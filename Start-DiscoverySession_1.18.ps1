@@ -414,6 +414,7 @@ function Connect-VSphere {
     $b64  = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("${user}:${pass}"))
     $authHeader = @{ Authorization = "Basic $b64" }
     # Try vSphere API v7+ first, then v6.x fallback
+    $lastErr = ''
     foreach ($apiPath in @('/api/session', '/rest/com/vmware/cis/session')) {
         try {
             $uri   = "https://$Server$apiPath"
@@ -421,9 +422,9 @@ function Connect-VSphere {
             $apiVer = if ($apiPath -match '^/api') { 'v7' } else { 'v6' }
             B-OK "Connected to vSphere ($apiVer API) at $Server"
             return @{ OK=$true; Token=$token; Server=$Server; APIVer=$apiVer }
-        } catch { }
+        } catch { $lastErr = $_.Exception.Message }
     }
-    return @{ OK=$false; Error="Could not connect to vSphere REST API on $Server. Check hostname and credentials." }
+    return @{ OK=$false; Error="Could not connect to vSphere REST API on $Server — $lastErr" }
 }
 
 function Get-VSphereVMs {
