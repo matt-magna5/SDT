@@ -6,7 +6,7 @@ PowerShell-based server and VM discovery tool for presales cloud migration scopi
 
 ## What It Does
 
-### 1. Session Launcher — `Start-DiscoverySession_1.17.ps1`
+### 1. Session Launcher — `Start-DiscoverySession_1.18.ps1`
 
 Interactive session manager. Run this first on any domain-joined jump box or directly on a Hyper-V host.
 
@@ -43,7 +43,7 @@ Interactive session manager. Run this first on any domain-joined jump box or dir
 
 ---
 
-### 2. Server Discovery Agent — `Invoke-ServerDiscovery_1.17.ps1`
+### 2. Server Discovery Agent — `Invoke-ServerDiscovery_1.18.ps1`
 
 Runs on each target server (locally or via WinRM). Read-only. Safe on Windows Server 2008 R2+. Collects:
 
@@ -126,10 +126,10 @@ python gen_report.py <path-to-manifest.json>
 
 ```powershell
 # Download and run
-iwr https://raw.githubusercontent.com/trophyscar-bit/sdt/main/Start-DiscoverySession_1.17.ps1 -OutFile C:\Temp\Start-DiscoverySession.ps1
-iwr https://raw.githubusercontent.com/trophyscar-bit/sdt/main/Invoke-ServerDiscovery_1.17.ps1 -OutFile C:\Temp\Invoke-ServerDiscovery_1.17.ps1
+iwr https://raw.githubusercontent.com/trophyscar-bit/sdt/main/Start-DiscoverySession_1.18.ps1 -OutFile C:\Temp\Start-DiscoverySession_1.18.ps1
+iwr https://raw.githubusercontent.com/trophyscar-bit/sdt/main/Invoke-ServerDiscovery_1.18.ps1 -OutFile C:\Temp\Invoke-ServerDiscovery_1.18.ps1
 cd C:\Temp
-.\Start-DiscoverySession.ps1
+.\Start-DiscoverySession_1.18.ps1
 ```
 
 **Generate report (requires Python 3.8+):**
@@ -172,6 +172,6 @@ Discovery-Session-2026-04-13-1647/
 | Version | Notes |
 |---|---|
 | v1.17 | Multi-hypervisor session launcher, vSphere REST API, WinRM safety, Nutanix Collector parser |
-| v1.18 | HV host auto-added as discovery targets; AD/DNS suggested servers scan; report fixes |
+| v1.18 | HV host auto-added as discovery targets; AD/DNS suggested servers scan; report fixes; async ping sweep (fixes freeze on subnet scan); AD server suggestions in bare metal path; B-Err silent error swallow fix |
 | v1.19 | Initial report generator release |
 | v1.20 | Full security product detection (EDR/RMM/Remote Access/Backup/PAM); System Overview layout; Basic tab removed; AD/SQL/file share rendering fixes |
