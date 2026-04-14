@@ -286,7 +286,13 @@ def build_flags(srv):
     return flags
 
 # ── SERVICE CATEGORIZATION ────────────────────────────────────────────────────
-_EDR_SVC  = ('sentinel', 'crowdstrike', 'cylance', 'huntress', 'carbonblack',
+_EDR_SVC  = ('sentinel', 'crowdstrike', 'csagent', 'csfalcon', 'cylance',
+             'huntress', 'carbonblack', 'cb defense', 'cortex xdr', 'cyserver',
+             'sophos', 'savservice', 'trellix', 'mcafee', 'eset', 'ekrn',
+             'kaspersky', 'avp', 'webroot', 'wrsa', 'bitdefender', 'malwarebytes',
+             'mbendpoint', 'cybereason', 'cramtray', 'darktrace', 'elastic-agent',
+             'elastic endpoint', 'deep instinct', 'cisco amp', 'withsecure',
+             'f-secure', 'avast', 'adlumin', 'arctic wolf',
              'windefend', 'wdnissvc', 'mdcoresvc', 'logprocessorservice', 'sentinelstatic')
 _PAM_SVC  = ('quickpass', 'cyberark', 'delinea', 'beyondtrust', 'wallix', 'thycotic')
 _RMM_SVC  = ('solarwinds', 'basupport', 'automationmanager', 'windows agent',
@@ -349,23 +355,203 @@ def detect_security(app_l, svc_l):
     all_s = [((s.get('DisplayName') or '') + ' ' + (s.get('Name') or '')).lower() for s in svc_l]
     combined = all_n + all_s
     edr = rmm = pam = bdr = None
-    for k, v in (('sentinelone','SentinelOne'), ('sentinel agent','SentinelOne'),
-                 ('crowdstrike','CrowdStrike Falcon'), ('huntress','Huntress'),
-                 ('cylance','Cylance'), ('carbon black','VMware Carbon Black')):
+
+    # EPP / EDR / MDR / XDR
+    _edr = [
+        ('sentinelone',          'SentinelOne'),
+        ('sentinel agent',       'SentinelOne'),
+        ('crowdstrike',          'CrowdStrike Falcon'),
+        ('csfalcon',             'CrowdStrike Falcon'),
+        ('csagent',              'CrowdStrike Falcon'),
+        ('huntress',             'Huntress MDR'),
+        ('cylance',              'BlackBerry Cylance'),
+        ('carbon black',         'VMware Carbon Black'),
+        ('cb defense',           'VMware Carbon Black'),
+        ('cortex xdr',           'Palo Alto Cortex XDR'),
+        ('cyserver',             'Palo Alto Cortex XDR'),
+        ('traps',                'Palo Alto Cortex XDR'),
+        ('cybereason',           'Cybereason EDR'),
+        ('cramtray',             'Cybereason EDR'),
+        ('deep instinct',        'Deep Instinct'),
+        ('darktrace',            'Darktrace'),
+        ('elastic security',     'Elastic Security'),
+        ('elastic agent',        'Elastic Security'),
+        ('elastic endpoint',     'Elastic Security'),
+        ('trellix',              'Trellix (McAfee)'),
+        ('mcafee',               'McAfee / Trellix'),
+        ('eset endpoint',        'ESET Endpoint Security'),
+        ('ekrn',                 'ESET'),
+        ('sophos',               'Sophos'),
+        ('savservice',           'Sophos'),
+        ('symantec endpoint',    'Symantec Endpoint'),
+        ('norton',               'Symantec / Norton'),
+        ('kaspersky',            'Kaspersky'),
+        ('avp service',          'Kaspersky'),
+        ('webroot',              'Webroot SecureAnywhere'),
+        ('wrsa',                 'Webroot SecureAnywhere'),
+        ('bitdefender',          'Bitdefender GravityZone'),
+        ('malwarebytes',         'Malwarebytes'),
+        ('mbendpointagent',      'Malwarebytes EDR'),
+        ('cisco secure endpoint','Cisco Secure Endpoint'),
+        ('cisco amp',            'Cisco Secure Endpoint'),
+        ('f-secure',             'F-Secure'),
+        ('withsecure',           'WithSecure (F-Secure)'),
+        ('avast',                'Avast'),
+        ('avg ',                 'AVG'),
+        ('adlumin',              'Adlumin MDR'),
+        ('arctic wolf',          'Arctic Wolf MDR'),
+        ('blackpoint',           'Blackpoint Cyber'),
+        ('ontinue',              'Ontinue MDR'),
+        ('netsurion',            'Netsurion MDR'),
+        ('microsoft defender for endpoint', 'Microsoft Defender for Endpoint'),
+        ('sense',                'Microsoft Defender for Endpoint'),
+    ]
+    for k, v in _edr:
         if any(k in n for n in combined):
-            ver = next((a.get('Version','') for a in app_l if k in (a.get('Name','') + a.get('Publisher','')).lower() and a.get('Version')), '')
-            edr = v + (f' v{ver}' if ver else ''); break
-    for k, v in (('n-able','N-able'), ('solarwinds','SolarWinds / N-able'),
-                 ('kaseya','Kaseya'), ('connectwise automate','ConnectWise Automate'),
-                 ('windows agent service','N-able Agent'), ('automation manager','N-able')):
+            edr = v; break
+
+    # RMM
+    _rmm = [
+        ('n-able',               'N-able'),
+        ('n_able',               'N-able'),
+        ('solarwinds',           'SolarWinds / N-able'),
+        ('advanced monitoring agent', 'N-able N-sight'),
+        ('windows agent service','N-able'),
+        ('ninjarmm',             'NinjaOne RMM'),
+        ('ninjaone',             'NinjaOne RMM'),
+        ('kaseya',               'Kaseya VSA'),
+        ('connectwise automate', 'ConnectWise Automate'),
+        ('labtech',              'ConnectWise Automate'),
+        ('ltsvc',                'ConnectWise Automate'),
+        ('connectwise rmm',      'ConnectWise RMM'),
+        ('datto rmm',            'Datto RMM'),
+        ('autotask endpoint',    'Datto RMM'),
+        ('cagservice',           'Datto RMM'),
+        ('syncro',               'Syncro RMM'),
+        ('kabuto',               'Syncro RMM'),
+        ('atera',                'Atera RMM'),
+        ('pulseway',             'Pulseway'),
+        ('pc monitor',           'Pulseway'),
+        ('splashtop',            'Splashtop RMM'),
+        ('manageengine',         'ManageEngine RMM'),
+        ('uems agent',           'ManageEngine Endpoint Central'),
+        ('naverisk',             'Naverisk RMM'),
+        ('barracuda rmm',        'Barracuda RMM'),
+        ('goto resolve',         'GoTo Resolve'),
+        ('logmein',              'LogMeIn / GoTo'),
+        ('teamviewer',           'TeamViewer RMM'),
+        ('itarian',              'ITarian RMM'),
+        ('acronis cyber protect cloud', 'Acronis RMM'),
+    ]
+    for k, v in _rmm:
         if any(k in n for n in combined): rmm = v; break
-    for k, v in (('quickpass','Quickpass'), ('cyberark','CyberArk'),
-                 ('delinea','Delinea'), ('beyondtrust','BeyondTrust'), ('wallix','WALLIX')):
+
+    # PAM
+    _pam = [
+        ('cyberark',             'CyberArk EPM'),
+        ('vf_agent',             'CyberArk EPM'),
+        ('beyondtrust',          'BeyondTrust'),
+        ('avecto',               'BeyondTrust'),
+        ('pgdriver',             'BeyondTrust'),
+        ('delinea',              'Delinea'),
+        ('thycotic',             'Delinea (Thycotic)'),
+        ('arellia',              'Delinea Privilege Manager'),
+        ('one identity safeguard','One Identity Safeguard'),
+        ('wallix',               'WALLIX Bastion'),
+        ('hashicorp vault',      'HashiCorp Vault'),
+        ('senhasegura',          'Senhasegura PAM'),
+        ('arcon pam',            'ARCON PAM'),
+        ('quickpass',            'Quickpass'),
+        ('saviynt',              'Saviynt'),
+    ]
+    for k, v in _pam:
         if any(k in n for n in combined): pam = v; break
-    for k, v in (('veeam','Veeam'), ('acronis','Acronis'), ('datto','Datto'),
-                 ('backup exec','Veritas Backup Exec'), ('shadow protect','StorageCraft')):
+
+    # Remote Access
+    _rmt = [
+        ('screenconnect',        'ScreenConnect'),
+        ('connectwise control',  'ScreenConnect'),
+        ('basupportexpress',     'N-able Take Control'),
+        ('msp anywhere',         'N-able Take Control'),
+        ('take control',         'N-able Take Control'),
+        ('teamviewer',           'TeamViewer'),
+        ('anydesk',              'AnyDesk'),
+        ('splashtop',            'Splashtop'),
+        ('srservice',            'Splashtop'),
+        ('logmein',              'LogMeIn / GoTo'),
+        ('goto resolve',         'GoTo Resolve'),
+        ('bomgar',               'BeyondTrust Remote Support'),
+        ('beyondtrust remote',   'BeyondTrust Remote Support'),
+        ('sra-pin',              'BeyondTrust Remote Support'),
+        ('dameware',             'Dameware Remote'),
+        ('dwrcs',                'Dameware Remote'),
+        ('tightvnc',             'TightVNC'),
+        ('ultravnc',             'UltraVNC'),
+        ('uvnc',                 'UltraVNC'),
+        ('realvnc',              'RealVNC'),
+        ('tigervnc',             'TigerVNC'),
+        ('winvnc',               'VNC Server'),
+        ('zoho assist',          'Zoho Assist'),
+        ('zohourmservice',       'Zoho Assist'),
+        ('isl alwayson',         'ISL Online'),
+        ('islalwayson',          'ISL Online'),
+        ('supremo',              'Supremo Remote'),
+        ('rserver3',             'Radmin'),
+        ('radmin',               'Radmin'),
+        ('nhostsvc',             'Netop Remote'),
+        ('rustdesk',             'RustDesk'),
+        ('chromoting',           'Chrome Remote Desktop'),
+        ('remoting_host',        'Chrome Remote Desktop'),
+        ('parsec',               'Parsec'),
+        ('nomachine',            'NoMachine'),
+        ('iperius remote',       'Iperius Remote'),
+        ('iperiusremote',        'Iperius Remote'),
+        ('getscreen',            'Getscreen.me'),
+        ('manageengine remote access', 'ManageEngine Remote Access Plus'),
+        ('webex support',        'Cisco Webex Remote Support'),
+        ('atashost',             'Cisco Webex Remote Support'),
+    ]
+    rmt = None
+    for k, v in _rmt:
+        if any(k in n for n in combined): rmt = v; break
+
+    # Backup
+    _bdr = [
+        ('veeam',                'Veeam'),
+        ('acronis',              'Acronis'),
+        ('datto bcdr',           'Datto BCDR'),
+        ('datto backup',         'Datto BCDR'),
+        ('commvault',            'Commvault'),
+        ('cvreplication',        'Commvault'),
+        ('backup exec',          'Veritas Backup Exec'),
+        ('bengine',              'Veritas Backup Exec'),
+        ('shadowprotect',        'StorageCraft ShadowProtect'),
+        ('shadow protect',       'StorageCraft ShadowProtect'),
+        ('arcserve',             'Arcserve'),
+        ('msp360',               'MSP360 Backup'),
+        ('cloudberry',           'MSP360 (CloudBerry)'),
+        ('azure backup',         'Azure Backup (MARS)'),
+        ('cbengine',             'Azure Backup (MARS)'),
+        ('microsoft azure recovery', 'Azure Backup (MARS)'),
+        ('druva',                'Druva inSync'),
+        ('insync',               'Druva inSync'),
+        ('cohesity',             'Cohesity'),
+        ('rubrik',               'Rubrik'),
+        ('zerto',                'Zerto'),
+        ('unitrends',            'Unitrends'),
+        ('barracuda backup',     'Barracuda Backup'),
+        ('axcient',              'Axcient'),
+        ('idrive',               'IDrive Backup'),
+        ('carbonite',            'Carbonite'),
+        ('backblaze',            'Backblaze'),
+        ('n2ws',                 'N2WS Backup'),
+        ('windows server backup','Windows Server Backup'),
+        ('wbengine',             'Windows Server Backup'),
+    ]
+    for k, v in _bdr:
         if any(k in n for n in combined): bdr = v; break
-    return edr, rmm, pam, bdr
+
+    return edr, rmm, pam, bdr, rmt
 
 _SAFE_PATH = ('c:\\windows\\', '"c:\\windows\\', 'c:\\program files\\common files\\microsoft',
               'c:\\program files\\windows defender', 'c:\\program files\\microsoft',
@@ -500,7 +686,7 @@ def build_server_tab(srv):
     svc_cats      = categorize_svcs(svc_list)
     app_cats      = categorize_apps(app_list)
     svc_anomalies = find_svc_anomalies(svc_list)
-    edr, rmm, pam, bdr = detect_security(app_list, svc_list)
+    edr, rmm, pam, bdr, rmt = detect_security(app_list, svc_list)
 
     running_count     = sum(len(v) for k, v in svc_cats.items() if k != 'StoppedAuto')
     stopped_auto_cnt  = len(svc_cats['StoppedAuto'])
@@ -634,13 +820,15 @@ def build_server_tab(srv):
         return f'<span class="pill pill-yellow">&#9888; None detected</span>' if missing_warn else '<span class="pill pill-gray">&mdash;</span>'
 
     sec_left_rows = (
-        f'<tr><td style="color:#6b6080;width:70px;padding:4px 0;font-size:8.5pt;">EDR</td>'
+        f'<tr><td style="color:#6b6080;width:90px;padding:4px 0;font-size:8.5pt;">&#128737;&#65039; EDR</td>'
         f'<td style="padding:4px 0">{_sec_pill(edr, missing_warn=True)}</td></tr>'
-        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">RMM</td>'
+        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">&#9881;&#65039; RMM</td>'
         f'<td style="padding:4px 0">{_sec_pill(rmm, missing_warn=True)}</td></tr>'
-        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">Backup</td>'
+        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">&#128279; Remote</td>'
+        f'<td style="padding:4px 0">{_sec_pill(rmt, missing_warn=False)}</td></tr>'
+        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">&#128190; Backup</td>'
         f'<td style="padding:4px 0">{_sec_pill(bdr, missing_warn=False)}</td></tr>'
-        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">PAM</td>'
+        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">&#128273; PAM</td>'
         f'<td style="padding:4px 0">{_sec_pill(pam, missing_warn=False)}</td></tr>'
     )
     sec_left_mini = mini_box('Security &amp; Protection',
@@ -742,19 +930,48 @@ def build_server_tab(srv):
     # ── SYSTEM OVERVIEW CARD ──────────────────────────────────────────────────
     dom_short = domain.split('.')[0] if domain else 'WORKGROUP'
     os_disp   = os_name.replace('Windows Server ', 'WS').replace(' Standard','').replace(' Datacenter','').strip() or os_short
-    overview_body = f'''<div class="stat-grid">
-<div class="stat-box"><div class="stat-num" style="font-size:15px">{h(os_disp)}</div><div class="stat-lbl">OS</div></div>
-<div class="stat-box"><div class="stat-num">{up:.1f}</div><div class="stat-lbl">Uptime (Days)</div></div>
-<div class="stat-box"><div class="stat-num" style="font-size:14px">{h(last_boot[:10] if last_boot else "&mdash;")}</div><div class="stat-lbl">Last Boot</div></div>
-<div class="stat-box"><div class="stat-num" style="font-size:{"13" if len(dom_short) > 9 else "15"}px">{h(dom_short)}</div><div class="stat-lbl">Domain</div></div>
-</div>
-<div class="meta-line"><strong>OS:</strong> {h(sys_.get("OSName",""))} (Build {h(os_build)}){f'&nbsp;<span class="pill pill-gray">VM on {h(vm_plat)}</span>' if is_vm and vm_plat else ''}</div>
-<div class="meta-line"><strong>EOL Date:</strong> {h(eol_date)} <span class="pill pill-{"red" if eol_status=="EOL" else "yellow" if eol_status=="Near EOL" else "green"}">{"EOL" if eol_status=="EOL" else "Supported"}</span></div>
-<div class="meta-line"><strong>Install Date:</strong> {h(install_dt[:10] if install_dt else "")}</div>
-<div class="meta-line"><strong>PowerShell Version:</strong> {h(ps_ver)}</div>
-<div class="meta-line"><strong>Run As:</strong> {h(run_as)}</div>
-<div class="meta-line"><strong>Collected At:</strong> {h(collected)}</div>
-''' + top_link(sid)
+    def _ov_sec_row(icon, label, val, warn=True):
+        if val:
+            badge = f'<span class="pill pill-green">{h(val)}</span>'
+        elif warn:
+            badge = '<span class="pill pill-yellow">None detected</span>'
+        else:
+            badge = '<span style="color:#c4b5fd">&mdash;</span>'
+        return (f'<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;">'
+                f'<span style="font-size:9pt;color:#6b6080;">{icon}&nbsp;{label}</span>'
+                f'{badge}</div>\n')
+    sec_col = (
+        f'<div style="font-size:8pt;font-weight:700;text-transform:uppercase;letter-spacing:.8px;'
+        f'color:#5b1fa4;margin-bottom:10px;">Security &amp; Protection</div>'
+        + _ov_sec_row('🛡️', 'EDR / XDR',    edr, warn=True)
+        + _ov_sec_row('⚙️', 'RMM',           rmm, warn=True)
+        + _ov_sec_row('🔗', 'Remote Access', rmt, warn=False)
+        + _ov_sec_row('💾', 'Backup',        bdr, warn=False)
+        + _ov_sec_row('🔑', 'PAM',           pam, warn=False)
+    )
+    _eol_color = 'red' if eol_status == 'EOL' else ('yellow' if eol_status == 'Near EOL' else 'green')
+    _eol_label = 'EOL' if eol_status == 'EOL' else 'Supported'
+    _vm_badge  = f'&nbsp;<span class="pill pill-gray">VM · {h(vm_plat)}</span>' if is_vm and vm_plat else ''
+    sys_col = (
+        f'<div class="stat-grid" style="grid-template-columns:repeat(2,1fr);">'
+        f'<div class="stat-box"><div class="stat-num" style="font-size:14px">{h(os_disp)}</div><div class="stat-lbl">OS</div></div>'
+        f'<div class="stat-box"><div class="stat-num">{up:.1f}d</div><div class="stat-lbl">Uptime</div></div>'
+        f'<div class="stat-box"><div class="stat-num" style="font-size:13px">{h(last_boot[:10] if last_boot else "—")}</div><div class="stat-lbl">Last Boot</div></div>'
+        f'<div class="stat-box"><div class="stat-num" style="font-size:{"12" if len(dom_short) > 9 else "14"}px">{h(dom_short)}</div><div class="stat-lbl">Domain</div></div>'
+        f'</div>'
+        f'<div class="meta-line"><strong>OS:</strong> {h(sys_.get("OSName",""))} (Build {h(os_build)}){_vm_badge}</div>'
+        f'<div class="meta-line"><strong>EOL Date:</strong> {h(eol_date)} <span class="pill pill-{_eol_color}">{_eol_label}</span></div>'
+        f'<div class="meta-line"><strong>Installed:</strong> {h(install_dt[:10] if install_dt else "")}</div>'
+        f'<div class="meta-line"><strong>PowerShell:</strong> {h(ps_ver)}</div>'
+        f'<div class="meta-line"><strong>Run As:</strong> {h(run_as)}</div>'
+        f'<div class="meta-line"><strong>Collected:</strong> {h(collected)}</div>'
+    )
+    overview_body = (
+        f'<div style="display:grid;grid-template-columns:3fr 2fr;gap:32px;align-items:start;">'
+        f'<div>{sys_col}</div>'
+        f'<div style="border-left:2px solid #ede9fe;padding-left:24px;">{sec_col}</div>'
+        f'</div>'
+    ) + top_link(sid)
 
     # ── HARDWARE CARD ─────────────────────────────────────────────────────────
     plat_pill = pill(vm_plat or 'Physical', 'gray' if not vm_plat else 'purple')
@@ -840,18 +1057,22 @@ def build_server_tab(srv):
         fl_d = str(ad.get('DomainFL', '')); fl_f = str(ad.get('ForestFL', ''))
         fy_d = (re.search(r'20\d\d', fl_d) or type('', (), {'group': lambda s,n: ''})()).group(0)
         fy_f = (re.search(r'20\d\d', fl_f) or type('', (), {'group': lambda s,n: ''})()).group(0)
-        uc = str(ad.get('UserCount', '') or '&mdash;')
-        cc = str(ad.get('ComputerCount', '') or '&mdash;')
-        ou = str(ad.get('OUCount', '') or '&mdash;')
+        uc = str(ad.get('UserCount', '') or '—')
+        cc = str(ad.get('ComputerCount', '') or '—')
+        ou = str(ad.get('OUCount', '') or '—')
         pdce = ad.get('PDCEmulator', '')
         ridf = ad.get('RIDMaster', '')
         schema_m = ad.get('SchemaMaster', '')
-        # FSMORoles is a list of role names held by this DC (e.g. ['PDC Emulator', 'RID Master', ...])
         fsmo_list = ad.get('FSMORoles', [])
         if not isinstance(fsmo_list, list): fsmo_list = []
         _stale_raw2 = ad.get('StaleUsers', '')
         stale_u = len(_stale_raw2) if isinstance(_stale_raw2, list) else (int(_stale_raw2) if str(_stale_raw2).isdigit() else 0)
-        domain_display = ad.get('DomainName', '') or ad.get('ForestName', '') or domain
+        def _dn_to_fqdn(v):
+            if v and str(v).upper().startswith('DC='):
+                return '.'.join(p.split('=')[1] for p in str(v).split(',') if '=' in p)
+            return v or ''
+        _raw_domain = ad.get('DomainName', '') or ad.get('ForestName', '') or domain
+        domain_display = _dn_to_fqdn(_raw_domain)
 
         rc += f'<div id="{sid}-roleconf-ad"></div>\n'
         rc += sub('Active Directory', 'margin-top:20px')
@@ -1119,7 +1340,8 @@ def build_server_tab(srv):
                         f'<td style="font-size:8.5pt">{h(s.get("StartName",""))}</td></tr>\n')
         svc_body += '</table>\n'
     svc_body += f'<div class="sub-title" style="margin-top:10px">Running Services ({running_count})</div>\n'
-    cat_display = [('EDR', 'EDR / Endpoint Protection'), ('PAM', 'Privileged Access Management'),
+    _edr_lbl = f'EDR / Endpoint Protection — {edr}' if edr else 'EDR / Endpoint Protection'
+    cat_display = [('EDR', _edr_lbl), ('PAM', 'Privileged Access Management'),
                    ('RMM', 'RMM / Managed Services'), ('HyperV', 'Virtualization (Hyper-V)'),
                    ('Core', 'Windows Core Services'), ('Print', 'Print Services'), ('Other', 'Other')]
     for cat_k, cat_lbl in cat_display:
@@ -1306,7 +1528,10 @@ def build_hv_tab():
 <table style="width:100%;font-size:9pt;border-collapse:collapse;">
 <tr style="background:#ede9fe"><th style="padding:5px 10px;text-align:left;font-size:8pt">Drive</th><th style="padding:5px 10px;font-size:8pt">Label</th><th style="padding:5px 10px;font-size:8pt">Total</th><th style="padding:5px 10px;font-size:8pt">Free</th><th style="padding:5px 10px;font-size:8pt">Usage</th></tr>
 {vol_rows}
-</table>''' if vol_rows else '') + '</div>\n'
+</table>''' if vol_rows else '') + \
+'<div style="text-align:right;margin-top:10px;padding-top:8px;border-top:1px solid #e0daf0;">' \
+'<a href="#top-virt" style="color:#5b1fa4;font-size:8.5pt;text-decoration:none;font-weight:600;">&#8593; Top</a>' \
+'</div>\n</div>\n'
 
         all_html += host_html
 
@@ -1339,21 +1564,13 @@ def build_hv_tab():
     for hvi2 in hv_inventories:
         hv2_name = hvi2.get('HVHost', 'Unknown Host')
         hv2_anchor = hv2_name.lower().replace('.', '').replace('-', '')
-        hv_nav += (f'<a href="#hv-host-{hv2_anchor}" style="color:#5b1fa4;font-size:9pt;text-decoration:none;'
+        hv_nav += (f'<a href="#hv-host-{hv2_anchor}" onclick="document.getElementById(\'hv-host-{hv2_anchor}\').scrollIntoView({{behavior:\'smooth\',block:\'start\'}});return false;" style="color:#5b1fa4;font-size:9pt;text-decoration:none;'
                    f'font-weight:700;padding:5px 16px;border-radius:20px;background:#ede9fe;'
                    f'border:1.5px solid #c4b5fd;">{h(hv2_name)}</a>\n')
     hv_nav += '</div>\n'
 
-    # Add ↑ Top link to each host section
-    all_html = all_html.replace(
-        '</div>\n',
-        '<div style="text-align:right;margin-top:8px;">'
-        '<a href="#hv-top-nav" style="color:#5b1fa4;font-size:8.5pt;text-decoration:none;font-weight:600;">&#8593; Top</a>'
-        '</div>\n</div>\n',
-        len(hv_inventories)
-    )
-
-    return sbr_html + card('hv-summary', f'Hyper-V Host Summary ({len(hv_inventories)} Hosts)', hv_nav + summary_card + all_html)
+    top_anchor = '<div id="top-virt"></div>\n'
+    return top_anchor + sbr_html + card('hv-summary', f'Hyper-V Host Summary ({len(hv_inventories)} Hosts)', hv_nav + summary_card + all_html)
 
 # ── BUILD ALL TABS ─────────────────────────────────────────────────────────────
 tabs = [build_server_tab(s) for s in servers]
@@ -1389,6 +1606,7 @@ html_out = f'''<!DOCTYPE html>
 <title>{h(CLIENT_FULL)} Server Discovery Report &mdash; {DATE}</title>
 <style>
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+html {{ scroll-padding-top: 100px; }}
 body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f5f4f8; color: #271e41; font-size: 10pt; }}
 .wrap {{ max-width: 1040px; margin: 0 auto; padding: 20px; }}
 .tab-nav {{ display: flex; gap: 4px; margin-bottom: -1px; flex-wrap: wrap; }}
@@ -1460,7 +1678,6 @@ details[open] summary::before {{ content: '\\25BC  '; }}
 </div>
 <div class="view-bar">
   <span class="view-lbl">View:</span>
-  <button class="view-btn" id="vbtn-basic" onclick="setView('basic')">Basic</button>
   <button class="view-btn v-active" id="vbtn-adv" onclick="setView('adv')">Advanced</button>
   <button class="view-btn" id="vbtn-sbr" onclick="setView('sbr')">SBR</button>
   <span class="view-desc" id="view-desc">Full technical detail &mdash; SE view</span>
@@ -1483,7 +1700,7 @@ var VIEW_DESCS = {{
   sbr:   "Executive health dashboard &mdash; client &amp; leadership"
 }};
 function setView(v) {{
-  document.body.classList.remove("view-basic","view-adv","view-sbr");
+  document.body.classList.remove("view-adv","view-sbr");
   document.body.classList.add("view-" + v);
   document.querySelectorAll(".view-btn").forEach(function(b){{ b.classList.remove("v-active"); }});
   var btn = document.getElementById("vbtn-" + v);
