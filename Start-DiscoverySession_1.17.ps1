@@ -109,7 +109,9 @@ if (Test-ScriptIntegrity $DiscoveryScript) {
 
 # -- SUGGESTED HYPERVISOR SCAN (AD + DNS) ------------------------------------
 function Get-SuggestedHypervisors {
-    $hvPatterns = @('*VH*','*HV*','*ESX*','*VCENTER*','*HYPERV*','*HYP*')
+    $hvPatterns = @('*VH*','*HV*','*ESX*','*ESXI*','*VCENTER*','*HYPERV*','*HYP*',
+                    '*VMWARE*','*VMW*','*NUTANIX*','*NTX*','*PRISM*',
+                    '*XEN*','*PROXMOX*','*PVE*','*VHOST*','*VIRT*')
     $found = [System.Collections.ArrayList]@()
 
     # Try AD via ActiveDirectory module
@@ -132,7 +134,7 @@ function Get-SuggestedHypervisors {
         try {
             $root    = [ADSI]'LDAP://RootDSE'
             $base    = $root.defaultNamingContext
-            $filter  = '(&(objectClass=computer)(|(name=*VH*)(name=*HV*)(name=*ESX*)(name=*VCENTER*)(name=*HYPERV*)))'
+            $filter  = '(&(objectClass=computer)(|(name=*VH*)(name=*HV*)(name=*ESX*)(name=*VCENTER*)(name=*HYPERV*)(name=*VMWARE*)(name=*VMW*)(name=*NUTANIX*)(name=*NTX*)(name=*PRISM*)(name=*XEN*)(name=*PROXMOX*)(name=*PVE*)(name=*VHOST*)(name=*VIRT*)))'
             $srch    = New-Object DirectoryServices.DirectorySearcher([ADSI]"LDAP://$base", $filter)
             @('name','dNSHostName','description') | ForEach-Object { [void]$srch.PropertiesToLoad.Add($_) }
             $srch.FindAll() | ForEach-Object {
@@ -148,7 +150,8 @@ function Get-SuggestedHypervisors {
 
     # DNS forward-lookup sweep for common HV naming patterns (fallback if AD empty)
     if ($found.Count -eq 0) {
-        $prefixes = @('VH','HV','ESX','ESXI','VCENTER','VC','HYPERV')
+        $prefixes = @('VH','HV','ESX','ESXI','VCENTER','VC','HYPERV',
+                      'VMW','NTX','PRISM','XEN','PVE','VHOST')
         foreach ($p in $prefixes) {
             foreach ($i in 1..10) {
                 foreach ($candidate in @("$p$i","${p}0$i","${p}-$i","${p}_$i")) {
