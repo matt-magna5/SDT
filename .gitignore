@@ -1,0 +1,15 @@
+# Output files - don't commit client data
+_output/
+*.html
+*.json
+*.zip
+*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+
+# Keep archive scripts but not output
+_archive/*.html
+_archive/*.json
+_archive/*.zip

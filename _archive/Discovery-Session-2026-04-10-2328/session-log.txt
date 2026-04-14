@@ -1,0 +1,6 @@
+﻿[2026-04-10 23:32:08] [INFO] [Session] Started - 2 AUTO targets
+[2026-04-10 23:32:09] [OK] [10.200.1.12] Inventory JSON: 10.200.1.12-inventory-2026-04-10.json
+[2026-04-10 23:32:09] [INFO] [QES-RDS-01] WinRM already ON
+[2026-04-10 23:32:43] [OK] [QES-RDS-01] Success - QES-RDS-01-discovery-2026-04-10.json
+[2026-04-10 23:32:44] [INFO] [QES_DC02] LOCAL run - no WinRM needed
+[2026-04-10 23:33:25] [OK] [QES_DC02] Success - QES-DATA-DC-discovery-2026-04-10.json
