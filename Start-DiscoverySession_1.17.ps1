@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Magna5 Server Discovery - Session Launcher v1.17
+    Magna5 Server Discovery - Session Launcher v1.18
 
 .DESCRIPTION
     Entry point for multi-server discovery. Enumerates servers from your
@@ -24,7 +24,7 @@
 param()
 
 $ErrorActionPreference = 'Continue'
-$script:SessionVersion  = '1.17'
+$script:SessionVersion  = '1.18'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
 $script:PendingInventories = [System.Collections.ArrayList]@()
@@ -105,6 +105,67 @@ if (Test-ScriptIntegrity $DiscoveryScript) {
         Write-Host "        Then re-run  --  this script will pull and cache it automatically." -ForegroundColor DarkGray
         exit 1
     }
+}
+
+# -- SUGGESTED HYPERVISOR SCAN (AD + DNS) ------------------------------------
+function Get-SuggestedHypervisors {
+    $hvPatterns = @('*VH*','*HV*','*ESX*','*VCENTER*','*HYPERV*','*HYP*')
+    $found = [System.Collections.ArrayList]@()
+
+    # Try AD via ActiveDirectory module
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $adComps = Get-ADComputer -Filter * -Properties Name,IPv4Address,Description,OperatingSystem -ErrorAction Stop
+        foreach ($c in $adComps) {
+            $n = $c.Name.ToUpper()
+            if ($hvPatterns | Where-Object { $n -like $_ }) {
+                if (-not ($found | Where-Object { $_.Name -ieq $c.Name })) {
+                    [void]$found.Add([PSCustomObject]@{
+                        Name = $c.Name; IP = $c.IPv4Address; Source = 'AD'
+                        Description = $c.Description; OS = $c.OperatingSystem
+                    })
+                }
+            }
+        }
+    } catch {
+        # Fallback: ADSI/LDAP (no AD module needed)
+        try {
+            $root    = [ADSI]'LDAP://RootDSE'
+            $base    = $root.defaultNamingContext
+            $filter  = '(&(objectClass=computer)(|(name=*VH*)(name=*HV*)(name=*ESX*)(name=*VCENTER*)(name=*HYPERV*)))'
+            $srch    = New-Object DirectoryServices.DirectorySearcher([ADSI]"LDAP://$base", $filter)
+            @('name','dNSHostName','description') | ForEach-Object { [void]$srch.PropertiesToLoad.Add($_) }
+            $srch.FindAll() | ForEach-Object {
+                $n   = if ($_.Properties['name'].Count)        { $_.Properties['name'][0] }        else { '' }
+                $dns = if ($_.Properties['dNSHostName'].Count)  { $_.Properties['dNSHostName'][0] }  else { $n }
+                $dsc = if ($_.Properties['description'].Count)  { $_.Properties['description'][0] }  else { '' }
+                if ($n -and -not ($found | Where-Object { $_.Name -ieq $n })) {
+                    [void]$found.Add([PSCustomObject]@{ Name=$n; IP=$dns; Source='AD (LDAP)'; Description=$dsc; OS='' })
+                }
+            }
+        } catch { }
+    }
+
+    # DNS forward-lookup sweep for common HV naming patterns (fallback if AD empty)
+    if ($found.Count -eq 0) {
+        $prefixes = @('VH','HV','ESX','ESXI','VCENTER','VC','HYPERV')
+        foreach ($p in $prefixes) {
+            foreach ($i in 1..10) {
+                foreach ($candidate in @("$p$i","${p}0$i","${p}-$i","${p}_$i")) {
+                    try {
+                        $r = [System.Net.Dns]::GetHostEntry($candidate)
+                        if (-not ($found | Where-Object { $_.Name -ieq $candidate })) {
+                            [void]$found.Add([PSCustomObject]@{
+                                Name=$candidate; IP=($r.AddressList[0].ToString())
+                                Source='DNS'; Description=''; OS=''
+                            })
+                        }
+                    } catch { }
+                }
+            }
+        }
+    }
+    return ,$found   # comma forces array return
 }
 
 # -- CERT BYPASS (PS 5.1 - self-signed certs on ESXi/vCenter) -----------------
@@ -978,6 +1039,19 @@ if ($hypervisorSources.Count -gt 0) {
                 B-OK "  Got $($vms.Count) VMs from Hyper-V $($src.Host)"
                 $hvInv = Get-HyperVInventory -HVHost $src.Host -Cred $hvCred
                 if ($hvInv) { [void]$script:PendingInventories.Add(@{ Type='HyperV'; Host=$src.Host; Data=$hvInv }) }
+                # Auto-add the HV host itself as a discovery target (produces a server tab in the report)
+                $isLocalHVSrc = ($src.Host -match '^(localhost|127\.0\.0\.1)$' -or $src.Host -ieq $env:COMPUTERNAME)
+                if (-not $isLocalHVSrc) {
+                    [void]$hypervisorVMs.Add([PSCustomObject]@{
+                        Name       = $src.Host.ToUpper()
+                        IP         = $src.Host
+                        PowerState = 'Running'
+                        GuestOS    = 'Windows (Hyper-V Host)'
+                        Source     = "HyperV Host ($($src.Host))"
+                        VMID       = $src.Host
+                    })
+                    B-OK "  Added $($src.Host) (HV host) as a server discovery target"
+                }
             }
         }
     }
@@ -1007,6 +1081,53 @@ $manualTargets = [System.Collections.ArrayList]@()
 
 if ($hypervisorSources.Count -gt 0 -and $hypervisorVMs.Count -gt 0) {
     # ?? HV / vCenter mode: VMs already known  --  just ask for outliers ??????????
+
+    # ── SUGGESTED SERVERS — AD/DNS SCAN ──────────────────────────────────────
+    Write-Phase "Step 3b - Suggested Servers"
+    B-Line "scanning Active Directory and DNS for hypervisor/server candidates..."
+    Write-Host ""
+    $suggestedAll  = Get-SuggestedHypervisors
+    $knownNames    = @($hypervisorVMs | ForEach-Object { $_.Name.ToUpper() }) +
+                     @($hypervisorSources | ForEach-Object { $_.Host.ToUpper() })
+    $newSuggested  = @($suggestedAll | Where-Object { $n = $_.Name.ToUpper(); $knownNames -notcontains $n })
+
+    if ($newSuggested.Count -gt 0) {
+        Write-Host ("  Found {0} candidate(s) not yet in your discovery list:" -f $newSuggested.Count) -ForegroundColor White
+        Write-Host ""
+        $suggMap = @{}
+        for ($si = 0; $si -lt $newSuggested.Count; $si++) {
+            $s    = $newSuggested[$si]
+            $num  = $si + 1
+            $ipStr = if ($s.IP) { $s.IP } else { 'IP unknown' }
+            Write-Host ("  [{0}]  {1,-22} {2,-18} [{3}]" -f $num, $s.Name, $ipStr, $s.Source) -ForegroundColor Cyan
+            if ($s.Description) { Write-Host ("        {0}" -f $s.Description) -ForegroundColor DarkGray }
+            $suggMap["$num"] = $s
+        }
+        Write-Host ""
+        Write-Host "  Enter numbers to add to discovery (comma-separated), or Enter to skip:" -ForegroundColor Gray
+        $picks = Read-Safe "  >"
+        if ($picks.Trim()) {
+            $picks -split '[,\s]+' | Where-Object { $_.Trim() } | ForEach-Object {
+                if ($suggMap.ContainsKey($_.Trim())) {
+                    $s = $suggMap[$_.Trim()]
+                    $ip = if ($s.IP) { ($s.IP -split ',')[0].Trim() } else { $s.Name }
+                    [void]$manualTargets.Add([PSCustomObject]@{
+                        Name       = $s.Name
+                        IP         = $ip
+                        PowerState = 'Unknown'
+                        GuestOS    = if ($s.OS) { $s.OS } else { 'Unknown' }
+                        Source     = "Suggested ($($s.Source))"
+                        VMID       = $s.Name
+                    })
+                    B-OK "Added: $($s.Name) ($ip)"
+                }
+            }
+        }
+    } else {
+        B-Line "No additional hypervisor/server candidates found in AD or DNS."
+    }
+    Write-Host ""
+
     Write-Phase "Step 4 - Additional Targets (Outliers)"
     B-Line "$($hypervisorVMs.Count) VM(s) discovered from hypervisor(s). Any standalone servers NOT on it?"
     Write-Host ""
