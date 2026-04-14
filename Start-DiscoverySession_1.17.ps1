@@ -171,6 +171,45 @@ function Get-SuggestedHypervisors {
     return ,$found   # comma forces array return
 }
 
+# -- SUGGESTED SERVER SCAN (AD - by OS type, bare metal path) -----------------
+function Get-SuggestedServers {
+    $found = [System.Collections.ArrayList]@()
+
+    # Try AD module first
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $adComps = Get-ADComputer -Filter {OperatingSystem -like "*Server*"} `
+            -Properties Name,IPv4Address,Description,OperatingSystem -ErrorAction Stop
+        foreach ($c in $adComps) {
+            if (-not ($found | Where-Object { $_.Name -ieq $c.Name })) {
+                [void]$found.Add([PSCustomObject]@{
+                    Name=$c.Name; IP=$c.IPv4Address; Source='AD'
+                    Description=$c.Description; OS=$c.OperatingSystem
+                })
+            }
+        }
+    } catch {
+        # ADSI/LDAP fallback (no AD module needed)
+        try {
+            $root   = [ADSI]'LDAP://RootDSE'
+            $base   = $root.defaultNamingContext
+            $filter = '(&(objectClass=computer)(operatingSystem=*Server*))'
+            $srch   = New-Object DirectoryServices.DirectorySearcher([ADSI]"LDAP://$base", $filter)
+            @('name','dNSHostName','description','operatingSystem') | ForEach-Object { [void]$srch.PropertiesToLoad.Add($_) }
+            $srch.FindAll() | ForEach-Object {
+                $n   = if ($_.Properties['name'].Count)            { $_.Properties['name'][0] }            else { '' }
+                $dns = if ($_.Properties['dNSHostName'].Count)     { $_.Properties['dNSHostName'][0] }     else { $n }
+                $os  = if ($_.Properties['operatingSystem'].Count) { $_.Properties['operatingSystem'][0] } else { '' }
+                $dsc = if ($_.Properties['description'].Count)     { $_.Properties['description'][0] }     else { '' }
+                if ($n -and -not ($found | Where-Object { $_.Name -ieq $n })) {
+                    [void]$found.Add([PSCustomObject]@{ Name=$n; IP=$dns; Source='AD (LDAP)'; Description=$dsc; OS=$os })
+                }
+            }
+        } catch { }
+    }
+    return ,$found
+}
+
 # -- CERT BYPASS (PS 5.1 - self-signed certs on ESXi/vCenter) -----------------
 
 $PSMaj = $PSVersionTable.PSVersion.Major
@@ -786,26 +825,31 @@ function Get-SubnetHosts {
 
 function Invoke-PingSweep {
     param([string[]]$IPs)
-    B-Line "Ping sweeping $($IPs.Count) addresses (~15-30 seconds)..."
-    $jobs = $IPs | ForEach-Object {
-        $ip = $_
-        Start-Job -ScriptBlock { param($h)
-            [PSCustomObject]@{ IP=$h; Alive=(Test-Connection $h -Count 1 -Quiet -EA SilentlyContinue) }
-        } -ArgumentList $ip -EA SilentlyContinue
+    B-Line "Ping sweeping $($IPs.Count) addresses (~10-20 seconds)..."
+    # Use .NET async pings -- avoids spawning one PS process per host (254 Start-Jobs = freeze)
+    $tasks = $IPs | ForEach-Object {
+        $p = [System.Net.NetworkInformation.Ping]::new()
+        [PSCustomObject]@{ IP=$_; Ping=$p; Task=$p.SendPingAsync($_, 1500) }
     }
     $spin = 0; $spinC = @('|','/','-','\')
-    $timeout = (Get-Date).AddSeconds(30)
-    while (($jobs|Where-Object{$_.State -eq 'Running'}).Count -gt 0 -and (Get-Date) -lt $timeout) {
-        $done = ($jobs|Where-Object{$_.State -ne 'Running'}).Count
-        Write-Host ("`r  (o_o)  scanning... $($spinC[$spin%4])  $done/$($jobs.Count)   ") -NoNewline -ForegroundColor DarkCyan
-        Start-Sleep -Milliseconds 250; $spin++
+    $timeout = (Get-Date).AddSeconds(25)
+    while (($tasks | Where-Object { -not $_.Task.IsCompleted }).Count -gt 0 -and (Get-Date) -lt $timeout) {
+        $done = ($tasks | Where-Object { $_.Task.IsCompleted }).Count
+        Write-Host ("`r  (o_o)  scanning... $($spinC[$spin%4])  $done/$($tasks.Count)   ") -NoNewline -ForegroundColor DarkCyan
+        Start-Sleep -Milliseconds 200; $spin++
     }
     Write-Host "`r                                          " -NoNewline; Write-Host ""
-    $results = $jobs | Wait-Job -Timeout 5 | Receive-Job -EA SilentlyContinue
-    $jobs    | Remove-Job -Force -EA SilentlyContinue
-    $live    = @($results | Where-Object { $_.Alive } | Select-Object -ExpandProperty IP)
+    $live = [System.Collections.ArrayList]@()
+    foreach ($t in $tasks) {
+        try {
+            if ($t.Task.IsCompleted -and $t.Task.Result.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                [void]$live.Add($t.IP)
+            }
+        } catch { }
+        $t.Ping.Dispose()
+    }
     B-OK "$($live.Count) live hosts found"
-    return $live
+    return ,$live.ToArray()
 }
 
 function Test-WMIAccess {
@@ -1164,12 +1208,56 @@ if ($hypervisorSources.Count -gt 0 -and $hypervisorVMs.Count -gt 0) {
     }
 } else {
     # ?? Bare metal / no hypervisor: full target entry ?????????????????????????
+    Write-Phase "Step 3b - Suggested Servers"
+    B-Line "scanning Active Directory for server candidates..."
+    Write-Host ""
+    $suggestedServers = Get-SuggestedServers
+    if ($suggestedServers.Count -gt 0) {
+        Write-Host ("  Found {0} server(s) in Active Directory:" -f $suggestedServers.Count) -ForegroundColor White
+        Write-Host ""
+        $srvMap = @{}
+        for ($si = 0; $si -lt $suggestedServers.Count; $si++) {
+            $s = $suggestedServers[$si]; $num = $si + 1
+            $ipStr = if ($s.IP) { $s.IP } else { 'IP unknown' }
+            Write-Host ("  [{0}]  {1,-28} {2,-18} [{3}]" -f $num, $s.Name, $ipStr, $s.Source) -ForegroundColor Cyan
+            if ($s.OS) { Write-Host ("        {0}" -f $s.OS) -ForegroundColor DarkGray }
+            $srvMap["$num"] = $s
+        }
+        Write-Host ""
+        Write-Host "  Enter numbers to add (comma-separated), A for all, or Enter to skip:" -ForegroundColor Gray
+        $picks = Read-Safe "  >"
+        if ($picks.Trim() -ieq 'A') {
+            foreach ($s in $suggestedServers) {
+                $ip = if ($s.IP) { ($s.IP -split ',')[0].Trim() } else { $s.Name }
+                [void]$manualTargets.Add([PSCustomObject]@{
+                    Name=$s.Name; IP=$ip; PowerState='Unknown'
+                    GuestOS=if ($s.OS) { $s.OS } else { 'Unknown' }; Source="Suggested ($($s.Source))"
+                })
+            }
+            B-OK "$($manualTargets.Count) server(s) added from AD"
+        } elseif ($picks.Trim()) {
+            $picks -split '[,\s]+' | Where-Object { $_.Trim() } | ForEach-Object {
+                if ($srvMap.ContainsKey($_.Trim())) {
+                    $s  = $srvMap[$_.Trim()]
+                    $ip = if ($s.IP) { ($s.IP -split ',')[0].Trim() } else { $s.Name }
+                    [void]$manualTargets.Add([PSCustomObject]@{
+                        Name=$s.Name; IP=$ip; PowerState='Unknown'
+                        GuestOS=if ($s.OS) { $s.OS } else { 'Unknown' }; Source="Suggested ($($s.Source))"
+                    })
+                }
+            }
+            B-OK "$($manualTargets.Count) server(s) added from AD"
+        }
+    } else {
+        B-Line "No servers found in Active Directory — or no AD access from this machine."
+    }
+
     Write-Phase "Step 4 - Server Targets"
-    B-Line "no hypervisor source  --  add servers manually..."
+    B-Line "add any remaining targets not covered above..."
     Write-Host ""
     Write-Host "  [1]  Enter hostnames or IPs manually" -ForegroundColor White
     Write-Host "  [2]  Load from text file (one per line)" -ForegroundColor White
-    Write-Host "  [3]  Subnet scan  (slow  --  ~30s per /24, ICMP must be open)" -ForegroundColor Yellow
+    Write-Host "  [3]  Subnet scan  (~10-20s per /24, ICMP must be open)" -ForegroundColor Yellow
     Write-Host "  [4]  Skip" -ForegroundColor DarkGray
     Write-Host ""
     $addMode = Read-Safe "  Choice [1/2/3/4]"
