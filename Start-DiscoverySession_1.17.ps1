@@ -235,9 +235,7 @@ function B-Line { param([string]$m,[string]$c='DarkCyan')
     Write-Host ("  " + $buddyFrames[(Get-Random -Max $buddyFrames.Count)] + "  $m") -ForegroundColor $c }
 function B-OK   { param([string]$m) Write-Host "  (^_^)  $m" -ForegroundColor DarkGreen  }
 function B-Warn { param([string]$m) Write-Host "  (>_<)  $m" -ForegroundColor DarkYellow }
-function B-Err  { param([string]$m) {
-    Write-Host "  (x_x)  $m" -ForegroundColor Red
-    [void]$script:SessionErrors.Add($m) }}
+function B-Err  { param([string]$m) Write-Host "  (x_x)  $m" -ForegroundColor Red; [void]$script:SessionErrors.Add($m) }
 function Write-Phase { param([string]$t)
     Write-Host ""
     Write-Host ("  -- " + $t.ToUpper() + " " + ("-" * [Math]::Max(1, 56 - $t.Length))) -ForegroundColor DarkMagenta }
