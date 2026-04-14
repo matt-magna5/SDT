@@ -1585,7 +1585,7 @@ def build_hv_tab():
     sbr_html = f'''<div class="sbr-only">
 <div style="background:linear-gradient(135deg,#5b1fa4,#3d1270);border-radius:10px 10px 0 0;padding:16px 24px;display:flex;justify-content:space-between;align-items:center;margin-bottom:0;">
   <div>
-    <div style="font-size:18px;font-weight:700;color:#fff;letter-spacing:.3px;">Hyper-V Host Inventory</div>
+    <div style="font-size:18px;font-weight:700;color:#fff;letter-spacing:.3px;">{('Hyper-V / ESX' if any(x.get('_type')=='HyperVInventory' for x in hv_inventories) and any(x.get('_type')=='vSphereInventory' for x in hv_inventories) else 'ESX Host Inventory' if any(x.get('_type')=='vSphereInventory' for x in hv_inventories) else 'Hyper-V Host Inventory')} </div>
     <div style="font-size:9pt;color:rgba(255,255,255,.85);margin-top:3px;">{len(hv_inventories)} hosts &middot; {total_vms} VMs &middot; {total_vcpu} vCPU &middot; {total_ram:.0f} GB RAM allocated</div>
   </div>
   <span style="background:rgba(255,255,255,.22);color:#fff;font-size:10pt;font-weight:700;padding:6px 18px;border-radius:20px;border:1.5px solid rgba(255,255,255,.5);">{len(hv_inventories)} Host(s)</span>
@@ -1605,7 +1605,12 @@ def build_hv_tab():
     hv_nav += '</div>\n'
 
     top_anchor = '<div id="top-virt"></div>\n'
-    return top_anchor + sbr_html + card('hv-summary', f'Hyper-V Host Summary ({len(hv_inventories)} Hosts)', hv_nav + summary_card + all_html)
+    _has_hv2 = any(x.get('_type') == 'HyperVInventory'  for x in hv_inventories)
+    _has_vs2 = any(x.get('_type') == 'vSphereInventory' for x in hv_inventories)
+    _card_title = ('Hyper-V / ESX Summary' if _has_hv2 and _has_vs2
+                   else 'ESX Host Summary'    if _has_vs2
+                   else 'Hyper-V Host Summary')
+    return top_anchor + sbr_html + card('hv-summary', f'{_card_title} ({len(hv_inventories)} Hosts)', hv_nav + summary_card + all_html)
 
 # ── SQL TAB ───────────────────────────────────────────────────────────────────
 _DB_VENDORS = [
@@ -1771,7 +1776,12 @@ for t in tabs:
     cls = 'tab-btn' + tab_cls(t['crit'], t['warn'])
     scope_ind = '' if t['in_scope'] else ' &#9702;'
     tab_buttons += f'<button class="{cls}" data-tab="tab-{t["id"]}" onclick="showTab(\'{t["id"]}\')">{h(t["name"])}{scope_ind}</button>\n'
-tab_buttons += '<button class="tab-btn" data-tab="tab-virt" onclick="showTab(\'virt\')">Hyper-V Hosts</button>\n'
+_has_hyperv  = any(h.get('_type') == 'HyperVInventory'   for h in hv_inventories)
+_has_vsphere = any(h.get('_type') == 'vSphereInventory'  for h in hv_inventories)
+_virt_label  = ('Hyper-V / ESX' if _has_hyperv and _has_vsphere
+                else 'ESX Hosts'    if _has_vsphere
+                else 'Hyper-V Hosts')
+tab_buttons += f'<button class="tab-btn" data-tab="tab-virt" onclick="showTab(\'virt\')">{_virt_label}</button>\n'
 if sql_tab_html:
     tab_buttons += '<button class="tab-btn" data-tab="tab-sql" onclick="showTab(\'sql\')">SQL</button>\n'
 
