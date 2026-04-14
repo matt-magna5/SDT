@@ -1572,9 +1572,156 @@ def build_hv_tab():
     top_anchor = '<div id="top-virt"></div>\n'
     return top_anchor + sbr_html + card('hv-summary', f'Hyper-V Host Summary ({len(hv_inventories)} Hosts)', hv_nav + summary_card + all_html)
 
+# ── SQL TAB ───────────────────────────────────────────────────────────────────
+_DB_VENDORS = [
+    ('solarwinds',   'SolarWinds'),
+    ('wsus',         'Windows Server Update Services (WSUS)'),
+    ('sharepoint',   'Microsoft SharePoint'),
+    ('reportserver', 'SQL Reporting Services (SSRS)'),
+    ('kiwi',         'Kiwiplan ERP'),
+    ('amtech',       'AmTech ERP'),
+    ('advantage',    'Advantage Software'),
+    ('netsuite',     'NetSuite'),
+    ('quickbooks',   'QuickBooks'),
+    ('sage',         'Sage'),
+    ('dynamics',     'Microsoft Dynamics'),
+    ('navision',     'Dynamics NAV'),
+    ('greatplains',  'Dynamics GP'),
+    ('connectwise',  'ConnectWise'),
+    ('labtech',      'ConnectWise Automate'),
+    ('autotask',     'Autotask / Datto'),
+    ('veeam',        'Veeam Backup'),
+    ('kaseya',       'Kaseya'),
+    ('halo',         'HaloPSA'),
+    ('servicenow',   'ServiceNow'),
+    ('adlumin',      'Adlumin MDR'),
+    ('huntress',     'Huntress'),
+    ('sccm',         'Microsoft SCCM'),
+    ('configmgr',    'Microsoft SCCM'),
+    ('wordpress',    'WordPress'),
+    ('gitlab',       'GitLab'),
+]
+
+def _db_vendor(name):
+    n = name.lower()
+    for k, v in _DB_VENDORS:
+        if k in n: return v
+    return ''
+
+def build_sql_tab():
+    # Collect SQL data from all servers
+    sql_servers = []
+    for srv in servers:
+        data = srv['data']
+        sql_raw = data.get('SQL', {})
+        if isinstance(sql_raw, list): sql_raw = sql_raw[0] if sql_raw else {}
+        if not isinstance(sql_raw, dict): continue
+        inst = sql_raw.get('Instances', {})
+        if not isinstance(inst, dict) or not inst.get('InstanceName'): continue
+        sql_servers.append({'server': srv['name'], 'ip': srv.get('ip',''), 'sql': sql_raw, 'inst': inst})
+
+    if not sql_servers:
+        return None
+
+    total_dbs   = sum(len(s['inst'].get('Databases', []) or []) for s in sql_servers if isinstance(s['inst'].get('Databases'), list))
+    total_data  = sum(
+        sum(float(d.get('DataSizeMB', 0) or 0) for d in (s['inst'].get('Databases') or []) if isinstance(d, dict))
+        for s in sql_servers
+    )
+
+    summary = (f'<div class="stat-grid" style="margin-bottom:20px;">'
+               f'<div class="stat-box"><div class="stat-num">{len(sql_servers)}</div><div class="stat-lbl">SQL Servers</div></div>'
+               f'<div class="stat-box"><div class="stat-num">{total_dbs}</div><div class="stat-lbl">Databases</div></div>'
+               f'<div class="stat-box"><div class="stat-num">{total_data/1024:.1f} GB</div><div class="stat-lbl">Total Data Size</div></div>'
+               f'</div>')
+
+    body = '<div id="top-sql"></div>\n'
+
+    # Nav pills
+    nav = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;">\n'
+    for s in sql_servers:
+        anc = s['server'].lower().replace('-','').replace('.','')
+        nav += (f'<a href="#sql-{anc}" onclick="document.getElementById(\'sql-{anc}\').scrollIntoView({{behavior:\'smooth\',block:\'start\'}});return false;" '
+                f'style="color:#5b1fa4;font-size:9pt;text-decoration:none;font-weight:700;padding:5px 16px;'
+                f'border-radius:20px;background:#ede9fe;border:1.5px solid #c4b5fd;">{h(s["server"])}</a>\n')
+    nav += '</div>\n'
+
+    for s in sql_servers:
+        inst = s['inst']
+        anc  = s['server'].lower().replace('-','').replace('.','')
+        ver  = inst.get('Version','—'); ed = inst.get('Edition','—')
+        eol  = inst.get('EOLDate','—'); eol_s = inst.get('EOLStatus','')
+        svc  = inst.get('ServiceAccount','—')
+        conn = inst.get('Connected', False)
+        eol_color = 'red' if eol_s == 'EOL' else ('yellow' if eol_s and 'near' in eol_s.lower() else 'green')
+
+        dbs = [d for d in (inst.get('Databases') or []) if isinstance(d, dict)]
+
+        db_rows = ''
+        for i, db in enumerate(dbs):
+            name    = db.get('Name','')
+            vendor  = _db_vendor(name)
+            data_mb = float(db.get('DataSizeMB', 0) or 0)
+            log_mb  = float(db.get('LogSizeMB', 0) or 0)
+            state   = db.get('State','—')
+            recov   = db.get('RecoveryModel','—')
+            compat  = db.get('CompatLevel','—')
+            backup  = db.get('LastFullBackup','—') or '—'
+            sc      = 'green' if state == 'ONLINE' else 'yellow'
+            bg      = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            data_disp = f'{data_mb/1024:.2f} GB' if data_mb >= 1024 else f'{data_mb:.0f} MB'
+            log_disp  = f'{log_mb/1024:.2f} GB'  if log_mb  >= 1024 else f'{log_mb:.0f} MB'
+            db_rows += (f'<tr{bg}>'
+                        f'<td style="padding:6px 10px;font-weight:600;font-family:monospace;font-size:9pt">{h(name)}</td>'
+                        f'<td style="padding:6px 10px;font-size:8.5pt;color:#5b1fa4">{h(vendor) if vendor else "<span style=\'color:#c4b5fd\'>—</span>"}</td>'
+                        f'<td style="padding:6px 10px;text-align:right">{data_disp}</td>'
+                        f'<td style="padding:6px 10px;text-align:right;color:#6b6080">{log_disp}</td>'
+                        f'<td style="padding:6px 10px">{pill(state, sc)}</td>'
+                        f'<td style="padding:6px 10px;font-size:8.5pt">{h(recov)}</td>'
+                        f'<td style="padding:6px 10px;text-align:center;font-size:8.5pt">{h(str(compat))}</td>'
+                        f'<td style="padding:6px 10px;font-size:8.5pt;color:#6b6080">{h(backup)}</td>'
+                        f'</tr>\n')
+
+        db_section = ''
+        if not conn:
+            db_section = '<div class="flag-warning"><div class="flag-label">Deep connect failed</div><div class="flag-detail">Could not connect to SQL instance — database list unavailable. Verify the discovery account has SQL login permissions.</div></div>\n'
+        elif dbs:
+            db_section = (f'<table style="width:100%;font-size:9pt;border-collapse:collapse;margin-top:14px;">'
+                          f'<tr style="background:#271e41">'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:left">Database</th>'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:left">Purpose / Vendor</th>'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:right">Data</th>'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:right">Log</th>'
+                          f'<th style="padding:7px 10px;color:#fff">State</th>'
+                          f'<th style="padding:7px 10px;color:#fff">Recovery</th>'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:center">Compat</th>'
+                          f'<th style="padding:7px 10px;color:#fff">Last Full Backup</th>'
+                          f'</tr>\n{db_rows}</table>\n')
+        else:
+            db_section = '<div style="color:#6b6080;font-style:italic;margin-top:10px;">No user databases found.</div>\n'
+
+        top_lnk = '<div style="text-align:right;margin-top:10px;"><a href="#top-sql" style="color:#5b1fa4;font-size:8.5pt;text-decoration:none;font-weight:600;">&#8593; Top</a></div>\n'
+
+        body += (f'<div id="sql-{anc}" style="background:#f5f4f8;border-radius:8px;padding:16px 20px;'
+                 f'margin-bottom:20px;border:1px solid #e0daf0;">\n'
+                 f'<div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:12px;">\n'
+                 f'<div><div style="font-size:13pt;font-weight:700;color:#271e41;">{h(s["server"])}</div>'
+                 f'<div style="font-size:9pt;color:#6b6080;margin-top:2px;">{h(s["ip"])}</div></div>\n'
+                 f'<div style="text-align:right;">'
+                 f'<div style="font-size:9pt;font-weight:700;color:#5b1fa4;">{h(ed)}</div>'
+                 f'<div style="font-size:8.5pt;color:#6b6080;">v{h(ver)} &middot; EOL {h(eol)} '
+                 f'<span class="pill pill-{eol_color}" style="font-size:7.5pt;">{h(eol_s) or "—"}</span></div>'
+                 f'<div style="font-size:8.5pt;color:#6b6080;margin-top:4px;">Service: {h(svc)}</div>'
+                 f'</div></div>\n'
+                 f'{db_section}{top_lnk}</div>\n')
+
+    return card('sql-all', f'SQL Server Inventory ({len(sql_servers)} Instance{"s" if len(sql_servers)>1 else ""})',
+                nav + summary + body)
+
 # ── BUILD ALL TABS ─────────────────────────────────────────────────────────────
 tabs = [build_server_tab(s) for s in servers]
 virt_tab_html = build_hv_tab()
+sql_tab_html  = build_sql_tab()
 
 # ── LOGO ──────────────────────────────────────────────────────────────────────
 if LOGO_B64:
@@ -1590,12 +1737,16 @@ for t in tabs:
     scope_ind = '' if t['in_scope'] else ' &#9702;'
     tab_buttons += f'<button class="{cls}" data-tab="tab-{t["id"]}" onclick="showTab(\'{t["id"]}\')">{h(t["name"])}{scope_ind}</button>\n'
 tab_buttons += '<button class="tab-btn" data-tab="tab-virt" onclick="showTab(\'virt\')">Hyper-V Hosts</button>\n'
+if sql_tab_html:
+    tab_buttons += '<button class="tab-btn" data-tab="tab-sql" onclick="showTab(\'sql\')">SQL</button>\n'
 
 tab_contents = ''
 for i, t in enumerate(tabs):
     active = ' active' if i == 0 else ''
     tab_contents += f'<div id="tab-{t["id"]}" class="tab-content{active}">\n{t["tab_html"]}\n</div>\n'
 tab_contents += f'<div id="tab-virt" class="tab-content">\n{virt_tab_html}\n</div>\n'
+if sql_tab_html:
+    tab_contents += f'<div id="tab-sql" class="tab-content">\n{sql_tab_html}\n</div>\n'
 
 # ── FULL HTML ─────────────────────────────────────────────────────────────────
 html_out = f'''<!DOCTYPE html>

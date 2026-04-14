@@ -1041,54 +1041,65 @@ $CollectionBlock = {
                     $svc = Get-WmiObject Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
                     if ($svc) { $inst.ServiceAccount = $svc.StartName }
                 } catch { }
-                # Query databases via SQL connection
+                # SQL deep connect — pull database-level details via integrated security
+                $inst.Connected = $false
                 try {
-                    $connStr = if ($instName -eq 'MSSQLSERVER') { $env:COMPUTERNAME } else { "$env:COMPUTERNAME\$instName" }
+                    $sqlServer = if ($instName -eq 'MSSQLSERVER') { '.' } else { ".\$instName" }
                     $conn = New-Object System.Data.SqlClient.SqlConnection
-                    $conn.ConnectionString = "Server=$connStr;Integrated Security=True;Connect Timeout=10"
+                    $conn.ConnectionString = "Server=$sqlServer;Integrated Security=True;Connect Timeout=10;Application Name=M5Discovery"
                     $conn.Open()
+                    $inst.Connected = $true
                     $cmd = $conn.CreateCommand()
                     $cmd.CommandText = @"
 SELECT
     d.name,
     d.state_desc,
-    CAST(SUM(mf.size) * 8.0 / 1024 / 1024 AS DECIMAL(10,2)) AS SizeGB,
-    d.create_date,
-    MAX(b.backup_finish_date) AS LastBackup,
-    (SELECT MAX(login_time) FROM sys.dm_exec_sessions s WHERE s.database_id = d.database_id) AS LastConnectionApprox
+    d.recovery_model_desc,
+    d.compatibility_level,
+    CONVERT(varchar, d.create_date, 23) AS create_date,
+    ISNULL(SUM(CASE WHEN mf.type = 0 THEN CAST(mf.size AS bigint) * 8 / 1024 ELSE 0 END), 0) AS data_size_mb,
+    ISNULL(SUM(CASE WHEN mf.type = 1 THEN CAST(mf.size AS bigint) * 8 / 1024 ELSE 0 END), 0) AS log_size_mb,
+    MAX(CONVERT(varchar, b.backup_finish_date, 23)) AS last_full_backup
 FROM sys.databases d
 LEFT JOIN sys.master_files mf ON d.database_id = mf.database_id
-LEFT JOIN msdb.dbo.backupset b ON d.name = b.database_name
-GROUP BY d.name, d.state_desc, d.create_date, d.database_id
-ORDER BY d.name
+LEFT JOIN msdb.dbo.backupset b ON b.database_name = d.name AND b.type = 'D'
+WHERE d.name NOT IN ('master','model','msdb','tempdb','resource','distribution')
+GROUP BY d.name, d.state_desc, d.recovery_model_desc, d.compatibility_level, d.create_date
+ORDER BY data_size_mb DESC
 "@
                     $reader = $cmd.ExecuteReader()
                     $dbs = [System.Collections.ArrayList]@()
                     while ($reader.Read()) {
-                        $dbName     = $reader["name"].ToString()
-                        $lastBackup = if ($reader["LastBackup"] -is [DBNull]) { 'Never' } else { $reader["LastBackup"].ToString("yyyy-MM-dd") }
-                        $sizeGB     = if ($reader["SizeGB"] -is [DBNull]) { 0 } else { $reader["SizeGB"] }
-                        $created    = $reader["create_date"].ToString("yyyy-MM-dd")
+                        $dbName        = $reader["name"].ToString()
+                        $lastFullBackup = if ($reader["last_full_backup"] -is [DBNull] -or $reader["last_full_backup"].ToString() -eq '') { $null } else { $reader["last_full_backup"].ToString() }
+                        $dataSizeMB    = if ($reader["data_size_mb"] -is [DBNull]) { 0 } else { [long]$reader["data_size_mb"] }
+                        $logSizeMB     = if ($reader["log_size_mb"]  -is [DBNull]) { 0 } else { [long]$reader["log_size_mb"]  }
                         # Lookup app name
                         $appName = ''
                         foreach ($k in $SqlDbAppMap.Keys) {
                             if ($dbName -match $k) { $appName = $SqlDbAppMap[$k]; break }
                         }
                         $db = @{
-                            Name        = $dbName
-                            State       = $reader["state_desc"].ToString()
-                            SizeGB      = $sizeGB
-                            Created     = $created
-                            LastBackup  = $lastBackup
-                            AppGuess    = $appName
+                            Name           = $dbName
+                            State          = $reader["state_desc"].ToString()
+                            RecoveryModel  = $reader["recovery_model_desc"].ToString()
+                            CompatLevel    = [int]$reader["compatibility_level"]
+                            CreateDate     = $reader["create_date"].ToString()
+                            DataSizeMB     = $dataSizeMB
+                            LogSizeMB      = $logSizeMB
+                            LastFullBackup = $lastFullBackup
+                            AppGuess       = $appName
                         }
-                        if ($lastBackup -eq 'Never' -and $dbName -notin @('tempdb','model')) {
-                            cb-Flag 'critical' "SQL DB Never Backed Up: $dbName ($instName)" "No backup record in msdb. This database has no recorded backups - confirm alternate backup method."
-                        } elseif ($lastBackup -ne 'Never') {
-                            $daysSince = ((Get-Date) - [datetime]::Parse($lastBackup)).TotalDays
-                            if ($daysSince -gt 30) {
-                                cb-Flag 'warning' "SQL DB Stale Backup: $dbName" "Last backup: $lastBackup ($([math]::Round($daysSince,0)) days ago)"
-                            }
+                        # Flag backup health
+                        if ($null -eq $lastFullBackup) {
+                            cb-Flag 'critical' "SQL DB Never Backed Up: $dbName ($instName)" "No full backup record in msdb. Confirm alternate backup method."
+                        } else {
+                            try {
+                                $daysSince = ((Get-Date) - [datetime]::Parse($lastFullBackup)).TotalDays
+                                if ($daysSince -gt 30) {
+                                    cb-Flag 'warning' "SQL DB Stale Backup: $dbName" "Last full backup: $lastFullBackup ($([math]::Round($daysSince,0)) days ago)"
+                                }
+                            } catch { }
                         }
                         [void]$dbs.Add($db)
                     }
@@ -1096,8 +1107,10 @@ ORDER BY d.name
                     $conn.Close()
                     $inst.Databases = $dbs
                 } catch {
-                    cb-Log "SQL-$instName" "Database query failed (may need SA access): $_"
-                    $inst.Partial = $true
+                    cb-Log "SQL-$instName" "Deep connect failed: $_"
+                    $inst.Connected  = $false
+                    $inst.Databases  = @()
+                    $inst.Partial    = $true
                 }
             } catch {
                 cb-Log "SQL-$instName" "Instance collection error: $_"
@@ -1218,6 +1231,130 @@ ORDER BY d.name
             cb-Log "HyperV" "Outer error: $_"
             $result.Partial = $true
         }
+
+        # -- HYPER-V PERFORMANCE CHECK (PerfMon .blg log files) ----------------
+        # Look for Performance Monitor Data Collector Set log files with 30+ days
+        # of history. If found, pull per-VM CPU% and memory counters from the log.
+        $result.HyperVPerfAvailable = $false
+        $result.HyperVPerfNote      = ''
+        $result.HyperVPerf          = $null
+
+        try {
+            $blgFiles = [System.Collections.ArrayList]@()
+            $perfLogRoots = @('C:\PerfLogs\Admin', 'C:\PerfLogs')
+            foreach ($root in $perfLogRoots) {
+                if (Test-Path $root) {
+                    try {
+                        $found = Get-ChildItem -Path $root -Filter '*.blg' -Recurse -ErrorAction SilentlyContinue
+                        if ($found) { foreach ($f in $found) { [void]$blgFiles.Add($f) } }
+                    } catch { }
+                }
+            }
+
+            # Find the best candidate: longest span that is >= 30 days
+            $bestFile  = $null
+            $bestSpan  = 0
+            foreach ($blg in $blgFiles) {
+                try {
+                    $spanDays = ($blg.LastWriteTime - $blg.CreationTime).TotalDays
+                    if ($spanDays -ge 30 -and $spanDays -gt $bestSpan) {
+                        $bestSpan = $spanDays
+                        $bestFile = $blg
+                    }
+                } catch { }
+            }
+
+            if ($null -eq $bestFile) {
+                $result.HyperVPerfAvailable = $false
+                $result.HyperVPerfNote      = 'No 30-day PerfMon history found — performance data unavailable'
+            } else {
+                # Attempt to read Hyper-V counters from the log file
+                try {
+                    $blgPath   = $bestFile.FullName
+                    $startDate = $bestFile.CreationTime.ToString('yyyy-MM-dd')
+                    $endDate   = $bestFile.LastWriteTime.ToString('yyyy-MM-dd')
+                    $spanDays  = [math]::Round($bestSpan, 1)
+
+                    $cpuCounter = '\Hyper-V Hypervisor Virtual Processor(*)\% Guest Run Time'
+                    $ramCounter = '\Hyper-V Dynamic Memory VM(*)\Physical Memory'
+
+                    # Import-Counter reads from a .blg binary log file
+                    $cpuData = Import-Counter -Path $blgPath -Counter $cpuCounter -MaxSamples 9999999 -ErrorAction Stop |
+                               Select-Object -ExpandProperty CounterSamples
+
+                    # Group by instance (VM name) and calculate avg/max
+                    $vmStats = @{}
+                    foreach ($sample in $cpuData) {
+                        # Counter instance is like "vm name:0" — strip the colon-suffix
+                        $instLabel = ($sample.InstanceName -replace ':\d+$', '').Trim()
+                        if ($instLabel -eq '_total' -or $instLabel -eq '') { continue }
+                        if (-not $vmStats.ContainsKey($instLabel)) {
+                            $vmStats[$instLabel] = @{ CpuSamples=[System.Collections.ArrayList]@(); RamSamples=[System.Collections.ArrayList]@() }
+                        }
+                        [void]$vmStats[$instLabel].CpuSamples.Add([double]$sample.CookedValue)
+                    }
+
+                    # Pull RAM samples — wrap in try so missing counter doesn't abort
+                    try {
+                        $ramData = Import-Counter -Path $blgPath -Counter $ramCounter -MaxSamples 9999999 -ErrorAction Stop |
+                                   Select-Object -ExpandProperty CounterSamples
+                        foreach ($sample in $ramData) {
+                            $instLabel = ($sample.InstanceName -replace ':\d+$', '').Trim()
+                            if ($instLabel -eq '_total' -or $instLabel -eq '') { continue }
+                            if (-not $vmStats.ContainsKey($instLabel)) {
+                                $vmStats[$instLabel] = @{ CpuSamples=[System.Collections.ArrayList]@(); RamSamples=[System.Collections.ArrayList]@() }
+                            }
+                            [void]$vmStats[$instLabel].RamSamples.Add([double]$sample.CookedValue)
+                        }
+                    } catch { }
+
+                    # Build per-VM result list
+                    $vmPerfList = [System.Collections.ArrayList]@()
+                    foreach ($vmName in $vmStats.Keys) {
+                        $cpu  = $vmStats[$vmName].CpuSamples
+                        $ram  = $vmStats[$vmName].RamSamples
+                        $cpuAvg = if ($cpu.Count -gt 0) { [math]::Round(($cpu | Measure-Object -Average).Average, 1) } else { $null }
+                        $cpuMax = if ($cpu.Count -gt 0) { [math]::Round(($cpu | Measure-Object -Maximum).Maximum, 1) } else { $null }
+                        $ramAvg = if ($ram.Count -gt 0) { [math]::Round(($ram | Measure-Object -Average).Average, 0) } else { $null }
+                        $ramMax = if ($ram.Count -gt 0) { [math]::Round(($ram | Measure-Object -Maximum).Maximum, 0) } else { $null }
+                        [void]$vmPerfList.Add(@{
+                            Name        = $vmName
+                            CPU_Avg_Pct = $cpuAvg
+                            CPU_Max_Pct = $cpuMax
+                            RAM_Avg_MB  = $ramAvg
+                            RAM_Max_MB  = $ramMax
+                        })
+                    }
+
+                    $result.HyperVPerfAvailable = $true
+                    $result.HyperVPerf = @{
+                        Available  = $true
+                        SpanDays   = $spanDays
+                        LogPath    = $blgPath
+                        StartDate  = $startDate
+                        EndDate    = $endDate
+                        VMs        = $vmPerfList
+                    }
+                } catch {
+                    # Get-Counter failed on this log (counters missing, format issue, etc.)
+                    $result.HyperVPerfAvailable = $false
+                    $result.HyperVPerf = @{
+                        Available = $false
+                        LogPath   = $bestFile.FullName
+                        SpanDays  = [math]::Round($bestSpan, 1)
+                        Note      = "Get-Counter failed reading log: $_"
+                        VMs       = @()
+                    }
+                    cb-Log "HyperV-Perf" "Get-Counter failed on $($bestFile.FullName): $_"
+                }
+            }
+        } catch {
+            # Entire perf check failed — non-fatal
+            $result.HyperVPerfAvailable = $false
+            $result.HyperVPerfNote      = "PerfMon check error: $_"
+            cb-Log "HyperV-Perf" "Outer perf check error: $_"
+        }
+
         return $result
     }
 
