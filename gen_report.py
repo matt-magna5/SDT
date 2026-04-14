@@ -45,7 +45,7 @@ for _fname in sorted(os.listdir(SESSION_DIR)):
     if os.path.getsize(_fpath) < 100: continue
     try:
         _hinv = jload(_fpath)
-        if _hinv.get('_type') == 'HyperVInventory':
+        if _hinv.get('_type') in ('HyperVInventory', 'vSphereInventory'):
             hv_inventories.append(_hinv)
     except Exception:
         pass
@@ -1450,16 +1450,21 @@ def build_hv_tab():
     all_html = ''
 
     for hvi in hv_inventories:
-        hs       = hvi.get('HostSummary', {})
-        hv_name  = hvi.get('HVHost', 'Unknown Host')
-        model    = hs.get('Model', '—')
-        mfg      = hs.get('Manufacturer', '')
-        cpu_model= hs.get('CPUModel', '—')
-        cpu_cores= hs.get('CPUCores', '?')
-        cpu_log  = hs.get('CPULogical', '?')
-        ram_gb   = float(hs.get('TotalRAMgb', 0) or 0)
-        vols     = hs.get('Volumes', [])
-        vms      = hvi.get('VMs', [])
+        hs         = hvi.get('HostSummary', {})
+        is_vsphere = hvi.get('_type') == 'vSphereInventory'
+        hv_name    = hvi.get('HVHost', 'Unknown Host')
+        host_ip    = hvi.get('HostIP', '')
+        esxi_ver   = hvi.get('ESXiVersion', '')
+        host_type  = hvi.get('HostType', 'Hyper-V')
+        model      = hs.get('Model', '—')
+        mfg        = hs.get('Manufacturer', '')
+        cpu_model  = hs.get('CPUModel', '—')
+        cpu_cores  = hs.get('CPUCores', '?')
+        cpu_log    = hs.get('CPULogical', cpu_cores)
+        ram_gb     = float(hs.get('TotalRAMgb', 0) or 0)
+        vols       = hs.get('Volumes', [])
+        datastores = hvi.get('Datastores', [])
+        vms        = hvi.get('VMs', [])
 
         # Aggregate totals
         host_vcpu = sum(v.get('vCPU', 0) or 0 for v in vms)
@@ -1471,41 +1476,71 @@ def build_hv_tab():
         # VM table
         vm_rows = ''
         for i, vm in enumerate(vms):
-            disks   = [d for d in (vm.get('Disks', []) or []) if isinstance(d, dict)]
-            disk_gb = sum(float(d.get('SizeGB', 0) or 0) for d in disks)
+            disks     = [d for d in (vm.get('Disks', []) or []) if isinstance(d, dict)]
+            disk_gb   = sum(float(d.get('SizeGB', 0) or 0) for d in disks)
             disk_used = sum(float(d.get('UsedGB', 0) or 0) for d in disks)
-            state   = vm.get('State', '?')
-            sc      = 'green' if state in ('Running', 'POWERED_ON') else 'gray'
-            snaps   = vm.get('Snapshots', 0) or 0
-            bg      = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            disk_str  = f'{disk_gb:.0f} GB' + (f' / {disk_used:.0f} GB used' if disk_used else '')
+            state     = vm.get('State', '?')
+            sc        = 'green' if state in ('Running', 'POWERED_ON') else 'gray'
+            snaps     = vm.get('Snapshots', 0) or 0
+            ip_val    = vm.get('IP', '') or vm.get('IPs', '') or '—'
+            guest_os  = vm.get('GuestOS', '')
+            bg        = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            last_col  = (f'<td style="padding:6px 10px;font-size:8pt;color:#6b6080">{h(guest_os)}</td>'
+                         if is_vsphere else
+                         f'<td style="padding:6px 10px;text-align:center">{pill(str(snaps), "yellow" if snaps else "green")}</td>')
             vm_rows += (f'<tr{bg}>'
                        f'<td style="font-weight:600;padding:6px 10px">{h(vm.get("Name",""))}</td>'
                        f'<td style="padding:6px 10px">{pill(state, sc)}</td>'
                        f'<td style="padding:6px 10px;text-align:center">{vm.get("vCPU","?")}</td>'
                        f'<td style="padding:6px 10px;text-align:center">{float(vm.get("RAMgb",0) or 0):.0f} GB</td>'
-                       f'<td style="padding:6px 10px;font-family:monospace;font-size:8.5pt">{h(str(vm.get("IPs","—")))}</td>'
-                       f'<td style="padding:6px 10px;text-align:center">{disk_gb:.0f} GB / {disk_used:.0f} GB used</td>'
-                       f'<td style="padding:6px 10px;text-align:center">{pill(str(snaps), "yellow" if snaps else "green")}</td>'
+                       f'<td style="padding:6px 10px;font-family:monospace;font-size:8.5pt">{h(str(ip_val))}</td>'
+                       f'<td style="padding:6px 10px;text-align:center">{disk_str}</td>'
+                       f'{last_col}'
                        f'</tr>\n')
 
-        # Storage volumes
-        vol_rows = ''
-        for vol in vols:
-            pct = float(vol.get('UsedPct', 0) or 0)
-            pc  = 'red' if pct >= 85 else ('yellow' if pct >= 70 else 'green')
-            vol_rows += (f'<tr><td style="padding:5px 10px;font-family:monospace">{h(vol.get("Drive",""))}</td>'
-                        f'<td style="padding:5px 10px;font-size:8.5pt;color:#6b6080">{h(vol.get("Label",""))}</td>'
-                        f'<td style="padding:5px 10px">{float(vol.get("TotalGB",0)):.0f} GB</td>'
-                        f'<td style="padding:5px 10px">{float(vol.get("FreeGB",0)):.0f} GB free</td>'
-                        f'<td style="padding:5px 10px">{pill(f"{pct:.0f}%", pc)}{disk_bar(pct)}</td></tr>\n')
+        last_col_hdr = '<th style="padding:7px 10px;color:#fff">Guest OS</th>' if is_vsphere else '<th style="padding:7px 10px;color:#fff">Snaps</th>'
 
-        hv_anchor = hv_name.lower().replace('.', '').replace('-', '')
+        # Storage volumes (HyperV) or Datastores (vSphere)
+        vol_rows = ''
+        if is_vsphere:
+            for ds in datastores:
+                cap  = float(ds.get('CapacityGB', 0) or 0)
+                free = float(ds.get('FreeGB', 0) or 0)
+                prov = float(ds.get('ProvisionedGB', 0) or 0)
+                pct  = round((cap - free) / cap * 100, 1) if cap else 0
+                pc   = 'red' if pct >= 85 else ('yellow' if pct >= 70 else 'green')
+                vol_rows += (f'<tr><td style="padding:5px 10px;font-weight:600">{h(ds.get("Name",""))}</td>'
+                            f'<td style="padding:5px 10px;font-size:8.5pt;color:#6b6080">{h(ds.get("Type",""))} &middot; {h(ds.get("DriveType",""))}</td>'
+                            f'<td style="padding:5px 10px">{cap:.0f} GB</td>'
+                            f'<td style="padding:5px 10px">{prov:.0f} GB</td>'
+                            f'<td style="padding:5px 10px">{free:.0f} GB free</td>'
+                            f'<td style="padding:5px 10px">{pill(f"{pct:.0f}%", pc)}{disk_bar(pct)}</td></tr>\n')
+        else:
+            for vol in vols:
+                pct = float(vol.get('UsedPct', 0) or 0)
+                pc  = 'red' if pct >= 85 else ('yellow' if pct >= 70 else 'green')
+                vol_rows += (f'<tr><td style="padding:5px 10px;font-family:monospace">{h(vol.get("Drive",""))}</td>'
+                            f'<td style="padding:5px 10px;font-size:8.5pt;color:#6b6080">{h(vol.get("Label",""))}</td>'
+                            f'<td style="padding:5px 10px">{float(vol.get("TotalGB",0)):.0f} GB</td>'
+                            f'<td style="padding:5px 10px">{float(vol.get("FreeGB",0)):.0f} GB free</td>'
+                            f'<td style="padding:5px 10px">{pill(f"{pct:.0f}%", pc)}{disk_bar(pct)}</td></tr>\n')
+
+        hv_anchor   = hv_name.lower().replace('.', '').replace('-', '')
+        host_badge  = f'ESXi {esxi_ver}' if is_vsphere else 'Hyper-V'
+        host_sub    = (f'{h(mfg)} {h(model)} &middot; {h(cpu_model)} &middot; {cpu_cores} cores &middot; {h(host_ip)}'
+                       if is_vsphere else
+                       f'{h(mfg)} {h(model)} &middot; {h(cpu_model)} &middot; {cpu_cores} cores / {cpu_log} logical &middot; {ram_gb:.0f} GB RAM')
+        storage_label = 'Datastores' if is_vsphere else 'Host Storage Volumes'
+        storage_hdr   = ('''<tr style="background:#ede9fe"><th style="padding:5px 10px;text-align:left;font-size:8pt">Datastore</th><th style="padding:5px 10px;font-size:8pt">Type</th><th style="padding:5px 10px;font-size:8pt">Capacity</th><th style="padding:5px 10px;font-size:8pt">Provisioned</th><th style="padding:5px 10px;font-size:8pt">Free</th><th style="padding:5px 10px;font-size:8pt">Usage</th></tr>'''
+                         if is_vsphere else
+                         '''<tr style="background:#ede9fe"><th style="padding:5px 10px;text-align:left;font-size:8pt">Drive</th><th style="padding:5px 10px;font-size:8pt">Label</th><th style="padding:5px 10px;font-size:8pt">Total</th><th style="padding:5px 10px;font-size:8pt">Free</th><th style="padding:5px 10px;font-size:8pt">Usage</th></tr>''')
         host_html = f'''
 <div id="hv-host-{hv_anchor}" style="background:#f5f4f8;border-radius:8px;padding:16px 20px;margin-bottom:20px;border:1px solid #e0daf0;">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
   <div>
-    <div style="font-size:13pt;font-weight:700;color:#271e41;">{h(hv_name)}</div>
-    <div style="font-size:9pt;color:#6b6080;margin-top:2px;">{h(mfg)} {h(model)} &middot; {h(cpu_model)} &middot; {cpu_cores} cores / {cpu_log} logical &middot; {ram_gb:.0f} GB RAM</div>
+    <div style="font-size:13pt;font-weight:700;color:#271e41;">{h(hv_name)} <span style="font-size:8.5pt;font-weight:400;background:#ede9fe;color:#5b1fa4;padding:2px 8px;border-radius:10px;vertical-align:middle">{host_badge}</span></div>
+    <div style="font-size:9pt;color:#6b6080;margin-top:2px;">{host_sub}</div>
   </div>
   <div style="text-align:right;">
     <div style="font-size:9pt;font-weight:700;color:#5b1fa4;">{len(vms)} VMs &middot; {running} running</div>
@@ -1519,14 +1554,14 @@ def build_hv_tab():
   <th style="padding:7px 10px;color:#fff">vCPU</th>
   <th style="padding:7px 10px;color:#fff">RAM</th>
   <th style="padding:7px 10px;color:#fff">IP</th>
-  <th style="padding:7px 10px;color:#fff">Disk (Size / Used)</th>
-  <th style="padding:7px 10px;color:#fff">Snaps</th>
+  <th style="padding:7px 10px;color:#fff">Disk (Size)</th>
+  {last_col_hdr}
 </tr>
 {vm_rows if vm_rows else '<tr><td colspan="7" style="padding:10px;color:#6b6080;font-style:italic;">No VMs found on this host</td></tr>'}
 </table>
-''' + (f'''<div style="font-size:8.5pt;font-weight:700;color:#5b1fa4;margin-bottom:6px;text-transform:uppercase;letter-spacing:.4px;">Host Storage Volumes</div>
+''' + (f'''<div style="font-size:8.5pt;font-weight:700;color:#5b1fa4;margin-bottom:6px;text-transform:uppercase;letter-spacing:.4px;">{storage_label}</div>
 <table style="width:100%;font-size:9pt;border-collapse:collapse;">
-<tr style="background:#ede9fe"><th style="padding:5px 10px;text-align:left;font-size:8pt">Drive</th><th style="padding:5px 10px;font-size:8pt">Label</th><th style="padding:5px 10px;font-size:8pt">Total</th><th style="padding:5px 10px;font-size:8pt">Free</th><th style="padding:5px 10px;font-size:8pt">Usage</th></tr>
+{storage_hdr}
 {vol_rows}
 </table>''' if vol_rows else '') + \
 '<div style="text-align:right;margin-top:10px;padding-top:8px;border-top:1px solid #e0daf0;">' \
@@ -1537,7 +1572,7 @@ def build_hv_tab():
 
     # Summary stats card
     summary_card = f'''<div class="stat-grid" style="margin-bottom:18px;">
-<div class="stat-box"><div class="stat-num">{len(hv_inventories)}</div><div class="stat-lbl">Hyper-V Hosts</div></div>
+<div class="stat-box"><div class="stat-num">{len(hv_inventories)}</div><div class="stat-lbl">Virtualization Hosts</div></div>
 <div class="stat-box"><div class="stat-num">{total_vms}</div><div class="stat-lbl">Total VMs</div></div>
 <div class="stat-box"><div class="stat-num">{total_vcpu}</div><div class="stat-lbl">vCPUs Allocated</div></div>
 <div class="stat-box"><div class="stat-num">{total_ram:.0f} GB</div><div class="stat-lbl">RAM Allocated</div></div>
