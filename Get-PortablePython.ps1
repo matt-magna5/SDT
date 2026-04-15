@@ -14,7 +14,7 @@ Write-Host "  SDT -- Dependencies Setup" -ForegroundColor Cyan
 Write-Host ("  " + "=" * 40) -ForegroundColor DarkCyan
 Write-Host ""
 
-# ── PORTABLE PYTHON ──────────────────────────────────────────────────────────
+# --- PORTABLE PYTHON ---
 
 $PY_VERSION  = "3.12.6"
 $PY_URL      = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-embed-amd64.zip"
@@ -33,14 +33,14 @@ if (Test-Path (Join-Path $DEST_FOLDER "python.exe")) {
         if (Test-Path (Join-Path $DEST_FOLDER "python.exe")) {
             Write-Host "  [OK] Portable Python ready." -ForegroundColor Green
         } else {
-            Write-Host "  [WARN] Python extracted but python.exe not found — check $DEST_FOLDER" -ForegroundColor Yellow
+            Write-Host "  [WARN] Python extracted but python.exe not found. Check: $DEST_FOLDER" -ForegroundColor Yellow
         }
     } catch {
         Write-Host "  [FAIL] Python download failed: $_" -ForegroundColor Red
     }
 }
 
-# ── PLINK.EXE (PuTTY SSH client — for Linux discovery) ───────────────────────
+# --- PLINK.EXE (PuTTY SSH client for Linux discovery) ---
 
 $PLINK_URL  = "https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe"
 $PLINK_DEST = Join-Path $PSScriptRoot "plink.exe"
