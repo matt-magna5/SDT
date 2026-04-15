@@ -9,6 +9,9 @@ _output/
 __pycache__/
 *.pyc
 
+# Portable Python bundle — run Get-PortablePython.ps1 to set up locally
+python/
+
 # Keep archive scripts but not output
 _archive/*.html
 _archive/*.json

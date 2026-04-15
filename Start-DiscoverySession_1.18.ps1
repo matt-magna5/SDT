@@ -1788,13 +1788,18 @@ if ($script:vSphereSources.Count -gt 0) {
     B-Line "collecting 90-day CPU/RAM/IOPS history from vSphere..."
     Write-Host ""
 
-    # Locate Python
+    # Locate Python — portable bundle takes priority over system install
     $pythonCmd = $null
-    foreach ($pyCandidate in @('python','python3','py')) {
-        try {
-            $pyOut = & $pyCandidate --version 2>&1
-            if ($pyOut -match 'Python [23]') { $pythonCmd = $pyCandidate; break }
-        } catch { }
+    $portablePy = Join-Path $PSScriptRoot 'python\python.exe'
+    if (Test-Path $portablePy) {
+        $pythonCmd = $portablePy
+    } else {
+        foreach ($pyCandidate in @('python','python3','py')) {
+            try {
+                $pyOut = & $pyCandidate --version 2>&1
+                if ($pyOut -match 'Python [23]') { $pythonCmd = $pyCandidate; break }
+            } catch { }
+        }
     }
 
     $collectorScript = Join-Path $PSScriptRoot 'collect_vsphere_perf.py'
@@ -1910,22 +1915,54 @@ if ($outputFiles.Count -gt 0) {
     $manifest | ConvertTo-Json -Depth 5 | Out-File $manifestFile -Encoding UTF8 -Force
     B-OK "Manifest: $(Split-Path $manifestFile -Leaf)"
 
-    # ── NEXT STEP ────────────────────────────────────────────────────────────
+    # ── AUTO-GENERATE HTML REPORT ────────────────────────────────────────────
     $genReportScript = Join-Path $PSScriptRoot 'gen_report.py'
+    $portablePy      = Join-Path $PSScriptRoot 'python\python.exe'
+
+    $reportPython = $null
+    if (Test-Path $portablePy) {
+        $reportPython = $portablePy
+    } else {
+        foreach ($pyCandidate in @('python','python3','py')) {
+            try {
+                $pyOut = & $pyCandidate --version 2>&1
+                if ($pyOut -match 'Python [23]') { $reportPython = $pyCandidate; break }
+            } catch { }
+        }
+    }
+
     Write-Host ""
     Write-Host ("=" * 72) -ForegroundColor DarkCyan
-    Write-Host "  NEXT STEP -- Generate HTML Report" -ForegroundColor Cyan
-    Write-Host ("=" * 72) -ForegroundColor DarkCyan
-    Write-Host ""
-    Write-Host "  Role labels are auto-detected from installed roles and services." -ForegroundColor DarkGray
-    Write-Host "  Only edit needed: set  in_scope: false  for out-of-scope servers." -ForegroundColor DarkGray
-    Write-Host ""
-    Write-Host "  Manifest: $manifestFile" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  Run:" -ForegroundColor DarkGray
-    Write-Host "  python `"$genReportScript`" `"$manifestFile`"" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "  HTML drops into: $sessionFolder" -ForegroundColor DarkGray
+
+    if ($reportPython -and (Test-Path $genReportScript)) {
+        Write-Host "  GENERATING HTML REPORT" -ForegroundColor Cyan
+        Write-Host ("=" * 72) -ForegroundColor DarkCyan
+        Write-Host ""
+        Write-Host "  Role labels are auto-detected from installed roles and services." -ForegroundColor DarkGray
+        Write-Host "  To exclude a server post-run: set  in_scope: false  in the manifest." -ForegroundColor DarkGray
+        Write-Host ""
+        try {
+            & $reportPython $genReportScript $manifestFile
+            Write-Host ""
+            B-OK "Report saved to: $sessionFolder"
+        } catch {
+            B-Err "Report generation failed: $_"
+            Write-Host ""
+            Write-Host "  Run manually:" -ForegroundColor DarkGray
+            Write-Host "  python `"$genReportScript`" `"$manifestFile`"" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  NEXT STEP -- Generate HTML Report" -ForegroundColor Yellow
+        Write-Host ("=" * 72) -ForegroundColor DarkCyan
+        Write-Host ""
+        Write-Host "  Python not found. Run Get-PortablePython.ps1 once to set up:" -ForegroundColor Yellow
+        Write-Host "  .\Get-PortablePython.ps1" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "  Then re-run, or generate the report manually:" -ForegroundColor DarkGray
+        Write-Host "  python `"$genReportScript`" `"$manifestFile`"" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "  HTML drops into: $sessionFolder" -ForegroundColor DarkGray
+    }
     Write-Host ""
 }
 
