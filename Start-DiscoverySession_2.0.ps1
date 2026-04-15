@@ -202,14 +202,18 @@ function Get-SuggestedHypervisors {
 
 # -- SUGGESTED SERVER SCAN (AD - by OS type, bare metal path) -----------------
 function Get-SuggestedServers {
+    # Returns ALL Windows servers from AD — caller filters out known VMs.
+    # No nested jobs: this function runs inside an outer job with a hard timeout.
     $found = [System.Collections.ArrayList]@()
 
-    # Try AD module first
+    # Try AD module first (fast on a DC, works wherever RSAT is installed)
+    $adOK = $false
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
-        $adComps = Get-ADComputer -Filter {OperatingSystem -like "*Server*"} `
+        $adComps = Get-ADComputer -Filter * `
             -Properties Name,IPv4Address,Description,OperatingSystem -ErrorAction Stop
         foreach ($c in $adComps) {
+            if ($c.OperatingSystem -notmatch 'Server') { continue }
             if (-not ($found | Where-Object { $_.Name -ieq $c.Name })) {
                 [void]$found.Add([PSCustomObject]@{
                     Name=$c.Name; IP=$c.IPv4Address; Source='AD'
@@ -217,13 +221,19 @@ function Get-SuggestedServers {
                 })
             }
         }
-    } catch {
-        # ADSI/LDAP fallback (no AD module needed)
+        $adOK = $true
+    } catch { }
+
+    # ADSI/LDAP fallback — works on any domain-joined machine, no module needed
+    if (-not $adOK) {
         try {
             $root   = [ADSI]'LDAP://RootDSE'
             $base   = $root.defaultNamingContext
             $filter = '(&(objectClass=computer)(operatingSystem=*Server*))'
             $srch   = New-Object DirectoryServices.DirectorySearcher([ADSI]"LDAP://$base", $filter)
+            $srch.ClientTimeout   = [TimeSpan]::FromSeconds(10)
+            $srch.ServerTimeLimit = [TimeSpan]::FromSeconds(10)
+            $srch.PageSize        = 500
             @('name','dNSHostName','description','operatingSystem') | ForEach-Object { [void]$srch.PropertiesToLoad.Add($_) }
             $srch.FindAll() | ForEach-Object {
                 $n   = if ($_.Properties['name'].Count)            { $_.Properties['name'][0] }            else { '' }
@@ -1359,7 +1369,10 @@ if ($hypervisorSources.Count -gt 0 -and $hypervisorVMs.Count -gt 0) {
     if ($scanChoice -eq 'Y') {
         $spin = @('|','/','-','\'); $si = 0
         Write-Host "  Scanning...  (any key to cancel)" -NoNewline -ForegroundColor DarkGray
-        $scanJob  = Start-Job -ScriptBlock ([ScriptBlock]::Create("function Get-SuggestedHypervisors {`n" + (Get-Command Get-SuggestedHypervisors).Definition + "`n}`nGet-SuggestedHypervisors"))
+        # In vCenter/HV mode use Get-SuggestedServers (all Windows servers) so
+        # naming conventions like ACL-DEN-* are found, not just VH*/ESX* patterns.
+        $scanFuncDef = (Get-Command Get-SuggestedServers).Definition
+        $scanJob  = Start-Job -ScriptBlock ([ScriptBlock]::Create("function Get-SuggestedServers {`n$scanFuncDef`n}`nGet-SuggestedServers"))
         $deadline = [DateTime]::Now.AddSeconds(15)
         $skipped  = $false
         while (-not $scanJob.HasExited) {
@@ -1687,10 +1700,14 @@ foreach ($vm in $allVMTargets) {
     $wmi = Test-WMIAccess -Target $addr -Cred $script:DomainCred
     if (-not $wmi.OK) {
         $row.Ping = $true
-        # If vCenter guest hint is non-Windows, treat as Linux/appliance instead of MANUAL
+        # If vCenter guest hint OR machine name suggests non-Windows, tag as Linux/appliance
         $guestHint  = (($vm.GuestOS -replace '_',' ') + '').ToUpper().Trim()
-        $looksWin   = ($guestHint -match 'WINDOWS|WIN') -or [string]::IsNullOrEmpty($guestHint) -or $guestHint -eq 'UNKNOWN'
-        if (-not $looksWin) {
+        $nameUpper  = $displayName.ToUpper()
+        $guestIsLinux = (-not [string]::IsNullOrEmpty($guestHint)) -and
+                        ($guestHint -ne 'UNKNOWN') -and
+                        ($guestHint -notmatch 'WINDOWS|WIN')
+        $nameIsAppliance = $nameUpper -match 'VCENTER|ODNS|DNS(?!DC)|IDRAC|ILO\d|IMM|BMC|ESXI\d|PHOTON|APPLIANCE'
+        if ($guestIsLinux -or $nameIsAppliance) {
             Write-Host " LINUX/APPLIANCE" -ForegroundColor Cyan
             $row.Action        = 'LINUX'
             $row.SkipReason    = "Non-Windows guest ($($vm.GuestOS)) -- WinRM N/A"
