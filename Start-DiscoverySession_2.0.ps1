@@ -21,9 +21,12 @@
 #>
 
 [CmdletBinding()]
-param()
+param(
+    [switch]$ReuseCreds   # set automatically when restarting via [B]
+)
 
 $ErrorActionPreference = 'Continue'
+$script:CredCacheFile = Join-Path $env:TEMP 'sdt-session-creds.xml'
 $script:SessionVersion  = '2.3'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
@@ -1252,11 +1255,22 @@ Write-Host ""
 Write-Host "  Format:  DOMAIN\username   (domain-joined servers - most common)" -ForegroundColor Cyan
 Write-Host "           .\Administrator   (local admin, workgroup servers only)" -ForegroundColor DarkGray
 Write-Host ""
-try {
-    $script:DomainCred = Get-Credential -Message "SERVER credentials -- DOMAIN\username or .\Administrator"
-    if (-not $script:DomainCred) { throw "No credentials" }
-    B-OK "Server creds loaded: $($script:DomainCred.UserName)"
-} catch { B-Err "No credentials entered - cannot proceed"; exit 1 }
+$_credReused = $false
+if ($ReuseCreds -and (Test-Path $script:CredCacheFile)) {
+    try {
+        $script:DomainCred = Import-Clixml $script:CredCacheFile -ErrorAction Stop
+        Remove-Item $script:CredCacheFile -Force -ErrorAction SilentlyContinue
+        B-OK "Server creds reloaded: $($script:DomainCred.UserName)"
+        $_credReused = $true
+    } catch { }
+}
+if (-not $_credReused) {
+    try {
+        $script:DomainCred = Get-Credential -Message "SERVER credentials -- DOMAIN\username or .\Administrator"
+        if (-not $script:DomainCred) { throw "No credentials" }
+        B-OK "Server creds loaded: $($script:DomainCred.UserName)"
+    } catch { B-Err "No credentials entered - cannot proceed"; exit 1 }
+}
 
 # -----------------------------------------------------------------------------
 # PHASE 2 - ENUMERATE FROM HYPERVISORS
@@ -1700,22 +1714,25 @@ foreach ($vm in $allVMTargets) {
     $wmi = Test-WMIAccess -Target $addr -Cred $script:DomainCred
     if (-not $wmi.OK) {
         $row.Ping = $true
-        # If vCenter guest hint OR machine name suggests non-Windows, tag as Linux/appliance
-        $guestHint  = (($vm.GuestOS -replace '_',' ') + '').ToUpper().Trim()
-        $nameUpper  = $displayName.ToUpper()
-        $guestIsLinux = (-not [string]::IsNullOrEmpty($guestHint)) -and
-                        ($guestHint -ne 'UNKNOWN') -and
-                        ($guestHint -notmatch 'WINDOWS|WIN')
-        $nameIsAppliance = $nameUpper -match 'VCENTER|ODNS|DNS(?!DC)|IDRAC|ILO\d|IMM|BMC|ESXI\d|PHOTON|APPLIANCE'
-        if ($guestIsLinux -or $nameIsAppliance) {
-            Write-Host " LINUX/APPLIANCE" -ForegroundColor Cyan
+        # Test SSH port 22 — open port is a reliable Linux/appliance indicator
+        Write-Host " WMI failed, probing SSH..." -NoNewline -ForegroundColor DarkGray
+        $sshOpen = $false
+        try {
+            $sshOpen = (Test-NetConnection -ComputerName $addr -Port 22 `
+                        -InformationLevel Quiet -WarningAction SilentlyContinue `
+                        -ErrorAction SilentlyContinue)
+        } catch { }
+
+        if ($sshOpen) {
+            $osGuess = if ($vm.GuestOS -and $vm.GuestOS -ne 'Unknown') { $vm.GuestOS } else { 'Linux (SSH:22 detected)' }
+            Write-Host " SSH:22 OPEN -- Linux/Appliance" -ForegroundColor Cyan
             $row.Action        = 'LINUX'
-            $row.SkipReason    = "Non-Windows guest ($($vm.GuestOS)) -- WinRM N/A"
+            $row.SkipReason    = "SSH port 22 open -- Linux or appliance"
             $row.ConnectMethod = 'N/A (Linux/Appliance)'
-            $row.ResolvedOS    = $vm.GuestOS
+            $row.ResolvedOS    = $osGuess
         } else {
             Write-Host " WMI FAILED" -ForegroundColor Red
-            $row.Action    = 'MANUAL'
+            $row.Action     = 'MANUAL'
             $row.SkipReason = "WMI failed - $($wmi.Error)"
         }
         [void]$planRows.Add($row); continue
@@ -1895,10 +1912,11 @@ Write-Host "  [S]  Strict read-only - skip any server where WinRM is currently O
 Write-Host "  [N]  Abort - nothing changed on any server" -ForegroundColor Red
 Write-Host "  [R]  Re-probe - re-test connectivity with current credentials" -ForegroundColor DarkCyan
 Write-Host "  [C]  Re-enter credentials - change account and re-probe" -ForegroundColor Yellow
+Write-Host "  [B]  Back to start - restart from the top (credentials saved)" -ForegroundColor Magenta
 Write-Host ""
 
 $goAns = ''
-while ($goAns -notin @('Y','S','N','R','C')) { $goAns = (Read-Safe "  Ready to run? [Y/S/N/R/C]").ToUpper() }
+while ($goAns -notin @('Y','S','N','R','C','B')) { $goAns = (Read-Safe "  Ready to run? [Y/S/N/R/C/B]").ToUpper() }
 
 # Strict read-only mode: drop any server that would need WinRM bootstrap
 if ($goAns -eq 'S') {
@@ -1914,16 +1932,15 @@ if ($goAns -eq 'S') {
     $goAns = 'Y'
 }
 
+if ($goAns -eq 'B') {
+    Write-Host "  Saving credentials and restarting..." -ForegroundColor Magenta
+    try { $script:DomainCred | Export-Clixml $script:CredCacheFile -Force } catch { }
+    & $PSCommandPath -ReuseCreds
+    exit 0
+}
+
 if ($goAns -eq 'N') {
-    B-Line "Aborted. Nothing was changed on any server."
-    Write-Host ""
-    $restartAns = (Read-Safe "  Restart discovery with same credentials? [Y/N]").ToUpper()
-    if ($restartAns -eq 'Y') {
-        Write-Host "  Restarting..." -ForegroundColor Cyan
-        & $PSCommandPath
-        exit 0
-    }
-    Invoke-Cleanup; exit 0
+    B-Line "Aborted. Nothing was changed on any server."; Invoke-Cleanup; exit 0
 }
 if ($goAns -eq 'C') {
     Write-Host ""
@@ -1938,7 +1955,7 @@ if ($goAns -eq 'C') {
         }
     } catch { B-Err "Credential prompt failed - keeping existing: $($script:DomainCred.UserName)" }
 }
-} while ($goAns -in @('R','C'))
+} while ($goAns -in @('R','C','B') -and $goAns -ne 'B')
 
 # -----------------------------------------------------------------------------
 # PHASE 6 - DISCOVERY LOOP
