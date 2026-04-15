@@ -1420,15 +1420,18 @@ def build_server_tab(srv):
     rc += top_link(sid)
 
     # ── DISK STORAGE CARD ─────────────────────────────────────────────────────
-    disk_body = '<table><tr><th>Drive</th><th>Label</th><th>Filesystem</th><th>Total (GB)</th><th>Free (GB)</th><th>Used %</th><th>Utilization</th></tr>\n'
+    disk_body = '<table><tr><th>Drive</th><th>Label</th><th>Filesystem</th><th>Total (GB)</th><th>Used (GB)</th><th>Free (GB)</th><th>Used %</th><th>Utilization</th></tr>\n'
     for d in disks:
-        pct = d.get('UsedPct', 0)
+        pct      = d.get('UsedPct', 0)
+        total_gb = d.get('TotalGB', 0)
+        free_gb  = d.get('FreeGB', 0)
+        used_gb  = round(total_gb - free_gb, 2)
         pc  = 'red' if pct >= 85 else ('yellow' if pct >= 70 else 'green')
         c   = '#d63638' if pct >= 85 else ('#f5a623' if pct >= 70 else '#20c800')
         disk_body += (f'<tr><td><strong>{h(d.get("Drive","?"))}</strong></td>'
                      f'<td>{h(d.get("Label","") or "")}</td>'
                      f'<td>{h(d.get("Filesystem","NTFS"))}</td>'
-                     f'<td>{d.get("TotalGB",0):.2f}</td><td>{d.get("FreeGB",0):.2f}</td>'
+                     f'<td>{total_gb:.2f}</td><td>{used_gb:.2f}</td><td>{free_gb:.2f}</td>'
                      f'<td><span class="pill pill-{pc}">{pct}%</span></td>'
                      f'<td style="min-width:120px"><div class="disk-bar-bg"><div class="disk-bar-fill" '
                      f'style="width:{min(pct,100)}%;background:{c}"></div></div></td></tr>\n')
