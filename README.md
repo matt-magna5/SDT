@@ -2,11 +2,13 @@
 
 PowerShell-based server and VM discovery tool for presales cloud migration scoping. Connects to Hyper-V, ESXi, and vCenter environments, runs deep per-server discovery, and generates a branded HTML report for client presentations and internal SE use.
 
+**[Download SDT v2.0](https://github.com/trophyscar-bit/sdt/archive/refs/tags/v2.0.zip)** — unzip, run `Start-DiscoverySession_2.0.ps1`, done.
+
 ---
 
 ## What It Does
 
-### 1. Session Launcher — `Start-DiscoverySession_1.18.ps1` (v2.0)
+### 1. Session Launcher — `Start-DiscoverySession_2.0.ps1` (v2.0)
 
 Interactive session manager. Run this first on any domain-joined jump box or directly on a Hyper-V host.
 
@@ -44,7 +46,7 @@ Interactive session manager. Run this first on any domain-joined jump box or dir
 
 ---
 
-### 2. Server Discovery Agent — `Invoke-ServerDiscovery_1.18.ps1` (v2.0)
+### 2. Server Discovery Agent — `Invoke-ServerDiscovery_2.0.ps1` (v2.0)
 
 Runs on each target server (locally or via WinRM). Read-only. Safe on Windows Server 2008 R2+. Collects:
 
@@ -127,8 +129,8 @@ python gen_report.py <path-to-manifest.json>
 
 The folder contains:
 ```
-Start-DiscoverySession_1.18.ps1
-Invoke-ServerDiscovery_1.18.ps1
+Start-DiscoverySession_2.0.ps1
+Invoke-ServerDiscovery_2.0.ps1
 gen_report.py
 Get-PortablePython.ps1
 ```
@@ -145,7 +147,7 @@ Downloads the official Python 3.12 embeddable package (~10MB) into `SDT\python\`
 **Step 3 — Run discovery**
 
 ```powershell
-.\Start-DiscoverySession_1.18.ps1
+.\Start-DiscoverySession_2.0.ps1
 ```
 
 When discovery completes, the HTML report is generated automatically and saved to the session folder. Done.
