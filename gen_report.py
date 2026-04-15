@@ -7,6 +7,45 @@ import json, html as htmlmod, sys, io, os, re, datetime
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
+# ── DETECTION RULES ───────────────────────────────────────────────────────────
+# Loaded from detection_rules.json alongside this script.
+# Per-session override: place a detection_rules.json in the session folder —
+# its entries are appended to the global rules (additive, not replacing).
+
+def _load_rules():
+    def _read(path):
+        try:
+            with open(path, encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _merge(base, over):
+        result = {}
+        for k in set(list(base.keys()) + list(over.keys())):
+            bv, ov = base.get(k, []), over.get(k, [])
+            if isinstance(bv, list) and isinstance(ov, list):
+                result[k] = bv + [x for x in ov if x not in bv]
+            elif isinstance(bv, dict) and isinstance(ov, dict):
+                result[k] = _merge(bv, ov)
+            else:
+                result[k] = ov if ov else bv
+        return result
+
+    script_dir  = os.path.dirname(os.path.abspath(__file__))
+    global_path = os.path.join(script_dir, 'detection_rules.json')
+    rules = _read(global_path)
+
+    # Per-session override (session folder = manifest directory)
+    if 'manifest_dir' in globals():
+        session_path = os.path.join(manifest_dir, 'detection_rules.json')
+        if os.path.exists(session_path):
+            rules = _merge(rules, _read(session_path))
+
+    return rules
+
+RULES = _load_rules()
+
 if len(sys.argv) < 2:
     print("Usage: python gen_report.py <manifest.json>")
     sys.exit(1)
@@ -291,26 +330,13 @@ def build_flags(srv):
     return flags
 
 # ── SERVICE CATEGORIZATION ────────────────────────────────────────────────────
-_EDR_SVC  = ('sentinel', 'crowdstrike', 'csagent', 'csfalcon', 'cylance',
-             'huntress', 'carbonblack', 'cb defense', 'cortex xdr', 'cyserver',
-             'sophos', 'savservice', 'trellix', 'mcafee', 'eset', 'ekrn',
-             'kaspersky', 'avp', 'webroot', 'wrsa', 'bitdefender', 'malwarebytes',
-             'mbendpoint', 'cybereason', 'cramtray', 'darktrace', 'elastic-agent',
-             'elastic endpoint', 'deep instinct', 'cisco amp', 'withsecure',
-             'f-secure', 'avast', 'adlumin', 'arctic wolf',
-             'windefend', 'wdnissvc', 'mdcoresvc', 'logprocessorservice', 'sentinelstatic')
-_PAM_SVC  = ('quickpass', 'cyberark', 'delinea', 'beyondtrust', 'wallix', 'thycotic')
-_RMM_SVC  = ('solarwinds', 'basupport', 'automationmanager', 'windows agent',
-             'pme.agent', 'patchmanagement', 'filecache', 'msp.', 'ncentralmsp',
-             'kaseya', 'labtech', 'screenconnect', 'ncentral', 'nable',
-             'requesthandler', 'windowsagentmaintenance')
-_HV_SVC   = ('vmms', 'vmcompute', 'hvhost', 'vmicheart', 'vmicvss',
-             'vmicrdv', 'vmicshutdown', 'vhdsvc', 'nvspwmi')
-_PRINT_SVC = ('spooler',)
-_CORE_SVC = ('dhcp', 'dnscache', 'rpcss', 'rpcept', 'eventlog', 'lanmanserver',
-             'lanmanworkstation', 'netlogon', 'samss', 'winrm', 'w32tm',
-             'cryptsvc', 'winmgmt', 'schedule', 'mpssvc', 'bits',
-             'securityhealthservice', 'base filtering', 'seclogon')
+_SK       = RULES.get('service_keywords', {})
+_EDR_SVC  = tuple(_SK.get('edr',    []))
+_PAM_SVC  = tuple(_SK.get('pam',    []))
+_RMM_SVC  = tuple(_SK.get('rmm',    []))
+_HV_SVC   = tuple(_SK.get('hyperv', []))
+_PRINT_SVC = tuple(_SK.get('print', []))
+_CORE_SVC = tuple(_SK.get('core',   []))
 
 def categorize_svcs(svc_l):
     cats = {'EDR': [], 'PAM': [], 'RMM': [], 'HyperV': [], 'Core': [], 'Print': [],
@@ -343,13 +369,12 @@ def categorize_apps(app_l):
         if any(s in nm for s in skip_nm): continue
         if pub == 'microsoft corporation' and not any(k in nm for k in ('edge', 'defender')): continue
         combined = nm + ' ' + pub
-        if any(k in combined for k in ('sentinelone', 'crowdstrike', 'huntress', 'malwarebytes', 'bitdefender', 'sentinel agent')):
+        _ak = RULES.get('app_keywords', {})
+        if any(k in combined for k in _ak.get('security', [])):
             cats['Security'].append(app)
-        elif any(k in combined for k in ('n-able', 'solarwinds', 'kaseya', 'quickpass', 'connectwise',
-                                         'labtech', 'screenconnect', 'beanywhere', 'beyondtrust',
-                                         'automation manager', 'msp platform')):
+        elif any(k in combined for k in _ak.get('management', [])):
             cats['Management'].append(app)
-        elif any(k in combined for k in ('chrome', 'firefox', 'edge', 'opera', 'browser')):
+        elif any(k in combined for k in _ak.get('browser', [])):
             cats['Browser'].append(app)
         else:
             cats['Other'].append(app)
@@ -359,208 +384,32 @@ def detect_security(app_l, svc_l):
     all_n = [((a.get('Name') or '') + ' ' + (a.get('Publisher') or '')).lower() for a in app_l]
     all_s = [((s.get('DisplayName') or '') + ' ' + (s.get('Name') or '')).lower() for s in svc_l]
     combined = all_n + all_s
-    edr = rmm = pam = bdr = None
+    edr = rmm = pam = bdr = rmt = None
 
-    # EPP / EDR / MDR / XDR
-    _edr = [
-        ('sentinelone',          'SentinelOne'),
-        ('sentinel agent',       'SentinelOne'),
-        ('crowdstrike',          'CrowdStrike Falcon'),
-        ('csfalcon',             'CrowdStrike Falcon'),
-        ('csagent',              'CrowdStrike Falcon'),
-        ('huntress',             'Huntress MDR'),
-        ('cylance',              'BlackBerry Cylance'),
-        ('carbon black',         'VMware Carbon Black'),
-        ('cb defense',           'VMware Carbon Black'),
-        ('cortex xdr',           'Palo Alto Cortex XDR'),
-        ('cyserver',             'Palo Alto Cortex XDR'),
-        ('traps',                'Palo Alto Cortex XDR'),
-        ('cybereason',           'Cybereason EDR'),
-        ('cramtray',             'Cybereason EDR'),
-        ('deep instinct',        'Deep Instinct'),
-        ('darktrace',            'Darktrace'),
-        ('elastic security',     'Elastic Security'),
-        ('elastic agent',        'Elastic Security'),
-        ('elastic endpoint',     'Elastic Security'),
-        ('trellix',              'Trellix (McAfee)'),
-        ('mcafee',               'McAfee / Trellix'),
-        ('eset endpoint',        'ESET Endpoint Security'),
-        ('ekrn',                 'ESET'),
-        ('sophos',               'Sophos'),
-        ('savservice',           'Sophos'),
-        ('symantec endpoint',    'Symantec Endpoint'),
-        ('norton',               'Symantec / Norton'),
-        ('kaspersky',            'Kaspersky'),
-        ('avp service',          'Kaspersky'),
-        ('webroot',              'Webroot SecureAnywhere'),
-        ('wrsa',                 'Webroot SecureAnywhere'),
-        ('bitdefender',          'Bitdefender GravityZone'),
-        ('malwarebytes',         'Malwarebytes'),
-        ('mbendpointagent',      'Malwarebytes EDR'),
-        ('cisco secure endpoint','Cisco Secure Endpoint'),
-        ('cisco amp',            'Cisco Secure Endpoint'),
-        ('f-secure',             'F-Secure'),
-        ('withsecure',           'WithSecure (F-Secure)'),
-        ('avast',                'Avast'),
-        ('avg ',                 'AVG'),
-        ('adlumin',              'Adlumin MDR'),
-        ('arctic wolf',          'Arctic Wolf MDR'),
-        ('blackpoint',           'Blackpoint Cyber'),
-        ('ontinue',              'Ontinue MDR'),
-        ('netsurion',            'Netsurion MDR'),
-        ('microsoft defender for endpoint', 'Microsoft Defender for Endpoint'),
-        ('sense',                'Microsoft Defender for Endpoint'),
-    ]
-    for k, v in _edr:
-        if any(k in n for n in combined):
-            edr = v; break
+    _sp = RULES.get('security_products', {})
 
-    # RMM
-    _rmm = [
-        ('n-able',               'N-able'),
-        ('n_able',               'N-able'),
-        ('solarwinds',           'SolarWinds / N-able'),
-        ('advanced monitoring agent', 'N-able N-sight'),
-        ('windows agent service','N-able'),
-        ('ninjarmm',             'NinjaOne RMM'),
-        ('ninjaone',             'NinjaOne RMM'),
-        ('kaseya',               'Kaseya VSA'),
-        ('connectwise automate', 'ConnectWise Automate'),
-        ('labtech',              'ConnectWise Automate'),
-        ('ltsvc',                'ConnectWise Automate'),
-        ('connectwise rmm',      'ConnectWise RMM'),
-        ('datto rmm',            'Datto RMM'),
-        ('autotask endpoint',    'Datto RMM'),
-        ('cagservice',           'Datto RMM'),
-        ('syncro',               'Syncro RMM'),
-        ('kabuto',               'Syncro RMM'),
-        ('atera',                'Atera RMM'),
-        ('pulseway',             'Pulseway'),
-        ('pc monitor',           'Pulseway'),
-        ('splashtop',            'Splashtop RMM'),
-        ('manageengine',         'ManageEngine RMM'),
-        ('uems agent',           'ManageEngine Endpoint Central'),
-        ('naverisk',             'Naverisk RMM'),
-        ('barracuda rmm',        'Barracuda RMM'),
-        ('goto resolve',         'GoTo Resolve'),
-        ('logmein',              'LogMeIn / GoTo'),
-        ('teamviewer',           'TeamViewer RMM'),
-        ('itarian',              'ITarian RMM'),
-        ('acronis cyber protect cloud', 'Acronis RMM'),
-    ]
-    for k, v in _rmm:
-        if any(k in n for n in combined): rmm = v; break
+    def _first_match(category):
+        for entry in _sp.get(category, []):
+            k, v = entry[0], entry[1]
+            if any(k in n for n in combined):
+                return v
+        return None
 
-    # PAM
-    _pam = [
-        ('cyberark',             'CyberArk EPM'),
-        ('vf_agent',             'CyberArk EPM'),
-        ('beyondtrust',          'BeyondTrust'),
-        ('avecto',               'BeyondTrust'),
-        ('pgdriver',             'BeyondTrust'),
-        ('delinea',              'Delinea'),
-        ('thycotic',             'Delinea (Thycotic)'),
-        ('arellia',              'Delinea Privilege Manager'),
-        ('one identity safeguard','One Identity Safeguard'),
-        ('wallix',               'WALLIX Bastion'),
-        ('hashicorp vault',      'HashiCorp Vault'),
-        ('senhasegura',          'Senhasegura PAM'),
-        ('arcon pam',            'ARCON PAM'),
-        ('quickpass',            'Quickpass'),
-        ('saviynt',              'Saviynt'),
-    ]
-    for k, v in _pam:
-        if any(k in n for n in combined): pam = v; break
-
-    # Remote Access
-    _rmt = [
-        ('screenconnect',        'ScreenConnect'),
-        ('connectwise control',  'ScreenConnect'),
-        ('basupportexpress',     'N-able Take Control'),
-        ('msp anywhere',         'N-able Take Control'),
-        ('take control',         'N-able Take Control'),
-        ('teamviewer',           'TeamViewer'),
-        ('anydesk',              'AnyDesk'),
-        ('splashtop',            'Splashtop'),
-        ('srservice',            'Splashtop'),
-        ('logmein',              'LogMeIn / GoTo'),
-        ('goto resolve',         'GoTo Resolve'),
-        ('bomgar',               'BeyondTrust Remote Support'),
-        ('beyondtrust remote',   'BeyondTrust Remote Support'),
-        ('sra-pin',              'BeyondTrust Remote Support'),
-        ('dameware',             'Dameware Remote'),
-        ('dwrcs',                'Dameware Remote'),
-        ('tightvnc',             'TightVNC'),
-        ('ultravnc',             'UltraVNC'),
-        ('uvnc',                 'UltraVNC'),
-        ('realvnc',              'RealVNC'),
-        ('tigervnc',             'TigerVNC'),
-        ('winvnc',               'VNC Server'),
-        ('zoho assist',          'Zoho Assist'),
-        ('zohourmservice',       'Zoho Assist'),
-        ('isl alwayson',         'ISL Online'),
-        ('islalwayson',          'ISL Online'),
-        ('supremo',              'Supremo Remote'),
-        ('rserver3',             'Radmin'),
-        ('radmin',               'Radmin'),
-        ('nhostsvc',             'Netop Remote'),
-        ('rustdesk',             'RustDesk'),
-        ('chromoting',           'Chrome Remote Desktop'),
-        ('remoting_host',        'Chrome Remote Desktop'),
-        ('parsec',               'Parsec'),
-        ('nomachine',            'NoMachine'),
-        ('iperius remote',       'Iperius Remote'),
-        ('iperiusremote',        'Iperius Remote'),
-        ('getscreen',            'Getscreen.me'),
-        ('manageengine remote access', 'ManageEngine Remote Access Plus'),
-        ('webex support',        'Cisco Webex Remote Support'),
-        ('atashost',             'Cisco Webex Remote Support'),
-    ]
-    rmt = None
-    for k, v in _rmt:
-        if any(k in n for n in combined): rmt = v; break
-
-    # Backup
-    _bdr = [
-        ('veeam',                'Veeam'),
-        ('acronis',              'Acronis'),
-        ('datto bcdr',           'Datto BCDR'),
-        ('datto backup',         'Datto BCDR'),
-        ('commvault',            'Commvault'),
-        ('cvreplication',        'Commvault'),
-        ('backup exec',          'Veritas Backup Exec'),
-        ('bengine',              'Veritas Backup Exec'),
-        ('shadowprotect',        'StorageCraft ShadowProtect'),
-        ('shadow protect',       'StorageCraft ShadowProtect'),
-        ('arcserve',             'Arcserve'),
-        ('msp360',               'MSP360 Backup'),
-        ('cloudberry',           'MSP360 (CloudBerry)'),
-        ('azure backup',         'Azure Backup (MARS)'),
-        ('cbengine',             'Azure Backup (MARS)'),
-        ('microsoft azure recovery', 'Azure Backup (MARS)'),
-        ('druva',                'Druva inSync'),
-        ('insync',               'Druva inSync'),
-        ('cohesity',             'Cohesity'),
-        ('rubrik',               'Rubrik'),
-        ('zerto',                'Zerto'),
-        ('unitrends',            'Unitrends'),
-        ('barracuda backup',     'Barracuda Backup'),
-        ('axcient',              'Axcient'),
-        ('idrive',               'IDrive Backup'),
-        ('carbonite',            'Carbonite'),
-        ('backblaze',            'Backblaze'),
-        ('n2ws',                 'N2WS Backup'),
-        ('windows server backup','Windows Server Backup'),
-        ('wbengine',             'Windows Server Backup'),
-    ]
-    for k, v in _bdr:
-        if any(k in n for n in combined): bdr = v; break
+    edr = _first_match('edr')
+    rmm = _first_match('rmm')
+    pam = _first_match('pam')
+    rmt = _first_match('remote_access')
+    bdr = _first_match('backup')
 
     return edr, rmm, pam, bdr, rmt
 
-_SAFE_PATH = ('c:\\windows\\', '"c:\\windows\\', 'c:\\program files\\common files\\microsoft',
-              'c:\\program files\\windows defender', 'c:\\program files\\microsoft',
-              '"c:\\program files\\microsoft', '"c:\\program files\\windows')
+_SAFE_PATH = tuple(RULES.get('safe_paths', [
+    'c:\\windows\\', '"c:\\windows\\',
+    'c:\\program files\\common files\\microsoft',
+    'c:\\program files\\windows defender',
+    'c:\\program files\\microsoft',
+    '"c:\\program files\\microsoft', '"c:\\program files\\windows'
+]))
 
 def find_svc_anomalies(svc_l):
     out = []

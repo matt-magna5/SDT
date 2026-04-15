@@ -2,6 +2,7 @@
 _output/
 *.html
 *.json
+!detection_rules.json
 *.zip
 *.xlsx
 
