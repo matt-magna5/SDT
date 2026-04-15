@@ -26,7 +26,19 @@ if (Test-Path (Join-Path $DEST_FOLDER "python.exe")) {
 } else {
     Write-Host "  Downloading Python $PY_VERSION embeddable package..." -ForegroundColor DarkGray
     try {
-        Invoke-WebRequest -Uri $PY_URL -OutFile $ZIP_TMP -UseBasicParsing
+        $spin = @('|','/','-','\'); $si = 0
+        $dlJob = Start-Job -ScriptBlock {
+            param($u,$o)
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing
+        } -ArgumentList $PY_URL, $ZIP_TMP
+        while (-not $dlJob.HasExited) {
+            Write-Host ("`r  Downloading Python $PY_VERSION...  $($spin[$si % 4])") -NoNewline -ForegroundColor DarkGray
+            $si++; Start-Sleep -Milliseconds 150
+        }
+        Write-Host "`r  Download complete.                              " -ForegroundColor DarkGray
+        Receive-Job $dlJob -ErrorAction Stop | Out-Null
+        Remove-Job $dlJob -Force -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Path $DEST_FOLDER -Force | Out-Null
         Expand-Archive -Path $ZIP_TMP -DestinationPath $DEST_FOLDER -Force
         Remove-Item $ZIP_TMP -Force -ErrorAction SilentlyContinue

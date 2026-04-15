@@ -1357,18 +1357,27 @@ if ($hypervisorSources.Count -gt 0 -and $hypervisorVMs.Count -gt 0) {
 
     $suggestedAll = @()
     if ($scanChoice -eq 'Y') {
-        B-Line "scanning..."
-        $scanJob = Start-Job -ScriptBlock ([ScriptBlock]::Create("function Get-SuggestedHypervisors {`n" + (Get-Command Get-SuggestedHypervisors).Definition + "`n}`nGet-SuggestedHypervisors"))
-        $skipped = $false
+        $spin = @('|','/','-','\'); $si = 0
+        Write-Host "  Scanning...  (any key to cancel)" -NoNewline -ForegroundColor DarkGray
+        $scanJob  = Start-Job -ScriptBlock ([ScriptBlock]::Create("function Get-SuggestedHypervisors {`n" + (Get-Command Get-SuggestedHypervisors).Definition + "`n}`nGet-SuggestedHypervisors"))
+        $deadline = [DateTime]::Now.AddSeconds(15)
+        $skipped  = $false
         while (-not $scanJob.HasExited) {
+            Write-Host ("`r  Scanning...  $($spin[$si % 4])  ") -NoNewline -ForegroundColor DarkGray
+            $si++
             if ([Console]::KeyAvailable) {
                 [Console]::ReadKey($true) | Out-Null
-                Stop-Job $scanJob
-                $skipped = $true
+                Stop-Job $scanJob; $skipped = $true; break
+            }
+            if ([DateTime]::Now -gt $deadline) {
+                Stop-Job $scanJob; $skipped = $true
+                Write-Host "`r  Scan timed out (15s).              " -ForegroundColor Yellow
                 break
             }
-            Start-Sleep -Milliseconds 200
+            Start-Sleep -Milliseconds 150
         }
+        Write-Host "`r                                     " -NoNewline
+        Write-Host ""
         if ($skipped) {
             B-Warn "Scan cancelled."
         } else {
@@ -1611,8 +1620,7 @@ Write-Host "    then restore the original OFF state. That is the only state chan
 Write-Host "    Choose [S] at the plan prompt to skip bootstrap entirely (strict mode)." -ForegroundColor DarkGreen
 Write-Host ("=" * 72) -ForegroundColor DarkCyan
 Write-Host ""
-$preAns = (Read-Safe "  Proceed to pre-flight check? [Y/N]").ToUpper()
-if ($preAns -ne 'Y') { Write-Host "  Aborted." -ForegroundColor Red; exit 0 }
+# Pre-flight: proceed directly to plan review
 
 do {
 # -----------------------------------------------------------------------------
@@ -1890,7 +1898,15 @@ if ($goAns -eq 'S') {
 }
 
 if ($goAns -eq 'N') {
-    B-Line "Aborted. Nothing was changed on any server."; Invoke-Cleanup; exit 0
+    B-Line "Aborted. Nothing was changed on any server."
+    Write-Host ""
+    $restartAns = (Read-Safe "  Restart discovery with same credentials? [Y/N]").ToUpper()
+    if ($restartAns -eq 'Y') {
+        Write-Host "  Restarting..." -ForegroundColor Cyan
+        & $PSCommandPath
+        exit 0
+    }
+    Invoke-Cleanup; exit 0
 }
 if ($goAns -eq 'C') {
     Write-Host ""
