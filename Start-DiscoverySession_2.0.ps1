@@ -375,7 +375,9 @@ function Invoke-LinuxDiscovery {
         [PSCustomObject]$Row,
         [string]$PlinkPath,
         [string]$OutputFolder,
-        [string]$DateStr
+        [string]$DateStr,
+        [string]$SshUser   = '',   # pre-supplied (shared creds mode)
+        [string]$SshPass   = ''    # pre-supplied (shared creds mode)
     )
 
     $target = $Row.Address
@@ -384,11 +386,17 @@ function Invoke-LinuxDiscovery {
 
     Write-Host ""
     Write-Host ("  [{0}]  {1}  ({2})" -f $name, $target, $guest) -ForegroundColor Cyan
-    $sshUser = (Read-Host "    SSH Username [root]").Trim()
-    if (-not $sshUser) { $sshUser = 'root' }
-    $sshPassSec = Read-Host "    SSH Password" -AsSecureString
-    $sshPass    = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sshPassSec))
+
+    # Use pre-supplied creds or prompt
+    $sshUser = $SshUser
+    $sshPass = $SshPass
+    if (-not $sshUser) {
+        $sshUser = (Read-Host "    SSH Username [root]").Trim()
+        if (-not $sshUser) { $sshUser = 'root' }
+        $sshPassSec = Read-Host "    SSH Password" -AsSecureString
+        $sshPass    = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sshPassSec))
+    }
 
     # Bash discovery command — here-string prevents PowerShell from parsing || $ etc.
     $bashCmd = @'
@@ -411,8 +419,8 @@ echo '---HOSTNAME---'; hostname 2>/dev/null; echo '---OSRELEASE---'; cat /etc/os
 
         if ($outStr -notmatch '---DONE---') {
             Write-Host " FAILED" -ForegroundColor Red
-            Write-Host "    Check: credentials, SSH enabled, firewall allows port 22" -ForegroundColor DarkGray
-            return $null
+            Write-Host "    Check: credentials, SSH enabled, firewall port 22" -ForegroundColor DarkGray
+            return [PSCustomObject]@{ Success=$false; File=$null }
         }
 
         Write-Host " OK" -ForegroundColor Green
@@ -420,11 +428,11 @@ echo '---HOSTNAME---'; hostname 2>/dev/null; echo '---OSRELEASE---'; cat /etc/os
         $outFile = Join-Path $OutputFolder "$name-linux-$DateStr.json"
         $result | ConvertTo-Json -Depth 6 | Out-File $outFile -Encoding UTF8 -Force
         B-OK "Saved: $(Split-Path $outFile -Leaf)"
-        return $outFile
+        return [PSCustomObject]@{ Success=$true; File=$outFile }
 
     } catch {
         Write-Host " ERROR: $_" -ForegroundColor Red
-        return $null
+        return [PSCustomObject]@{ Success=$false; File=$null }
     } finally {
         if ($sshPass) { $sshPass = [string]::Empty }
     }
@@ -2155,11 +2163,12 @@ if ($script:vSphereSources.Count -gt 0) {
 
 if ($linuxRows.Count -gt 0) {
     Write-Phase "Linux / Appliance Discovery (SSH)"
-    Write-Host ("  {0} Linux/appliance box(es) detected." -f $linuxRows.Count) -ForegroundColor Cyan
-    Write-Host "  Each box prompts for its own SSH credentials." -ForegroundColor DarkGray
+
+    Write-Host ("  {0} Linux/appliance box(es) detected:" -f $linuxRows.Count) -ForegroundColor Cyan
+    $linuxRows | ForEach-Object { Write-Host ("    $($_.DisplayName)  ($($_.Address))") -ForegroundColor DarkCyan }
     Write-Host ""
-    Write-Host "  [Y]  Attempt SSH discovery on each box" -ForegroundColor Cyan
-    Write-Host "  [N]  Skip (boxes still get placeholder tabs in the report)" -ForegroundColor Cyan
+    Write-Host "  [Y]  Attempt SSH discovery" -ForegroundColor Cyan
+    Write-Host "  [N]  Skip (boxes still appear as placeholder tabs in the report)" -ForegroundColor DarkGray
     Write-Host ""
     $linuxChoice = ''
     while ($linuxChoice -notin @('Y','N')) {
@@ -2172,12 +2181,43 @@ if ($linuxRows.Count -gt 0) {
             B-Warn "plink.exe not found. Run Get-PortablePython.ps1 to download it."
             B-Warn "Skipping SSH discovery — boxes will appear as placeholders."
         } else {
+            # Ask if all boxes share the same SSH credentials
+            $sharedUser = ''; $sharedPass = ''
+            if ($linuxRows.Count -gt 1) {
+                Write-Host ""
+                $sameCredsAns = ''
+                while ($sameCredsAns -notin @('Y','N')) {
+                    $sameCredsAns = (Read-Host "  Same SSH credentials for all boxes? [Y/N]").Trim().ToUpper()
+                }
+                if ($sameCredsAns -eq 'Y') {
+                    $sharedUser = (Read-Host "  SSH Username [root]").Trim()
+                    if (-not $sharedUser) { $sharedUser = 'root' }
+                    $sharedPassSec = Read-Host "  SSH Password" -AsSecureString
+                    $sharedPass    = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                                        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sharedPassSec))
+                }
+            }
+
             $linuxDateStr = (Get-Date).ToString('yyyy-MM-dd')
             foreach ($lr in $linuxRows) {
-                $lFile = Invoke-LinuxDiscovery -Row $lr -PlinkPath $plinkExe `
-                             -OutputFolder $sessionFolder -DateStr $linuxDateStr
-                if ($lFile) { [void]$outputFiles.Add($lFile) }
+                $result = Invoke-LinuxDiscovery -Row $lr -PlinkPath $plinkExe `
+                              -OutputFolder $sessionFolder -DateStr $linuxDateStr `
+                              -SshUser $sharedUser -SshPass $sharedPass
+
+                # If shared creds failed, offer per-box retry
+                if (-not $result.Success -and $sharedUser) {
+                    Write-Host "    Retry with different credentials for this box? [Y/N]" -NoNewline -ForegroundColor Yellow
+                    $retryAns = (Read-Host "").Trim().ToUpper()
+                    if ($retryAns -eq 'Y') {
+                        $result = Invoke-LinuxDiscovery -Row $lr -PlinkPath $plinkExe `
+                                      -OutputFolder $sessionFolder -DateStr $linuxDateStr
+                    }
+                }
+
+                if ($result.File) { [void]$outputFiles.Add($result.File) }
             }
+
+            if ($sharedPass) { $sharedPass = [string]::Empty }
         }
     } else {
         B-Line "Skipped. Linux boxes will appear as placeholder tabs in the report."
