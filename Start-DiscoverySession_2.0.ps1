@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Magna5 Server Discovery - Session Launcher v2.1
+    Magna5 Server Discovery - Session Launcher v2.2
 
 .DESCRIPTION
     Entry point for multi-server discovery. Enumerates servers from your
@@ -24,7 +24,7 @@
 param()
 
 $ErrorActionPreference = 'Continue'
-$script:SessionVersion  = '2.1'
+$script:SessionVersion  = '2.2'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
 $script:PendingInventories = [System.Collections.ArrayList]@()
@@ -162,27 +162,39 @@ function Get-SuggestedHypervisors {
         } catch { }
     }
 
-    # DNS forward-lookup sweep — async with 1s timeout per candidate (fallback if AD empty)
+    # DNS forward-lookup sweep — fire all candidates in parallel, collect within 4s total
     if ($found.Count -eq 0) {
         $prefixes = @('VH','HV','ESX','ESXI','VCENTER','VC','HYPERV',
                       'VMW','NTX','PRISM','XEN','PVE','VHOST')
+        $candidates = @()
         foreach ($p in $prefixes) {
             foreach ($i in 1..5) {
-                foreach ($candidate in @("$p$i","${p}0$i","${p}-$i","${p}_$i")) {
-                    try {
-                        $ar = [System.Net.Dns]::BeginGetHostEntry($candidate, $null, $null)
-                        if ($ar.AsyncWaitHandle.WaitOne(1000)) {
-                            $r = [System.Net.Dns]::EndGetHostEntry($ar)
-                            if (-not ($found | Where-Object { $_.Name -ieq $candidate })) {
-                                [void]$found.Add([PSCustomObject]@{
-                                    Name=$candidate; IP=($r.AddressList[0].ToString())
-                                    Source='DNS'; Description=''; OS=''
-                                })
-                            }
-                        }
-                    } catch { }
+                foreach ($fmt in @("$p$i","${p}0$i","${p}-$i","${p}_$i")) {
+                    $candidates += $fmt
                 }
             }
+        }
+        # Start all async lookups simultaneously
+        $handles = [ordered]@{}
+        foreach ($c in $candidates) {
+            try { $handles[$c] = [System.Net.Dns]::BeginGetHostEntry($c, $null, $null) } catch { }
+        }
+        # Collect results within a 4s window
+        $deadline = [DateTime]::Now.AddSeconds(4)
+        foreach ($c in $handles.Keys) {
+            $remaining = [int]($deadline - [DateTime]::Now).TotalMilliseconds
+            if ($remaining -le 0) { break }
+            try {
+                if ($handles[$c].AsyncWaitHandle.WaitOne([Math]::Max($remaining, 1))) {
+                    $r = [System.Net.Dns]::EndGetHostEntry($handles[$c])
+                    if (-not ($found | Where-Object { $_.Name -ieq $c })) {
+                        [void]$found.Add([PSCustomObject]@{
+                            Name=$c; IP=($r.AddressList[0].ToString())
+                            Source='DNS'; Description=''; OS=''
+                        })
+                    }
+                }
+            } catch { }
         }
     }
     return ,$found   # comma forces array return
@@ -1186,28 +1198,40 @@ if ($hypervisorSources.Count -gt 0 -and $hypervisorVMs.Count -gt 0) {
 
     # ── SUGGESTED SERVERS — AD/DNS SCAN ──────────────────────────────────────
     Write-Phase "Step 3b - Suggested Servers"
-    B-Line "scanning Active Directory and DNS for hypervisor/server candidates..."
-    Write-Host "  (press any key to skip)" -ForegroundColor DarkGray
+    Write-Host "  Scan AD/DNS for servers not already in your discovery list?" -ForegroundColor White
+    Write-Host "  (useful for bare-metal boxes or servers outside the hypervisor)" -ForegroundColor DarkGray
     Write-Host ""
+    Write-Host "  [Y]  Scan  (AD first, DNS fallback, ~10s max)" -ForegroundColor Cyan
+    Write-Host "  [N]  Skip  (recommended if all servers are VMs in vCenter/Hyper-V)" -ForegroundColor Cyan
+    Write-Host ""
+    $scanChoice = ''
+    while ($scanChoice -notin @('Y','N')) {
+        $scanChoice = (Read-Host "  Scan? [Y/N]").Trim().ToUpper()
+    }
 
-    $scanJob = Start-Job -ScriptBlock ([ScriptBlock]::Create("function Get-SuggestedHypervisors {`n" + (Get-Command Get-SuggestedHypervisors).Definition + "`n}`nGet-SuggestedHypervisors"))
-    $skipped = $false
-    while (-not $scanJob.HasExited) {
-        if ([Console]::KeyAvailable) {
-            [Console]::ReadKey($true) | Out-Null
-            Stop-Job $scanJob
-            $skipped = $true
-            break
+    $suggestedAll = @()
+    if ($scanChoice -eq 'Y') {
+        B-Line "scanning..."
+        $scanJob = Start-Job -ScriptBlock ([ScriptBlock]::Create("function Get-SuggestedHypervisors {`n" + (Get-Command Get-SuggestedHypervisors).Definition + "`n}`nGet-SuggestedHypervisors"))
+        $skipped = $false
+        while (-not $scanJob.HasExited) {
+            if ([Console]::KeyAvailable) {
+                [Console]::ReadKey($true) | Out-Null
+                Stop-Job $scanJob
+                $skipped = $true
+                break
+            }
+            Start-Sleep -Milliseconds 200
         }
-        Start-Sleep -Milliseconds 200
-    }
-    if ($skipped) {
-        B-Warn "AD/DNS scan skipped."
-        $suggestedAll = @()
+        if ($skipped) {
+            B-Warn "Scan cancelled."
+        } else {
+            $suggestedAll = @(Receive-Job $scanJob)
+        }
+        Remove-Job $scanJob -Force -ErrorAction SilentlyContinue
     } else {
-        $suggestedAll = @(Receive-Job $scanJob)
+        B-Line "Skipped."
     }
-    Remove-Job $scanJob -Force -ErrorAction SilentlyContinue
     $knownNames    = @($hypervisorVMs | ForEach-Object { $_.Name.ToUpper() }) +
                      @($hypervisorSources | ForEach-Object { $_.Host.ToUpper() })
     $newSuggested  = @($suggestedAll | Where-Object { $n = $_.Name.ToUpper(); $knownNames -notcontains $n })

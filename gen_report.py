@@ -1380,13 +1380,18 @@ def build_server_tab(srv):
     if svc_anomalies:
         anom_body  = ('<div class="flag-info" style="margin-bottom:14px"><div class="flag-label">Manual Review Required</div>'
                      '<div class="flag-detail">These services warrant manual review. Not all are malicious — confirm with client before taking action.</div></div>\n')
-        anom_body += '<table><tr><th>Name</th><th>Display Name</th><th>Account</th><th>Why Flagged</th></tr>\n'
+        anom_body += ('<table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:8.5pt">'
+                     '<colgroup><col style="width:18%"><col style="width:22%"><col style="width:14%"><col style="width:46%"></colgroup>'
+                     '<tr><th style="padding:6px 8px;text-align:left">Name</th>'
+                     '<th style="padding:6px 8px;text-align:left">Display Name</th>'
+                     '<th style="padding:6px 8px;text-align:left">Account</th>'
+                     '<th style="padding:6px 8px;text-align:left">Why Flagged</th></tr>\n')
         for i, sv in enumerate(svc_anomalies):
             anom_body += (f'<tr style="background:#fff8e1" title="{h(sv.get("Path",""))}">'
-                         f'<td style="font-family:monospace;font-size:8.5pt">{h(sv.get("Name",""))}</td>'
-                         f'<td>{h(sv.get("DisplayName",""))}</td>'
-                         f'<td style="font-size:8.5pt">{h(sv.get("StartName",""))}</td>'
-                         f'<td style="font-size:8.5pt">{h(sv.get("_reason",""))}</td></tr>\n')
+                         f'<td style="padding:5px 8px;font-family:monospace;word-break:break-all">{h(sv.get("Name",""))}</td>'
+                         f'<td style="padding:5px 8px;word-wrap:break-word">{h(sv.get("DisplayName",""))}</td>'
+                         f'<td style="padding:5px 8px;word-break:break-all">{h(sv.get("StartName",""))}</td>'
+                         f'<td style="padding:5px 8px;word-break:break-all;color:#555">{h(sv.get("_reason",""))}</td></tr>\n')
         anom_body += '</table>\n' + top_link(sid)
 
     # ── FILE SHARES CARD ──────────────────────────────────────────────────────
@@ -1887,7 +1892,7 @@ details[open] summary::before {{ content: '\\25BC  '; }}
 </div>
 </div>
 <div style="text-align:center;padding:24px 0 32px;color:#a89bc8;font-size:8pt;letter-spacing:.3px;">
-  Generated {DATE} ET &middot; Magna5 Solutions Engineering &middot; SDT v2.1
+  Generated {DATE} ET &middot; Magna5 Solutions Engineering &middot; SDT v2.2
 </div>
 <script>
 var VIEW_DESCS = {{
