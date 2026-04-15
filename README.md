@@ -2,7 +2,13 @@
 
 PowerShell-based server and VM discovery tool for presales cloud migration scoping. Connects to Hyper-V, ESXi, and vCenter environments, runs deep per-server discovery, and generates a branded HTML report for client presentations and internal SE use.
 
-**[Download SDT v2.0](https://github.com/trophyscar-bit/sdt/archive/refs/tags/v2.0.zip)** — unzip, run `Start-DiscoverySession_2.0.ps1`, done.
+**Download and extract in one shot — paste this into PowerShell on the target machine:**
+
+```powershell
+iwr https://github.com/trophyscar-bit/sdt/archive/refs/tags/v2.0.zip -OutFile C:\Temp\sdt.zip; Expand-Archive C:\Temp\sdt.zip C:\Temp -Force; cd C:\Temp\sdt-2.0
+```
+
+Then run `.\Start-DiscoverySession_2.0.ps1` — everything else is automatic.
 
 ---
 
