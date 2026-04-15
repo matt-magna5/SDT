@@ -377,8 +377,11 @@ function Invoke-LinuxDiscovery {
     $sshPass    = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
                     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sshPassSec))
 
-    # Bash discovery command — section-delimited, single line
-    $bashCmd = "echo '---HOSTNAME---'; hostname 2>/dev/null; echo '---OSRELEASE---'; cat /etc/os-release 2>/dev/null || echo 'ID=unknown'; echo '---UNAME---'; uname -srm 2>/dev/null; echo '---CPU---'; echo CORES=\$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1); lscpu 2>/dev/null | grep 'Model name' || echo 'Model name: Unknown'; echo '---MEMORY---'; free -m 2>/dev/null; echo '---DISKS---'; df -h 2>/dev/null | grep -v tmpfs | grep -v udev | grep -v overlay | grep -v '^Filesystem'; echo '---NETWORK---'; ip -o addr show 2>/dev/null | grep ' inet ' || ifconfig 2>/dev/null | grep 'inet '; echo '---SERVICES---'; systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk '{print \$1}' | head -40; echo '---DONE---'"
+    # Bash discovery command — here-string prevents PowerShell from parsing || $ etc.
+    $bashCmd = @'
+echo '---HOSTNAME---'; hostname 2>/dev/null; echo '---OSRELEASE---'; cat /etc/os-release 2>/dev/null || echo 'ID=unknown'; echo '---UNAME---'; uname -srm 2>/dev/null; echo '---CPU---'; echo CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1); lscpu 2>/dev/null | grep 'Model name' || echo 'Model name: Unknown'; echo '---MEMORY---'; free -m 2>/dev/null; echo '---DISKS---'; df -h 2>/dev/null | grep -v tmpfs | grep -v udev | grep -v overlay | grep -v '^Filesystem'; echo '---NETWORK---'; ip -o addr show 2>/dev/null | grep ' inet ' || ifconfig 2>/dev/null | grep 'inet '; echo '---SERVICES---'; systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk '{print $1}' | head -40; echo '---DONE---'
+'@
+    $bashCmd = $bashCmd.Trim()
 
     Write-Host "    Connecting..." -NoNewline -ForegroundColor DarkGray
 
