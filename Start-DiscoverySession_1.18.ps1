@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Magna5 Server Discovery - Session Launcher v1.18
+    Magna5 Server Discovery - Session Launcher v2.0
 
 .DESCRIPTION
     Entry point for multi-server discovery. Enumerates servers from your
@@ -24,7 +24,7 @@
 param()
 
 $ErrorActionPreference = 'Continue'
-$script:SessionVersion  = '1.18'
+$script:SessionVersion  = '2.0'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
 $script:PendingInventories = [System.Collections.ArrayList]@()

@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Magna5 Solutions Engineering - Full Server Discovery v1.4
+    Magna5 Solutions Engineering - Full Server Discovery v2.0
 .DESCRIPTION
     Comprehensive server discovery for lift-and-shift, migration, and upgrade
     assessments. Collects OS, roles, SQL, Exchange, applications, shares,
@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '1.10'
+$script:ScriptVersion  = '2.0'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
