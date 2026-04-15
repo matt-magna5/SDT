@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Magna5 Server Discovery - Session Launcher v2.0
+    Magna5 Server Discovery - Session Launcher v2.1
 
 .DESCRIPTION
     Entry point for multi-server discovery. Enumerates servers from your
@@ -24,7 +24,7 @@
 param()
 
 $ErrorActionPreference = 'Continue'
-$script:SessionVersion  = '2.0'
+$script:SessionVersion  = '2.1'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
 $script:PendingInventories = [System.Collections.ArrayList]@()
@@ -1187,8 +1187,27 @@ if ($hypervisorSources.Count -gt 0 -and $hypervisorVMs.Count -gt 0) {
     # ── SUGGESTED SERVERS — AD/DNS SCAN ──────────────────────────────────────
     Write-Phase "Step 3b - Suggested Servers"
     B-Line "scanning Active Directory and DNS for hypervisor/server candidates..."
+    Write-Host "  (press any key to skip)" -ForegroundColor DarkGray
     Write-Host ""
-    $suggestedAll  = Get-SuggestedHypervisors
+
+    $scanJob = Start-Job -ScriptBlock ([ScriptBlock]::Create("function Get-SuggestedHypervisors {`n" + (Get-Command Get-SuggestedHypervisors).Definition + "`n}`nGet-SuggestedHypervisors"))
+    $skipped = $false
+    while (-not $scanJob.HasExited) {
+        if ([Console]::KeyAvailable) {
+            [Console]::ReadKey($true) | Out-Null
+            Stop-Job $scanJob
+            $skipped = $true
+            break
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    if ($skipped) {
+        B-Warn "AD/DNS scan skipped."
+        $suggestedAll = @()
+    } else {
+        $suggestedAll = @(Receive-Job $scanJob)
+    }
+    Remove-Job $scanJob -Force -ErrorAction SilentlyContinue
     $knownNames    = @($hypervisorVMs | ForEach-Object { $_.Name.ToUpper() }) +
                      @($hypervisorSources | ForEach-Object { $_.Host.ToUpper() })
     $newSuggested  = @($suggestedAll | Where-Object { $n = $_.Name.ToUpper(); $knownNames -notcontains $n })
