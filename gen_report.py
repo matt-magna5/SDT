@@ -52,9 +52,14 @@ for _fname in sorted(os.listdir(SESSION_DIR)):
 
 servers = []
 for s in CFG['servers']:
-    path = os.path.join(SESSION_DIR, s['file'])
-    data = jload(path)
-    servers.append({**s, 'data': data})
+    if s.get('os_type') == 'linux':
+        # Linux entry — may have SSH JSON or be a placeholder
+        data = jload(os.path.join(SESSION_DIR, s['file'])) if s.get('file') else {}
+        servers.append({**s, 'data': data})
+    else:
+        path = os.path.join(SESSION_DIR, s['file'])
+        data = jload(path)
+        servers.append({**s, 'data': data})
 
 LOGO_B64 = ''
 if LOGO_FILE and os.path.exists(LOGO_FILE):
@@ -570,6 +575,163 @@ def find_svc_anomalies(svc_l):
     return out
 
 # ── BUILD PER-SERVER TAB ──────────────────────────────────────────────────────
+def build_linux_tab(srv):
+    sid    = srv['id']
+    name   = srv['name']
+    ip     = srv.get('ip', '')
+    guest  = srv.get('guest_os', 'Linux')
+    in_sc  = srv.get('in_scope', True)
+    data   = srv['data']
+    has_data = bool(data and data.get('_type') == 'LinuxDiscovery')
+
+    # Teal/dark-green colour palette for Linux tabs
+    HDR   = '#0f4c5c'
+    HDR2  = '#1a7a8a'
+    TEAL  = '#0d9488'
+    LTEAL = '#ccfbf1'
+    DTEAL = '#134e4a'
+
+    def lcard(title, body, collapsed=False):
+        cid = f'{sid}-{re.sub(r"[^a-z0-9]","",title.lower())}'
+        btn = f'<button class="collapse-btn" onclick="toggleCard(\'{cid}\')">' + ('▲ Collapse' if not collapsed else '▼ Expand') + '</button>'
+        state = ' collapsed' if collapsed else ''
+        return (f'<div class="card" style="border-color:#a7f3d0;">\n'
+                f'<div class="card-title" style="color:{DTEAL};border-bottom-color:{TEAL};">{h(title)}{btn}</div>\n'
+                f'<div class="card-body{state}" id="{cid}">{body}</div></div>\n')
+
+    def disk_bar(pct):
+        col = '#d63638' if pct >= 85 else '#f5a623' if pct >= 70 else TEAL
+        return (f'<div class="disk-bar-bg"><div class="disk-bar-fill" '
+                f'style="width:{min(pct,100)}%;background:{col};"></div></div>')
+
+    scope_pill = f'<span class="pill pill-green">IN SCOPE</span>' if in_sc else f'<span class="pill pill-gray">OUT OF SCOPE</span>'
+
+    # ── HEADER BANNER ─────────────────────────────────────────────────────────
+    if has_data:
+        os_pretty = data.get('OS', {}).get('PrettyName', guest)
+        kernel    = data.get('OS', {}).get('Kernel', '')
+        arch      = data.get('OS', {}).get('Architecture', '')
+        cores     = data.get('CPU', {}).get('Cores', '?')
+        cpu_model = data.get('CPU', {}).get('ModelName', '')
+        mem_total = data.get('Memory', {}).get('TotalMB', 0)
+        mem_used  = data.get('Memory', {}).get('UsedMB', 0)
+        mem_free  = data.get('Memory', {}).get('FreeMB', 0)
+        mem_pct   = int(mem_used / mem_total * 100) if mem_total else 0
+        hostname  = data.get('Hostname', name)
+        collected = data.get('CollectedAt', '')
+        disks     = data.get('Disks', []) or []
+        network   = data.get('Network', []) or []
+        services  = data.get('Services', []) or []
+        os_line   = h(os_pretty)
+        meta_line = ' · '.join(filter(None, [h(kernel), h(arch)]))
+    else:
+        os_pretty = guest; hostname = name; cores = '?'
+        mem_total = mem_used = mem_free = mem_pct = 0
+        cpu_model = kernel = arch = collected = ''
+        disks = network = services = []
+        os_line = h(guest); meta_line = 'SSH discovery not collected'
+
+    header = (f'<div style="background:linear-gradient(135deg,{HDR},{HDR2});border-radius:10px 10px 0 0;'
+              f'padding:16px 24px;margin-bottom:0;">'
+              f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+              f'<div>'
+              f'<div style="font-size:18px;font-weight:700;color:#fff;">{h(hostname)} '
+              f'<span style="font-size:10pt;font-weight:400;color:rgba(255,255,255,.65);">({h(ip)})</span></div>'
+              f'<div style="font-size:9pt;color:rgba(255,255,255,.8);margin-top:4px;">{os_line}</div>'
+              f'<div style="font-size:8pt;color:rgba(255,255,255,.55);margin-top:2px;">{meta_line}</div>'
+              f'</div>'
+              f'<div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">'
+              f'{scope_pill}'
+              f'<span style="background:rgba(255,255,255,.15);color:#fff;font-size:8pt;padding:3px 10px;'
+              f'border-radius:12px;font-weight:600;">🐧 Linux / Non-Windows</span>'
+              f'</div></div></div>\n')
+
+    # ── NO DATA PLACEHOLDER ────────────────────────────────────────────────────
+    if not has_data:
+        placeholder = (f'<div style="text-align:center;padding:48px 24px;color:#6b6080;">'
+                       f'<div style="font-size:28px;margin-bottom:12px;">🐧</div>'
+                       f'<div style="font-size:13pt;font-weight:700;color:{DTEAL};margin-bottom:8px;">'
+                       f'SSH Discovery Not Collected</div>'
+                       f'<div style="font-size:9.5pt;">This box was identified as Linux/non-Windows.<br>'
+                       f'Re-run discovery and choose <strong>Y</strong> at the Linux SSH prompt to collect data.</div>'
+                       f'<div style="margin-top:16px;font-size:8.5pt;color:#9ca3af;">'
+                       f'Guest OS reported by hypervisor: {h(guest)}</div>'
+                       f'</div>')
+        tab_html = f'<div id="top-{sid}">\n{header}{placeholder}</div>\n'
+        return {'id': sid, 'name': name, 'crit': 0, 'warn': 0, 'in_scope': in_sc, 'tab_html': tab_html}
+
+    # ── SYSTEM OVERVIEW ────────────────────────────────────────────────────────
+    ram_gb   = round(mem_total / 1024, 1) if mem_total else '?'
+    ram_used = round(mem_used  / 1024, 1) if mem_used  else '?'
+    stats = (f'<div class="stat-grid" style="grid-template-columns:repeat(3,1fr);">'
+             f'<div class="stat-box"><div class="stat-num" style="color:{TEAL};">{cores}</div>'
+             f'<div class="stat-lbl">CPU Cores</div></div>'
+             f'<div class="stat-box"><div class="stat-num" style="color:{TEAL};">{ram_gb}</div>'
+             f'<div class="stat-lbl">RAM (GB)</div></div>'
+             f'<div class="stat-box"><div class="stat-num" style="color:{TEAL};">{mem_pct}%</div>'
+             f'<div class="stat-lbl">RAM Used</div></div></div>')
+    meta_rows = [('Hostname', hostname), ('IP', ip), ('OS', os_pretty),
+                 ('Kernel', kernel), ('Architecture', arch),
+                 ('CPU Model', cpu_model), ('Collected', collected)]
+    meta_tbl = '<table>' + ''.join(
+        f'<tr><td style="font-weight:600;width:130px;color:{DTEAL}">{h(k)}</td>'
+        f'<td>{h(v)}</td></tr>'
+        for k, v in meta_rows if v) + '</table>'
+    overview_body = stats + meta_tbl
+    overview_card = lcard('System Overview', overview_body)
+
+    # ── DISKS ──────────────────────────────────────────────────────────────────
+    disks_body = ''
+    if disks:
+        disks_body = ('<table><tr><th>Mount</th><th>Source</th><th>Size</th>'
+                      '<th>Used</th><th>Free</th><th style="min-width:120px">Usage</th></tr>\n')
+        for i, d in enumerate(disks):
+            if not isinstance(d, dict): continue
+            pct = d.get('UsePct', 0)
+            bg  = 'background:#f5f4f8;' if i % 2 else ''
+            disks_body += (f'<tr style="{bg}"><td style="font-family:monospace">{h(d.get("Mount",""))}</td>'
+                           f'<td style="font-size:8.5pt;color:#6b6080">{h(d.get("Source",""))}</td>'
+                           f'<td>{h(d.get("Size",""))}</td><td>{h(d.get("Used",""))}</td>'
+                           f'<td>{h(d.get("Free",""))}</td>'
+                           f'<td>{disk_bar(pct)}<span style="font-size:8pt;color:#6b6080">{pct}%</span></td></tr>\n')
+        disks_body += '</table>'
+    else:
+        disks_body = '<div style="color:#9ca3af;font-style:italic">No disk data collected.</div>'
+    disks_card = lcard('Disk Storage', disks_body)
+
+    # ── NETWORK ────────────────────────────────────────────────────────────────
+    net_body = ''
+    if network:
+        net_body = '<table><tr><th>Interface</th><th>Addresses</th></tr>\n'
+        for i, a in enumerate(network):
+            if not isinstance(a, dict): continue
+            bg  = 'background:#f5f4f8;' if i % 2 else ''
+            addrs = ', '.join(a.get('Addresses') or [])
+            net_body += (f'<tr style="{bg}"><td style="font-family:monospace;font-weight:600">'
+                         f'{h(a.get("Interface",""))}</td><td>{h(addrs)}</td></tr>\n')
+        net_body += '</table>'
+    else:
+        net_body = '<div style="color:#9ca3af;font-style:italic">No network data collected.</div>'
+    net_card = lcard('Network', net_body)
+
+    # ── SERVICES ──────────────────────────────────────────────────────────────
+    svc_body = ''
+    if services:
+        svc_body = ('<div style="display:flex;flex-wrap:wrap;gap:6px;">' +
+                    ''.join(f'<span style="background:{LTEAL};color:{DTEAL};border-radius:4px;'
+                            f'padding:3px 10px;font-size:8.5pt;font-weight:600;">{h(s.get("Name","") if isinstance(s,dict) else s)}</span>'
+                            for s in services[:60]) + '</div>')
+        if len(services) > 60:
+            svc_body += f'<div style="font-size:8pt;color:#9ca3af;margin-top:8px;">+ {len(services)-60} more</div>'
+    else:
+        svc_body = '<div style="color:#9ca3af;font-style:italic">No service data collected.</div>'
+    svc_card = lcard('Running Services', svc_body, collapsed=len(services) > 20)
+
+    body = f'<div style="padding:0 16px 16px;">\n{overview_card}{disks_card}{net_card}{svc_card}</div>\n'
+    tab_html = f'<div id="top-{sid}">\n{header}{body}</div>\n'
+    return {'id': sid, 'name': name, 'crit': 0, 'warn': 0, 'in_scope': in_sc, 'tab_html': tab_html}
+
+
 def build_server_tab(srv):
     data    = srv['data']
     sid     = srv['id']
@@ -1764,7 +1926,7 @@ def build_sql_tab():
                 nav + summary + body)
 
 # ── BUILD ALL TABS ─────────────────────────────────────────────────────────────
-tabs = [build_server_tab(s) for s in servers]
+tabs = [(build_linux_tab(s) if s.get('os_type') == 'linux' else build_server_tab(s)) for s in servers]
 virt_tab_html = build_hv_tab()
 sql_tab_html  = build_sql_tab()
 
@@ -1778,9 +1940,11 @@ else:
 # ── TABS HTML ─────────────────────────────────────────────────────────────────
 tab_buttons = ''
 for t in tabs:
-    cls = 'tab-btn' + tab_cls(t['crit'], t['warn'])
+    is_linux = servers[[s['id'] for s in servers].index(t['id'])].get('os_type') == 'linux' if t['id'] in [s['id'] for s in servers] else False
+    cls = 'tab-btn' + (' is-linux' if is_linux else tab_cls(t['crit'], t['warn']))
     scope_ind = '' if t['in_scope'] else ' &#9702;'
-    tab_buttons += f'<button class="{cls}" data-tab="tab-{t["id"]}" onclick="showTab(\'{t["id"]}\')">{h(t["name"])}{scope_ind}</button>\n'
+    lx_icon = ' 🐧' if is_linux else ''
+    tab_buttons += f'<button class="{cls}" data-tab="tab-{t["id"]}" onclick="showTab(\'{t["id"]}\')">{h(t["name"])}{lx_icon}{scope_ind}</button>\n'
 _has_hyperv  = any(h.get('_type') == 'HyperVInventory'   for h in hv_inventories)
 _has_vsphere = any(h.get('_type') == 'vSphereInventory'  for h in hv_inventories)
 _virt_label  = ('Hyper-V / ESX' if _has_hyperv and _has_vsphere
@@ -1815,6 +1979,7 @@ body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f5f4f8; color: 
 .tab-btn.active {{ background: white; border-bottom: 1px solid white; color: #5b1fa4; }}
 .tab-btn.has-critical {{ border-top: 3px solid #d63638; }}
 .tab-btn.has-warning  {{ border-top: 3px solid #f5a623; }}
+.tab-btn.is-linux     {{ border-top: 3px solid #0d9488; color: #0f4c5c; }}
 .tab-content {{ display: none; }}
 .tab-content.active {{ display: block; }}
 .card {{ background: white; border-radius: 0 8px 8px 8px; padding: 24px; margin-bottom: 18px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); border: 1px solid #e8e4f0; }}
@@ -1892,7 +2057,7 @@ details[open] summary::before {{ content: '\\25BC  '; }}
 </div>
 </div>
 <div style="text-align:center;padding:24px 0 32px;color:#a89bc8;font-size:8pt;letter-spacing:.3px;">
-  Generated {DATE} ET &middot; Magna5 Solutions Engineering &middot; SDT v2.2
+  Generated {DATE} ET &middot; Magna5 Solutions Engineering &middot; SDT v2.3
 </div>
 <script>
 var VIEW_DESCS = {{

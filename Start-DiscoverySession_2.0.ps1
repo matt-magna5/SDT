@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Magna5 Server Discovery - Session Launcher v2.2
+    Magna5 Server Discovery - Session Launcher v2.3
 
 .DESCRIPTION
     Entry point for multi-server discovery. Enumerates servers from your
@@ -24,7 +24,7 @@
 param()
 
 $ErrorActionPreference = 'Continue'
-$script:SessionVersion  = '2.2'
+$script:SessionVersion  = '2.3'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
 $script:PendingInventories = [System.Collections.ArrayList]@()
@@ -264,11 +264,154 @@ function Test-IsLinux {
     if (-not $GuestOSHint -or $GuestOSHint -eq 'Unknown') { return $false }
     $linuxPatterns = @('LINUX','CENTOS','UBUNTU','RHEL','DEBIAN','FEDORA',
                        'SUSE','ORACLE LINUX','PHOTON','COREOS','ROCKY',
-                       'ALMA','AMAZON LINUX','OTHER 64','OTHER LINUX')
+                       'ALMA','AMAZON LINUX','OTHER 64','OTHER LINUX',
+                       'FREEBSD','SOLARIS','DARWIN','UNIX','OPENBSD',
+                       'OTHER (64','OTHER GUEST','VMWARE PHOTON',
+                       'OPENSOLARIS','NETBSD','MANJARO','ARCH LINUX')
     foreach ($p in $linuxPatterns) {
         if ($GuestOSHint.ToUpper().Contains($p)) { return $true }
     }
     return $false
+}
+
+# -- LINUX SSH DISCOVERY -------------------------------------------------------
+
+function Parse-LinuxOutput {
+    param([string]$Raw, [string]$IP, [string]$GuestOS)
+
+    $sec = @{}; $cur = $null; $buf = [System.Collections.ArrayList]@()
+    foreach ($ln in ($Raw -split "`r?`n")) {
+        if ($ln -match '^---([A-Z]+)---$') {
+            if ($cur) { $sec[$cur] = @($buf) }
+            $cur = $matches[1]; $buf.Clear()
+        } elseif ($cur -and $ln.Trim()) {
+            [void]$buf.Add($ln.TrimEnd())
+        }
+    }
+    if ($cur) { $sec[$cur] = @($buf) }
+
+    $hostname = if ($sec['HOSTNAME']) { $sec['HOSTNAME'][0].Trim() } else { $IP }
+
+    $os = @{ PrettyName='Unknown'; ID='unknown'; VersionID=''; Kernel=''; Architecture='' }
+    foreach ($ln in ($sec['OSRELEASE'] -as [array])) {
+        if ($ln -match '^PRETTY_NAME="?([^"]+)"?')  { $os.PrettyName  = $matches[1] }
+        if ($ln -match '^ID="?([^"]+)"?')            { $os.ID          = $matches[1] }
+        if ($ln -match '^VERSION_ID="?([^"]+)"?')    { $os.VersionID   = $matches[1] }
+    }
+    $uname = if ($sec['UNAME']) { $sec['UNAME'][0] } else { '' }
+    if ($uname -match '\S+\s+(\S+)\s+(\S+)') { $os.Kernel = $matches[1]; $os.Architecture = $matches[2] }
+
+    $cores = 1; $cpuModel = 'Unknown'
+    foreach ($ln in ($sec['CPU'] -as [array])) {
+        if ($ln -match 'CORES=(\d+)')                { $cores    = [int]$matches[1] }
+        if ($ln -match 'Model name\s*:\s*(.+)')      { $cpuModel = $matches[1].Trim() }
+    }
+
+    $memTotal = 0; $memUsed = 0; $memFree = 0
+    foreach ($ln in ($sec['MEMORY'] -as [array])) {
+        if ($ln -match '^Mem:\s+(\d+)\s+(\d+)\s+(\d+)') {
+            $memTotal = [int]$matches[1]; $memUsed = [int]$matches[2]; $memFree = [int]$matches[3]
+        }
+    }
+
+    $disks = [System.Collections.ArrayList]@()
+    foreach ($ln in ($sec['DISKS'] -as [array])) {
+        if ($ln -match '(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)%\s+(\S+)') {
+            [void]$disks.Add([PSCustomObject]@{
+                Source=$matches[1]; Size=$matches[2]; Used=$matches[3]
+                Free=$matches[4]; UsePct=[int]$matches[5]; Mount=$matches[6]
+            })
+        }
+    }
+
+    $ifMap = [ordered]@{}
+    foreach ($ln in ($sec['NETWORK'] -as [array])) {
+        if ($ln -match '^\d+:\s+(\S+)\s+inet\s+(\S+)') {
+            $iface = ($matches[1] -replace '@.*','').Trim()
+            if (-not $ifMap[$iface]) { $ifMap[$iface] = [System.Collections.ArrayList]@() }
+            [void]$ifMap[$iface].Add($matches[2])
+        } elseif ($ln -match 'inet\s+(\d+\.\d+\.\d+\.\d+)') {
+            if (-not $ifMap['eth0']) { $ifMap['eth0'] = [System.Collections.ArrayList]@() }
+            [void]$ifMap['eth0'].Add($matches[1])
+        }
+    }
+    $netList = @($ifMap.GetEnumerator() | ForEach-Object {
+        [PSCustomObject]@{ Interface=$_.Key; Addresses=@($_.Value) }
+    })
+
+    $svcs = @(($sec['SERVICES'] -as [array]) | Where-Object { $_ -and $_ -ne 'none' } |
+              ForEach-Object { [PSCustomObject]@{ Name=$_.Trim() } })
+
+    return [PSCustomObject]@{
+        _type       = 'LinuxDiscovery'
+        CollectedAt = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')
+        Hostname    = $hostname
+        IP          = $IP
+        GuestOS     = $GuestOS
+        OS          = $os
+        CPU         = [PSCustomObject]@{ Cores=$cores; ModelName=$cpuModel }
+        Memory      = [PSCustomObject]@{ TotalMB=$memTotal; UsedMB=$memUsed; FreeMB=$memFree }
+        Disks       = @($disks)
+        Network     = $netList
+        Services    = $svcs
+    }
+}
+
+function Invoke-LinuxDiscovery {
+    param(
+        [PSCustomObject]$Row,
+        [string]$PlinkPath,
+        [string]$OutputFolder,
+        [string]$DateStr
+    )
+
+    $target = $Row.Address
+    $name   = $Row.DisplayName
+    $guest  = if ($Row.ResolvedOS -and $Row.ResolvedOS -ne 'Unknown') { $Row.ResolvedOS } else { 'Linux' }
+
+    Write-Host ""
+    Write-Host ("  [{0}]  {1}  ({2})" -f $name, $target, $guest) -ForegroundColor Cyan
+    $sshUser = (Read-Host "    SSH Username [root]").Trim()
+    if (-not $sshUser) { $sshUser = 'root' }
+    $sshPassSec = Read-Host "    SSH Password" -AsSecureString
+    $sshPass    = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sshPassSec))
+
+    # Bash discovery command — section-delimited, single line
+    $bashCmd = "echo '---HOSTNAME---'; hostname 2>/dev/null; echo '---OSRELEASE---'; cat /etc/os-release 2>/dev/null || echo 'ID=unknown'; echo '---UNAME---'; uname -srm 2>/dev/null; echo '---CPU---'; echo CORES=\$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1); lscpu 2>/dev/null | grep 'Model name' || echo 'Model name: Unknown'; echo '---MEMORY---'; free -m 2>/dev/null; echo '---DISKS---'; df -h 2>/dev/null | grep -v tmpfs | grep -v udev | grep -v overlay | grep -v '^Filesystem'; echo '---NETWORK---'; ip -o addr show 2>/dev/null | grep ' inet ' || ifconfig 2>/dev/null | grep 'inet '; echo '---SERVICES---'; systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk '{print \$1}' | head -40; echo '---DONE---'"
+
+    Write-Host "    Connecting..." -NoNewline -ForegroundColor DarkGray
+
+    try {
+        # Try with -batch first (works if host key cached in PuTTY registry)
+        $output = & $PlinkPath -ssh -l $sshUser -pw $sshPass -batch $target $bashCmd 2>&1
+        $outStr = $output -join "`n"
+
+        if ($outStr -notmatch '---DONE---') {
+            # Host key not cached — pipe 'y' to accept it, then retry
+            $output = "y`n" | & $PlinkPath -ssh -l $sshUser -pw $sshPass $target $bashCmd 2>&1
+            $outStr = $output -join "`n"
+        }
+
+        if ($outStr -notmatch '---DONE---') {
+            Write-Host " FAILED" -ForegroundColor Red
+            Write-Host "    Check: credentials, SSH enabled, firewall allows port 22" -ForegroundColor DarkGray
+            return $null
+        }
+
+        Write-Host " OK" -ForegroundColor Green
+        $result  = Parse-LinuxOutput -Raw $outStr -IP $target -GuestOS $guest
+        $outFile = Join-Path $OutputFolder "$name-linux-$DateStr.json"
+        $result | ConvertTo-Json -Depth 6 | Out-File $outFile -Encoding UTF8 -Force
+        B-OK "Saved: $(Split-Path $outFile -Leaf)"
+        return $outFile
+
+    } catch {
+        Write-Host " ERROR: $_" -ForegroundColor Red
+        return $null
+    } finally {
+        if ($sshPass) { $sshPass = [string]::Empty }
+    }
 }
 
 # -- PS VERSION COMPAT CHECK ---------------------------------------------------
@@ -1532,9 +1675,21 @@ foreach ($vm in $allVMTargets) {
     # WMI
     $wmi = Test-WMIAccess -Target $addr -Cred $script:DomainCred
     if (-not $wmi.OK) {
-        Write-Host " WMI FAILED" -ForegroundColor Red
-        $row.Ping   = $true
-        $row.Action = 'MANUAL'; $row.SkipReason = "WMI failed - $($wmi.Error)"
+        $row.Ping = $true
+        # If vCenter guest hint is non-Windows, treat as Linux/appliance instead of MANUAL
+        $guestHint  = (($vm.GuestOS -replace '_',' ') + '').ToUpper().Trim()
+        $looksWin   = ($guestHint -match 'WINDOWS|WIN') -or [string]::IsNullOrEmpty($guestHint) -or $guestHint -eq 'UNKNOWN'
+        if (-not $looksWin) {
+            Write-Host " LINUX/APPLIANCE" -ForegroundColor Cyan
+            $row.Action        = 'LINUX'
+            $row.SkipReason    = "Non-Windows guest ($($vm.GuestOS)) -- WinRM N/A"
+            $row.ConnectMethod = 'N/A (Linux/Appliance)'
+            $row.ResolvedOS    = $vm.GuestOS
+        } else {
+            Write-Host " WMI FAILED" -ForegroundColor Red
+            $row.Action    = 'MANUAL'
+            $row.SkipReason = "WMI failed - $($wmi.Error)"
+        }
         [void]$planRows.Add($row); continue
     }
     $row.WMI          = $true
@@ -1942,6 +2097,42 @@ if ($script:vSphereSources.Count -gt 0) {
 }
 
 # -----------------------------------------------------------------------------
+# PHASE 6c - LINUX / APPLIANCE SSH DISCOVERY
+# -----------------------------------------------------------------------------
+
+if ($linuxRows.Count -gt 0) {
+    Write-Phase "Linux / Appliance Discovery (SSH)"
+    Write-Host ("  {0} Linux/appliance box(es) detected." -f $linuxRows.Count) -ForegroundColor Cyan
+    Write-Host "  Each box prompts for its own SSH credentials." -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  [Y]  Attempt SSH discovery on each box" -ForegroundColor Cyan
+    Write-Host "  [N]  Skip (boxes still get placeholder tabs in the report)" -ForegroundColor Cyan
+    Write-Host ""
+    $linuxChoice = ''
+    while ($linuxChoice -notin @('Y','N')) {
+        $linuxChoice = (Read-Host "  Discover Linux? [Y/N]").Trim().ToUpper()
+    }
+
+    if ($linuxChoice -eq 'Y') {
+        $plinkExe = Join-Path $PSScriptRoot 'plink.exe'
+        if (-not (Test-Path $plinkExe)) {
+            B-Warn "plink.exe not found. Run Get-PortablePython.ps1 to download it."
+            B-Warn "Skipping SSH discovery — boxes will appear as placeholders."
+        } else {
+            $linuxDateStr = (Get-Date).ToString('yyyy-MM-dd')
+            foreach ($lr in $linuxRows) {
+                $lFile = Invoke-LinuxDiscovery -Row $lr -PlinkPath $plinkExe `
+                             -OutputFolder $sessionFolder -DateStr $linuxDateStr
+                if ($lFile) { [void]$outputFiles.Add($lFile) }
+            }
+        }
+    } else {
+        B-Line "Skipped. Linux boxes will appear as placeholder tabs in the report."
+    }
+    Write-Host ""
+}
+
+# -----------------------------------------------------------------------------
 # CLEANUP + SUMMARY
 # -----------------------------------------------------------------------------
 
@@ -1979,6 +2170,8 @@ if ($outputFiles.Count -gt 0) {
                      ForEach-Object { Split-Path $_ -Leaf }
 
     $serverEntries = [System.Collections.ArrayList]@()
+
+    # Windows discovery entries
     foreach ($f in ($outputFiles | Where-Object { (Split-Path $_ -Leaf) -match '-discovery-' })) {
         $leaf    = Split-Path $f -Leaf
         $srvName = [System.IO.Path]::GetFileNameWithoutExtension($leaf) -replace '-discovery-.*$', ''
@@ -1996,6 +2189,27 @@ if ($outputFiles.Count -gt 0) {
             name     = $srvName
             ip       = $srvIP
             in_scope = $true
+        })
+    }
+
+    # Linux/appliance entries — SSH-discovered and placeholder-only
+    foreach ($lr in $linuxRows) {
+        $lName   = $lr.DisplayName
+        $lId     = ($lName.ToLower() -replace '[^a-z0-9]', '') + 'lnx'
+        $lIP     = $lr.Address
+        $lGuest  = if ($lr.ResolvedOS -and $lr.ResolvedOS -ne 'Unknown') { $lr.ResolvedOS } else { 'Linux' }
+        # Check if SSH discovery produced a file for this box
+        $lFile   = $outputFiles | Where-Object { (Split-Path $_ -Leaf) -match "^$([regex]::Escape($lName))-linux-" } |
+                   Select-Object -First 1
+        $lLeaf   = if ($lFile) { Split-Path $lFile -Leaf } else { '' }
+        [void]$serverEntries.Add([ordered]@{
+            id       = $lId
+            file     = $lLeaf
+            name     = $lName
+            ip       = $lIP
+            in_scope = $true
+            os_type  = 'linux'
+            guest_os = $lGuest
         })
     }
 

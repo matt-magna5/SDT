@@ -1,58 +1,67 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Downloads the Python embeddable package into the SDT folder.
-    Run once on any machine where Python is not installed system-wide.
-    After this runs, Start-DiscoverySession will auto-generate HTML reports
-    without any additional setup.
+    Downloads SDT dependencies: portable Python (for HTML reports) and
+    plink.exe (for Linux SSH discovery). Run once per machine.
 .EXAMPLE
     .\Get-PortablePython.ps1
 #>
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+Write-Host ""
+Write-Host "  SDT -- Dependencies Setup" -ForegroundColor Cyan
+Write-Host ("  " + "=" * 40) -ForegroundColor DarkCyan
+Write-Host ""
+
+# ── PORTABLE PYTHON ──────────────────────────────────────────────────────────
 
 $PY_VERSION  = "3.12.6"
 $PY_URL      = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-embed-amd64.zip"
 $DEST_FOLDER = Join-Path $PSScriptRoot "python"
 $ZIP_TMP     = Join-Path $env:TEMP "sdt-py-embed.zip"
 
-Write-Host ""
-Write-Host "  SDT -- Portable Python Setup" -ForegroundColor Cyan
-Write-Host ("  " + "=" * 40) -ForegroundColor DarkCyan
-Write-Host ""
-
 if (Test-Path (Join-Path $DEST_FOLDER "python.exe")) {
-    Write-Host "  Portable Python already installed at:" -ForegroundColor Green
-    Write-Host "  $DEST_FOLDER" -ForegroundColor White
-    Write-Host ""
-    exit 0
-}
-
-Write-Host "  Downloading Python $PY_VERSION embeddable package..." -ForegroundColor DarkGray
-Write-Host "  $PY_URL" -ForegroundColor DarkGray
-Write-Host ""
-
-try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $PY_URL -OutFile $ZIP_TMP -UseBasicParsing
-} catch {
-    Write-Host "  Download failed: $_" -ForegroundColor Red
-    Write-Host ""
-    exit 1
-}
-
-Write-Host "  Extracting to: $DEST_FOLDER" -ForegroundColor DarkGray
-New-Item -ItemType Directory -Path $DEST_FOLDER -Force | Out-Null
-Expand-Archive -Path $ZIP_TMP -DestinationPath $DEST_FOLDER -Force
-Remove-Item $ZIP_TMP -Force -ErrorAction SilentlyContinue
-
-if (Test-Path (Join-Path $DEST_FOLDER "python.exe")) {
-    Write-Host ""
-    Write-Host "  Done. Portable Python ready." -ForegroundColor Green
-    Write-Host "  Start-DiscoverySession will now auto-generate HTML reports." -ForegroundColor DarkGray
-    Write-Host ""
+    Write-Host "  [OK] Portable Python already installed." -ForegroundColor Green
 } else {
-    Write-Host ""
-    Write-Host "  Extraction completed but python.exe not found." -ForegroundColor Yellow
-    Write-Host "  Check: $DEST_FOLDER" -ForegroundColor DarkGray
-    Write-Host ""
-    exit 1
+    Write-Host "  Downloading Python $PY_VERSION embeddable package..." -ForegroundColor DarkGray
+    try {
+        Invoke-WebRequest -Uri $PY_URL -OutFile $ZIP_TMP -UseBasicParsing
+        New-Item -ItemType Directory -Path $DEST_FOLDER -Force | Out-Null
+        Expand-Archive -Path $ZIP_TMP -DestinationPath $DEST_FOLDER -Force
+        Remove-Item $ZIP_TMP -Force -ErrorAction SilentlyContinue
+        if (Test-Path (Join-Path $DEST_FOLDER "python.exe")) {
+            Write-Host "  [OK] Portable Python ready." -ForegroundColor Green
+        } else {
+            Write-Host "  [WARN] Python extracted but python.exe not found — check $DEST_FOLDER" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  [FAIL] Python download failed: $_" -ForegroundColor Red
+    }
 }
+
+# ── PLINK.EXE (PuTTY SSH client — for Linux discovery) ───────────────────────
+
+$PLINK_URL  = "https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe"
+$PLINK_DEST = Join-Path $PSScriptRoot "plink.exe"
+
+if (Test-Path $PLINK_DEST) {
+    Write-Host "  [OK] plink.exe already present." -ForegroundColor Green
+} else {
+    Write-Host "  Downloading plink.exe (PuTTY SSH client)..." -ForegroundColor DarkGray
+    try {
+        Invoke-WebRequest -Uri $PLINK_URL -OutFile $PLINK_DEST -UseBasicParsing
+        if (Test-Path $PLINK_DEST) {
+            Write-Host "  [OK] plink.exe ready." -ForegroundColor Green
+        } else {
+            Write-Host "  [WARN] plink.exe download succeeded but file not found." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  [FAIL] plink.exe download failed: $_" -ForegroundColor Red
+        Write-Host "         Linux SSH discovery will not be available without it." -ForegroundColor DarkGray
+    }
+}
+
+Write-Host ""
+Write-Host "  Setup complete. Run Start-DiscoverySession_2.0.ps1 to begin." -ForegroundColor Cyan
+Write-Host ""
