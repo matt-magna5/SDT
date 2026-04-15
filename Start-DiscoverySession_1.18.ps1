@@ -303,6 +303,45 @@ Write-Host ("=" * 72) -ForegroundColor DarkMagenta
 Write-Host ""
 
 # -----------------------------------------------------------------------------
+# PORTABLE PYTHON — AUTO-SETUP
+# -----------------------------------------------------------------------------
+
+$portablePy     = Join-Path $PSScriptRoot 'python\python.exe'
+$setupScript    = Join-Path $PSScriptRoot 'Get-PortablePython.ps1'
+
+if (-not (Test-Path $portablePy)) {
+    $hasSysPython = $false
+    foreach ($pyCandidate in @('python','python3','py')) {
+        try {
+            $pyOut = & $pyCandidate --version 2>&1
+            if ($pyOut -match 'Python [23]') { $hasSysPython = $true; break }
+        } catch { }
+    }
+
+    if (-not $hasSysPython) {
+        if (Test-Path $setupScript) {
+            Write-Host "  Portable Python not found -- running setup..." -ForegroundColor Cyan
+            try {
+                & $setupScript
+                if (Test-Path $portablePy) {
+                    Write-Host ""
+                } else {
+                    Write-Host "  Setup completed but python.exe not found -- report will need manual generation." -ForegroundColor Yellow
+                    Write-Host ""
+                }
+            } catch {
+                Write-Host "  Python setup failed: $_ -- report will need manual generation." -ForegroundColor Yellow
+                Write-Host ""
+            }
+        } else {
+            Write-Host "  Python not found and Get-PortablePython.ps1 is missing." -ForegroundColor Yellow
+            Write-Host "  Discovery will run normally -- HTML report will need manual generation." -ForegroundColor DarkGray
+            Write-Host ""
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
 # HYPERVISOR HELPERS
 # -----------------------------------------------------------------------------
 
