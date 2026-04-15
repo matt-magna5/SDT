@@ -6,7 +6,7 @@ PowerShell-based server and VM discovery tool for presales cloud migration scopi
 
 ## What It Does
 
-### 1. Session Launcher — `Start-DiscoverySession_1.18.ps1`
+### 1. Session Launcher — `Start-DiscoverySession_1.18.ps1` (v2.0)
 
 Interactive session manager. Run this first on any domain-joined jump box or directly on a Hyper-V host.
 
@@ -35,15 +35,16 @@ Interactive session manager. Run this first on any domain-joined jump box or dir
 - Cleanup handler fires on `Ctrl+C` — no server gets left with WinRM enabled
 - Runs discovery on powered-on Windows VMs only; Linux VMs are skipped gracefully
 
-**Step 5 — Report Generation**
+**Step 5 — Report Generation (automatic)**
 - Saves per-server JSON to a timestamped session folder
 - Saves HV host inventory JSONs (hardware, VM list, storage volumes)
 - Writes a manifest JSON pointing to all output files
-- Calls `gen_report.py` automatically if Python is available
+- Calls `gen_report.py` automatically — no second step needed
+- Uses bundled portable Python (`python\python.exe`) if present; falls back to system Python; prints manual command if neither found
 
 ---
 
-### 2. Server Discovery Agent — `Invoke-ServerDiscovery_1.18.ps1`
+### 2. Server Discovery Agent — `Invoke-ServerDiscovery_1.18.ps1` (v2.0)
 
 Runs on each target server (locally or via WinRM). Read-only. Safe on Windows Server 2008 R2+. Collects:
 
@@ -71,9 +72,9 @@ Runs on each target server (locally or via WinRM). Read-only. Safe on Windows Se
 
 ---
 
-### 3. Report Generator — `gen_report.py`
+### 3. Report Generator — `gen_report.py` (v2.0)
 
-Python script. Takes a session manifest JSON and produces a single self-contained HTML report.
+Python script. Runs automatically at the end of each session via the bundled portable Python. Can also be called manually:
 
 ```bash
 python gen_report.py <path-to-manifest.json>
@@ -122,21 +123,32 @@ python gen_report.py <path-to-manifest.json>
 
 ## Quick Start
 
-**On the target environment (any domain-joined Windows machine with network access to the servers):**
+**Step 1 — Copy the SDT folder to the target machine (jump box or Hyper-V host)**
+
+The folder contains:
+```
+Start-DiscoverySession_1.18.ps1
+Invoke-ServerDiscovery_1.18.ps1
+gen_report.py
+Get-PortablePython.ps1
+```
+
+**Step 2 — Set up portable Python (one time per machine)**
 
 ```powershell
-# Download and run
-iwr https://raw.githubusercontent.com/trophyscar-bit/sdt/main/Start-DiscoverySession_1.18.ps1 -OutFile C:\Temp\Start-DiscoverySession_1.18.ps1
-iwr https://raw.githubusercontent.com/trophyscar-bit/sdt/main/Invoke-ServerDiscovery_1.18.ps1 -OutFile C:\Temp\Invoke-ServerDiscovery_1.18.ps1
-cd C:\Temp
+cd C:\Temp\SDT
+.\Get-PortablePython.ps1
+```
+
+Downloads the official Python 3.12 embeddable package (~10MB) into `SDT\python\`. No installer. No AV exposure.
+
+**Step 3 — Run discovery**
+
+```powershell
 .\Start-DiscoverySession_1.18.ps1
 ```
 
-**Generate report (requires Python 3.8+):**
-
-```bash
-python gen_report.py "C:\Temp\Discovery-Session-YYYY-MM-DD-HHMM\manifest.json"
-```
+When discovery completes, the HTML report is generated automatically and saved to the session folder. Done.
 
 ---
 
@@ -147,7 +159,7 @@ python gen_report.py "C:\Temp\Discovery-Session-YYYY-MM-DD-HHMM\manifest.json"
 | PowerShell | 5.1+ recommended (3.0 minimum) |
 | Permissions | Domain admin or local admin on each target server |
 | Network | WinRM (port 5985) or WMI/DCOM access to target servers |
-| Python | 3.8+ with `openpyxl` for report generation and Nutanix parsing |
+| Python | Bundled via `Get-PortablePython.ps1` — no system install needed |
 | vSphere | REST API access (port 443) for ESXi/vCenter environments |
 
 ---
@@ -172,6 +184,7 @@ Discovery-Session-2026-04-13-1647/
 | Version | Notes |
 |---|---|
 | v1.17 | Multi-hypervisor session launcher, vSphere REST API, WinRM safety, Nutanix Collector parser |
-| v1.18 | HV host auto-added as discovery targets; AD/DNS suggested servers scan; report fixes; async ping sweep (fixes freeze on subnet scan); AD server suggestions in bare metal path; B-Err silent error swallow fix |
+| v1.18 | HV host auto-added as discovery targets; AD/DNS suggested servers scan; report fixes; async ping sweep; B-Err silent error swallow fix |
 | v1.19 | Initial report generator release |
 | v1.20 | Full security product detection (EDR/RMM/Remote Access/Backup/PAM); System Overview layout; Basic tab removed; AD/SQL/file share rendering fixes |
+| **v2.0** | **Self-contained workflow — portable Python bundle eliminates manual report generation step. `Get-PortablePython.ps1` downloads official signed Python 3.12 embeddable (~10MB). HTML report auto-generates at session end. No system Python install required.** |
