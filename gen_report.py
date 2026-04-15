@@ -1420,7 +1420,7 @@ def build_server_tab(srv):
     rc += top_link(sid)
 
     # ── DISK STORAGE CARD ─────────────────────────────────────────────────────
-    disk_body = '<table><tr><th>Drive</th><th>Label</th><th>Filesystem</th><th>Total (GB)</th><th>Used (GB)</th><th>Free (GB)</th><th>Used %</th><th>Utilization</th></tr>\n'
+    disk_body = '<table><tr><th>Drive</th><th>Label</th><th>Filesystem</th><th>Total (GB)</th><th>Used (GB)</th><th>Free (GB)</th><th style="min-width:140px">Utilization</th></tr>\n'
     for d in disks:
         pct      = d.get('UsedPct', 0)
         total_gb = d.get('TotalGB', 0)
@@ -1432,9 +1432,9 @@ def build_server_tab(srv):
                      f'<td>{h(d.get("Label","") or "")}</td>'
                      f'<td>{h(d.get("Filesystem","NTFS"))}</td>'
                      f'<td>{total_gb:.2f}</td><td>{used_gb:.2f}</td><td>{free_gb:.2f}</td>'
-                     f'<td><span class="pill pill-{pc}">{pct}%</span></td>'
-                     f'<td style="min-width:120px"><div class="disk-bar-bg"><div class="disk-bar-fill" '
-                     f'style="width:{min(pct,100)}%;background:{c}"></div></div></td></tr>\n')
+                     f'<td><div class="disk-bar-bg"><div class="disk-bar-fill" '
+                     f'style="width:{min(pct,100)}%;background:{c}"></div></div>'
+                     f'<span style="font-size:8pt;color:#6b6080;">{pct}%</span></td></tr>\n')
     disk_body += '</table>\n' + top_link(sid)
 
     # ── NETWORK CARD ──────────────────────────────────────────────────────────
