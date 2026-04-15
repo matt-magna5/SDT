@@ -114,10 +114,22 @@ function Get-SuggestedHypervisors {
                     '*XEN*','*PROXMOX*','*PVE*','*VHOST*','*VIRT*')
     $found = [System.Collections.ArrayList]@()
 
-    # Try AD via ActiveDirectory module
+    # Try AD via ActiveDirectory module — run in job with 10s timeout to avoid hangs
+    $adComps = $null
     try {
-        Import-Module ActiveDirectory -ErrorAction Stop
-        $adComps = Get-ADComputer -Filter * -Properties Name,IPv4Address,Description,OperatingSystem -ErrorAction Stop
+        $adJob = Start-Job -ScriptBlock {
+            Import-Module ActiveDirectory -ErrorAction Stop
+            Get-ADComputer -Filter * -Properties Name,IPv4Address,Description,OperatingSystem -ErrorAction Stop
+        }
+        if (Wait-Job $adJob -Timeout 10) {
+            $adComps = Receive-Job $adJob
+        } else {
+            Stop-Job $adJob
+        }
+        Remove-Job $adJob -Force -ErrorAction SilentlyContinue
+    } catch { }
+
+    if ($adComps) {
         foreach ($c in $adComps) {
             $n = $c.Name.ToUpper()
             if ($hvPatterns | Where-Object { $n -like $_ }) {
@@ -129,13 +141,15 @@ function Get-SuggestedHypervisors {
                 }
             }
         }
-    } catch {
-        # Fallback: ADSI/LDAP (no AD module needed)
+    } else {
+        # Fallback: ADSI/LDAP with explicit timeout
         try {
             $root    = [ADSI]'LDAP://RootDSE'
             $base    = $root.defaultNamingContext
             $filter  = '(&(objectClass=computer)(|(name=*VH*)(name=*HV*)(name=*ESX*)(name=*VCENTER*)(name=*HYPERV*)(name=*VMWARE*)(name=*VMW*)(name=*NUTANIX*)(name=*NTX*)(name=*PRISM*)(name=*XEN*)(name=*PROXMOX*)(name=*PVE*)(name=*VHOST*)(name=*VIRT*)))'
             $srch    = New-Object DirectoryServices.DirectorySearcher([ADSI]"LDAP://$base", $filter)
+            $srch.ClientTimeout  = [TimeSpan]::FromSeconds(8)
+            $srch.ServerTimeLimit = [TimeSpan]::FromSeconds(8)
             @('name','dNSHostName','description') | ForEach-Object { [void]$srch.PropertiesToLoad.Add($_) }
             $srch.FindAll() | ForEach-Object {
                 $n   = if ($_.Properties['name'].Count)        { $_.Properties['name'][0] }        else { '' }
@@ -148,20 +162,23 @@ function Get-SuggestedHypervisors {
         } catch { }
     }
 
-    # DNS forward-lookup sweep for common HV naming patterns (fallback if AD empty)
+    # DNS forward-lookup sweep — async with 1s timeout per candidate (fallback if AD empty)
     if ($found.Count -eq 0) {
         $prefixes = @('VH','HV','ESX','ESXI','VCENTER','VC','HYPERV',
                       'VMW','NTX','PRISM','XEN','PVE','VHOST')
         foreach ($p in $prefixes) {
-            foreach ($i in 1..10) {
+            foreach ($i in 1..5) {
                 foreach ($candidate in @("$p$i","${p}0$i","${p}-$i","${p}_$i")) {
                     try {
-                        $r = [System.Net.Dns]::GetHostEntry($candidate)
-                        if (-not ($found | Where-Object { $_.Name -ieq $candidate })) {
-                            [void]$found.Add([PSCustomObject]@{
-                                Name=$candidate; IP=($r.AddressList[0].ToString())
-                                Source='DNS'; Description=''; OS=''
-                            })
+                        $ar = [System.Net.Dns]::BeginGetHostEntry($candidate, $null, $null)
+                        if ($ar.AsyncWaitHandle.WaitOne(1000)) {
+                            $r = [System.Net.Dns]::EndGetHostEntry($ar)
+                            if (-not ($found | Where-Object { $_.Name -ieq $candidate })) {
+                                [void]$found.Add([PSCustomObject]@{
+                                    Name=$candidate; IP=($r.AddressList[0].ToString())
+                                    Source='DNS'; Description=''; OS=''
+                                })
+                            }
                         }
                     } catch { }
                 }
