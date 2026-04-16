@@ -1954,8 +1954,9 @@ def build_private_cloud_tab():
         used_disk  = round(sum(float(dk.get('TotalGB', 0) or 0) - float(dk.get('FreeGB', 0) or 0)
                                for dk in disks_raw if isinstance(dk, dict)
                                and dk.get('TotalGB') is not None and dk.get('FreeGB') is not None), 1)
+        vm_type = 'Virtual' if hw.get('IsVM') else 'Physical'
         if cores or ram or total_disk:
-            merged[name.upper()] = (name, cores, ram, total_disk, used_disk, 'WinRM')
+            merged[name.upper()] = (name, cores, ram, total_disk, used_disk, 'WinRM', vm_type)
 
     # Fill gaps: hypervisor inventory (VMs not WinRM-discovered — ODNS, vCenter, etc.)
     for inv in hv_inventories:
@@ -1969,16 +1970,23 @@ def build_private_cloud_tab():
             # vSphere uses CapacityGB; Hyper-V uses TotalGB
             total_disk = round(sum(float(dk.get('CapacityGB', dk.get('TotalGB', 0)) or 0)
                                    for dk in vm_disks if isinstance(dk, dict)), 1)
-            merged[nm.upper()] = (nm, cores, ram, total_disk, 0.0, 'Hypervisor')
+            merged[nm.upper()] = (nm, cores, ram, total_disk, 0.0, 'Hypervisor', 'Virtual')
 
     if not merged:
         return '<div style="padding:32px;text-align:center;color:#6b6080;">No hardware data collected.</div>'
 
     all_rows = sorted(merged.values(), key=lambda r: r[0])
-    tot_cpu   = sum(r[1] for r in all_rows)
-    tot_ram   = round(sum(r[2] for r in all_rows), 1)
-    tot_disk  = round(sum(r[3] for r in all_rows), 1)
-    tot_used  = round(sum(r[4] for r in all_rows), 1)
+    # Exclude hypervisor management infrastructure from sizing totals.
+    # vCenter/VCSA/ESXi management VMs are not workloads to migrate.
+    # Everything else (including Linux appliances like ODNS) IS a workload.
+    _HV_MGMT = re.compile(r'vcenter|vcsa|vmware.{0,5}center', re.I)
+    def _is_hv_mgmt(name): return bool(_HV_MGMT.search(name))
+    sizing_rows = [r for r in all_rows if not _is_hv_mgmt(r[0])]
+    excl_rows   = [r for r in all_rows if _is_hv_mgmt(r[0])]
+    tot_cpu   = sum(r[1] for r in sizing_rows)
+    tot_ram   = round(sum(r[2] for r in sizing_rows), 1)
+    tot_disk  = round(sum(r[3] for r in sizing_rows), 1)
+    tot_used  = round(sum(r[4] for r in sizing_rows), 1)
 
     # Commvault sizing
     cv_src    = tot_used if tot_used > 0 else tot_disk
@@ -1996,17 +2004,33 @@ def build_private_cloud_tab():
     # Main sizing table
     out += ('<div class="sub-title">Server Inventory</div>\n'
             '<table style="width:100%;border-collapse:collapse;font-size:9pt;">'
-            '<tr><th>Server</th><th>Source</th><th>vCPU / Cores</th>'
+            '<tr><th>Server</th><th>Type</th><th>Source</th><th>vCPU / Cores</th>'
             '<th>RAM (GB)</th><th>Total Disk (GB)</th><th>Used Disk (GB)</th></tr>\n')
-    for i, (nm, cpu, ram, disk, used, src) in enumerate(all_rows):
-        bg     = 'background:#f5f4f8;' if i % 2 else ''
-        src_cl = 'color:#065f46;font-size:8pt;' if src == 'WinRM' else 'color:#6b6080;font-size:8pt;'
-        out   += (f'<tr style="{bg}"><td style="font-weight:600">{h(nm)}</td>'
-                  f'<td style="{src_cl}">{h(src)}</td>'
-                  f'<td>{cpu}</td><td>{ram}</td><td>{disk}</td>'
-                  f'<td>{"—" if not used else used}</td></tr>\n')
+    for i, (nm, cpu, ram, disk, used, src, vm_type) in enumerate(all_rows):
+        is_excl = _is_hv_mgmt(nm)
+        if is_excl:
+            row_style = 'background:#f9f9f9;opacity:0.55;'
+            name_style = 'color:#9ca3af;'
+            src_cl = 'color:#9ca3af;font-size:8pt;font-style:italic;'
+            dim = 'color:#9ca3af;'
+        else:
+            row_style = 'background:#f5f4f8;' if i % 2 else ''
+            name_style = 'font-weight:600;'
+            src_cl = 'color:#065f46;font-size:8pt;' if src == 'WinRM' else 'color:#6b6080;font-size:8pt;'
+            dim = ''
+        type_color = '#6b6080' if vm_type == 'Virtual' else '#271e41'
+        excl_note = ' <span style="font-size:7.5pt;color:#9ca3af;">(HV mgmt)</span>' if is_excl else ''
+        out += (f'<tr style="{row_style}"><td style="{name_style}">{h(nm)}{excl_note}</td>'
+                f'<td style="font-size:8.5pt;{dim}color:{type_color};">{h(vm_type)}</td>'
+                f'<td style="font-size:8pt;{dim}">{h(src)}</td>'
+                f'<td style="{dim}">{cpu}</td>'
+                f'<td style="{dim}">{ram}</td>'
+                f'<td style="{dim}">{disk}</td>'
+                f'<td style="{dim}">{"—" if not used else used}</td></tr>\n')
+    excl_note_str = (f' <span style="font-size:8pt;font-weight:400;color:rgba(255,255,255,.6);">'
+                     f'({len(excl_rows)} infrastructure/appliance excluded)</span>') if excl_rows else ''
     out += (f'<tr style="background:#271e41;color:#fff;font-weight:700;">'
-            f'<td colspan="2">TOTAL ({len(all_rows)} servers)</td>'
+            f'<td colspan="3">WORKLOAD TOTAL ({len(sizing_rows)} servers){excl_note_str}</td>'
             f'<td>{tot_cpu}</td><td>{tot_ram}</td><td>{tot_disk}</td><td>{tot_used if tot_used else "—"}</td></tr>\n'
             '</table>\n')
 
