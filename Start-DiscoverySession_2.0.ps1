@@ -553,7 +553,7 @@ function Invoke-DownloadWithProgress {
     } catch { Write-Host "`r  Method 1 (HttpClient) failed — trying WebClient...    " -ForegroundColor DarkGray }
 
     # Spinner helper — kills job if stalled (no file growth for 30s)
-    function _spinDownload($job, $destPath, $lbl, [int]$stallSec = 30) {
+    function _spinDownload($job, $destPath, $lbl, [int]$stallSec = 10) {
         $sp = @('|','/','-','\'); $i = 0
         $lastSz = -1; $lastGrowth = [DateTime]::Now
         while (-not $job.HasExited) {
@@ -623,7 +623,7 @@ function Invoke-DownloadWithProgress {
     try {
         if (Test-Path $Dest) { Remove-Item $Dest -Force -EA SilentlyContinue }
         $job = Start-Job -ScriptBlock { param($u,$d) & certutil.exe -urlcache -split -f $u $d 2>&1 } -ArgumentList $Url, $Dest
-        _spinDownload $job $Dest $Label -stallSec 60 | Out-Null
+        _spinDownload $job $Dest $Label -stallSec 20 | Out-Null
         Remove-Job $job -Force -EA SilentlyContinue
         if (Test-Path $Dest) {
             & certutil.exe -urlcache -f $Url delete 2>&1 | Out-Null
