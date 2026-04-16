@@ -27,7 +27,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $script:CredCacheFile = Join-Path $env:TEMP 'sdt-session-creds.xml'
-$script:SessionVersion  = '2.3'
+$script:SessionVersion  = '2.9'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
 $script:PendingInventories = [System.Collections.ArrayList]@()
@@ -719,8 +719,21 @@ function Invoke-UpdateCheck {
 
         Remove-Item $extTmp -Recurse -Force -ErrorAction SilentlyContinue
 
+        # Verify the update actually landed — check version string in updated script
+        $updatedScript = Join-Path $PSScriptRoot 'Start-DiscoverySession.ps1'
+        $verifyOK = $false
+        if (Test-Path $updatedScript) {
+            $verifyContent = Get-Content $updatedScript -Raw -ErrorAction SilentlyContinue
+            $verifyOK = $verifyContent -match "SessionVersion\s*=\s*'$latest'"
+        }
+
         Write-Host ""
-        Write-Host ("  SDT updated to v{0}. Re-run the script to use the new version." -f $latest) -ForegroundColor Green
+        if ($verifyOK) {
+            Write-Host ("  SDT updated to v{0}. Re-run the script to use the new version." -f $latest) -ForegroundColor Green
+        } else {
+            Write-Host "  Update downloaded but version mismatch detected." -ForegroundColor Yellow
+            Write-Host "  Files were copied — please re-run to confirm." -ForegroundColor DarkGray
+        }
         Write-Host ""
         exit 0
 
