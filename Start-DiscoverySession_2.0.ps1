@@ -499,6 +499,98 @@ Write-Host ("=" * 72) -ForegroundColor DarkMagenta
 Write-Host ""
 
 # -----------------------------------------------------------------------------
+# AUTO-UPDATE CHECK
+# -----------------------------------------------------------------------------
+
+function Invoke-UpdateCheck {
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        $resp = Invoke-WebRequest `
+            -Uri 'https://api.github.com/repos/trophyscar-bit/sdt/releases/latest' `
+            -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        $rel    = $resp.Content | ConvertFrom-Json
+        $latest = ($rel.tag_name -replace '^v','').Trim()
+        if (-not $latest) { return }
+
+        try { $newer = ([version]$latest -gt [version]$script:SessionVersion) } catch { return }
+        if (-not $newer) { return }
+
+        Write-Host ""
+        Write-Host ("  Update available: v{0}  (you have v{1})" -f $latest, $script:SessionVersion) -ForegroundColor Yellow
+        $ans = (Read-Host "  Update now? [Y/N]").Trim().ToUpper()
+        if ($ans -ne 'Y') {
+            Write-Host "  Skipping update." -ForegroundColor DarkGray
+            Write-Host ""
+            return
+        }
+
+        # Download with spinner
+        $zipUrl = "https://github.com/trophyscar-bit/sdt/archive/refs/tags/v$latest.zip"
+        $zipTmp = Join-Path $env:TEMP "sdt-update.zip"
+        $extTmp = Join-Path $env:TEMP "sdt-update-$latest"
+        $spin = @('|','/','-','\'); $si = 0
+
+        $dlJob = Start-Job -ScriptBlock {
+            param($u,$o)
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing
+        } -ArgumentList $zipUrl, $zipTmp
+
+        Write-Host "  Downloading v$latest...  " -NoNewline -ForegroundColor Cyan
+        while (-not $dlJob.HasExited) {
+            Write-Host ("`r  Downloading v$latest...  $($spin[$si % 4])") -NoNewline -ForegroundColor Cyan
+            $si++; Start-Sleep -Milliseconds 150
+        }
+        Receive-Job $dlJob -ErrorAction Stop | Out-Null
+        Remove-Job $dlJob -Force -ErrorAction SilentlyContinue
+        Write-Host "`r  Download complete.                    " -ForegroundColor DarkGray
+
+        # Extract
+        if (Test-Path $extTmp) { Remove-Item $extTmp -Recurse -Force }
+        Expand-Archive $zipTmp $extTmp -Force
+        Remove-Item $zipTmp -Force -ErrorAction SilentlyContinue
+
+        $srcDir = Get-ChildItem $extTmp -Directory | Select-Object -First 1
+        if (-not $srcDir) {
+            Write-Host "  Update failed: extracted folder not found." -ForegroundColor Red
+            return
+        }
+
+        # Back up detection_rules.json if it exists and differs from the download
+        $localRules  = Join-Path $PSScriptRoot 'detection_rules.json'
+        $newRules    = Join-Path $srcDir.FullName 'detection_rules.json'
+        if ((Test-Path $localRules) -and (Test-Path $newRules)) {
+            $localHash = (Get-FileHash $localRules -Algorithm MD5).Hash
+            $newHash   = (Get-FileHash $newRules   -Algorithm MD5).Hash
+            if ($localHash -ne $newHash) {
+                Copy-Item $localRules "$localRules.bak" -Force
+                Write-Host "  detection_rules.json backed up to .bak (your customizations preserved)" -ForegroundColor DarkGray
+            }
+        }
+
+        # Copy updated files — skip python\ folder and plink.exe
+        $skipNames = @('plink.exe')
+        foreach ($pattern in @('*.ps1','*.py','*.json')) {
+            Get-ChildItem $srcDir.FullName -Filter $pattern |
+            Where-Object { $_.Name -notin $skipNames } |
+            ForEach-Object { Copy-Item $_.FullName $PSScriptRoot -Force }
+        }
+
+        Remove-Item $extTmp -Recurse -Force -ErrorAction SilentlyContinue
+
+        Write-Host ""
+        Write-Host ("  SDT updated to v{0}. Re-run the script to use the new version." -f $latest) -ForegroundColor Green
+        Write-Host ""
+        exit 0
+
+    } catch {
+        # Silent fail — update check never blocks startup
+    }
+}
+
+Invoke-UpdateCheck
+
+# -----------------------------------------------------------------------------
 # PORTABLE PYTHON — AUTO-SETUP
 # -----------------------------------------------------------------------------
 
