@@ -2012,9 +2012,10 @@ foreach ($vm in $allVMTargets) {
             $row.ConnectMethod = 'N/A (Linux/Appliance)'
             $row.ResolvedOS    = $osGuess
         } else {
-            Write-Host " WMI FAILED" -ForegroundColor Red
-            $row.Action     = 'MANUAL'
-            $row.SkipReason = "WMI failed - $($wmi.Error)"
+            Write-Host " WMI failed + SSH:22 closed -- MANUAL" -ForegroundColor Yellow
+            $row.Action        = 'MANUAL'
+            $row.SkipReason    = "WMI failed + SSH:22 closed"
+            $row.ConnectMethod = "WMI failed + SSH:22 closed"
         }
         [void]$planRows.Add($row); continue
     }
@@ -2115,7 +2116,7 @@ Write-Host ("=" * 72) -ForegroundColor DarkMagenta
 Write-Host ""
 
 # Header
-Write-Host ("  {0,-26} {1,-12} {2,-18} {3,-8} {4,-20} {5}" -f "Server","Source","OS","WinRM","Connect Method","Action") -ForegroundColor DarkMagenta
+Write-Host ("  {0,-26} {1,-12} {2,-18} {3,-8} {4,-28} {5}" -f "Server","Source","OS","WinRM","Connect Method","Action") -ForegroundColor DarkMagenta
 Write-Divider
 
 foreach ($r in $planRows) {
@@ -2123,7 +2124,7 @@ foreach ($r in $planRows) {
     $osShort    = if ($osDisplay.Length -gt 17) { $osDisplay.Substring(0,15) + '..' } else { $osDisplay }
     $srcShort   = if ($r.Source -and $r.Source.Length -gt 11) { $r.Source.Substring(0,9) + '..' } else { if ($r.Source) { $r.Source } else { '-' } }
     $methShort  = if ($r.ConnectMethod) { $r.ConnectMethod } elseif ($r.SkipReason) { $r.SkipReason } else { '-' }
-    if ($methShort.Length -gt 19) { $methShort = $methShort.Substring(0,17) + '..' }
+    if ($methShort.Length -gt 27) { $methShort = $methShort.Substring(0,25) + '..' }
     $winrmShort = if ($r.WinRMState) {
                       $s = $r.WinRMState -replace '\(.*\)',''  # strip "(Manual)" etc
                       $p = if ($r.WinRMPort) { '+' } else { '' }  # + means port open too
@@ -2144,7 +2145,7 @@ foreach ($r in $planRows) {
         'LINUX'  { 'Cyan'     }
         default  { 'Gray'     }
     }
-    Write-Host ("  {0,-26} {1,-12} {2,-18} {3,-8} {4,-20} {5}" -f $r.DisplayName, $srcShort, $osShort, $winrmShort, $methShort, $actionLabel) -ForegroundColor $color
+    Write-Host ("  {0,-26} {1,-12} {2,-18} {3,-8} {4,-28} {5}" -f $r.DisplayName, $srcShort, $osShort, $winrmShort, $methShort, $actionLabel) -ForegroundColor $color
 }
 
 Write-Divider
