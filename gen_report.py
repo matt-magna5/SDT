@@ -1532,19 +1532,38 @@ def build_hv_tab():
     all_html = ''
 
     for hvi in hv_inventories:
-        hs         = hvi.get('HostSummary', {})
         is_vsphere = hvi.get('_type') == 'vSphereInventory'
-        hv_name    = hvi.get('HVHost', 'Unknown Host')
-        host_ip    = hvi.get('HostIP', '')
-        esxi_ver   = hvi.get('ESXiVersion', '')
-        host_type  = hvi.get('HostType', 'Hyper-V')
-        model      = hs.get('Model', '—')
-        mfg        = hs.get('Manufacturer', '')
-        cpu_model  = hs.get('CPUModel', '—')
-        cpu_cores  = hs.get('CPUCores', '?')
-        cpu_log    = hs.get('CPULogical', cpu_cores)
-        ram_gb     = float(hs.get('TotalRAMgb', 0) or 0)
-        vols       = hs.get('Volumes', [])
+
+        if is_vsphere:
+            # vSphere inventory field mapping
+            esx_hosts  = hvi.get('ESXHosts', []) or []
+            first_host = esx_hosts[0] if esx_hosts else {}
+            hv_name    = first_host.get('Name') or hvi.get('Server', 'Unknown Host')
+            host_ip    = hvi.get('Server', '')
+            esxi_ver   = hvi.get('Version') or hvi.get('APIVersion', '')
+            host_type  = 'ESXi'
+            hs         = hvi.get('HostSummary', {}) or {}
+            model      = hs.get('Model', first_host.get('Model', '—'))
+            mfg        = hs.get('Manufacturer', first_host.get('Manufacturer', ''))
+            cpu_model  = hs.get('CPUModel', first_host.get('CPUModel', '—'))
+            cpu_cores  = hs.get('CPUCores', first_host.get('CPUCores', '?'))
+            cpu_log    = hs.get('CPULogical', cpu_cores)
+            ram_gb     = float(hs.get('TotalRAMgb', first_host.get('RAMgb', 0)) or 0)
+            vols       = []
+        else:
+            hs         = hvi.get('HostSummary', {})
+            hv_name    = hvi.get('HVHost', 'Unknown Host')
+            host_ip    = hvi.get('HostIP', '')
+            esxi_ver   = hvi.get('ESXiVersion', '')
+            host_type  = hvi.get('HostType', 'Hyper-V')
+            model      = hs.get('Model', '—')
+            mfg        = hs.get('Manufacturer', '')
+            cpu_model  = hs.get('CPUModel', '—')
+            cpu_cores  = hs.get('CPUCores', '?')
+            cpu_log    = hs.get('CPULogical', cpu_cores)
+            ram_gb     = float(hs.get('TotalRAMgb', 0) or 0)
+            vols       = hs.get('Volumes', [])
+
         datastores = hvi.get('Datastores', [])
         vms        = hvi.get('VMs', [])
 
@@ -1559,10 +1578,12 @@ def build_hv_tab():
         vm_rows = ''
         for i, vm in enumerate(vms):
             disks     = [d for d in (vm.get('Disks', []) or []) if isinstance(d, dict)]
-            disk_gb   = sum(float(d.get('SizeGB', 0) or 0) for d in disks)
+            # vSphere uses CapacityGB; Hyper-V uses SizeGB
+            disk_gb   = sum(float(d.get('CapacityGB', d.get('SizeGB', 0)) or 0) for d in disks)
             disk_used = sum(float(d.get('UsedGB', 0) or 0) for d in disks)
             disk_str  = f'{disk_gb:.0f} GB' + (f' / {disk_used:.0f} GB used' if disk_used else '')
-            state     = vm.get('State', '?')
+            # vSphere uses PowerState; Hyper-V uses State
+            state     = vm.get('PowerState', vm.get('State', '?'))
             sc        = 'green' if state in ('Running', 'POWERED_ON') else 'gray'
             snaps     = vm.get('Snapshots', 0) or 0
             ip_val    = vm.get('IP', '') or vm.get('IPs', '') or '—'

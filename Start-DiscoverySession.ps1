@@ -1098,11 +1098,21 @@ function Get-VSphereInventory {
     Write-Host "`r                          " -NoNewline; Write-Host ""
     B-OK "  vSphere inventory done: $($vmDetails.Count) VMs, $($datastores.Count) datastores, $($esxHosts.Count) hosts"
 
+    # Try to get vCenter version from appliance API
+    $vcVersion = $null
+    try {
+        $verUri = "$base/" + $(if ($v7) { 'api/appliance/system/version' } else { 'rest/appliance/system/version' })
+        $verRaw = Invoke-VSphereRest -Uri $verUri -Headers $hdr
+        $verObj = if ($v7) { $verRaw } else { $verRaw.value }
+        $vcVersion = $verObj.version
+    } catch { }
+
     return [PSCustomObject]@{
         _type      = 'vSphereInventory'
         CollectedAt= (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         Server     = $Conn.Server
         APIVersion = $Conn.APIVer
+        Version    = $vcVersion
         ESXHosts   = $esxHosts
         Datastores = $datastores
         VMs        = $vmDetails
