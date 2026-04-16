@@ -16,9 +16,17 @@ Write-Host ""
 
 function Get-FileWithProgress {
     param([string]$Url, [string]$Dest, [string]$Label, [int]$TimeoutSec = 120)
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-    # Primary: HttpClient chunked stream with live progress
+    try {
+        $allTls = [enum]::GetValues([Net.SecurityProtocolType]) | Where-Object { $_ -match 'Tls' }
+        [Net.ServicePointManager]::SecurityProtocol = $allTls -as [Net.SecurityProtocolType]
+    } catch {
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+    }
+    try { [Net.WebRequest]::DefaultWebProxy = [Net.WebRequest]::GetSystemWebProxy()
+          [Net.WebRequest]::DefaultWebProxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials } catch { }
+
+    # Method 1: HttpClient chunked with progress
     try {
         $client   = New-Object System.Net.Http.HttpClient
         $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
@@ -28,45 +36,90 @@ function Get-FileWithProgress {
         $inStream = $response.Content.ReadAsStreamAsync().Result
         $outFile  = New-Object System.IO.FileStream($Dest, [System.IO.FileMode]::Create,
                         [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-        $buffer    = New-Object byte[] 65536
-        $totalRead = [long]0; $lastRead = [long]0
-        $lastTime  = [DateTime]::Now; $startTime = [DateTime]::Now
-        $read      = 0
-        while (($read = $inStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            $outFile.Write($buffer, 0, $read)
-            $totalRead += $read
-            $now     = [DateTime]::Now
-            $elapsed = ($now - $lastTime).TotalSeconds
-            if ($elapsed -ge 0.4) {
-                $speed    = [math]::Round(($totalRead - $lastRead) / 1KB / $elapsed, 0)
+        $buf = New-Object byte[] 65536; $totalRead = [long]0
+        $lastRead = [long]0; $lastTime = [DateTime]::Now; $startTime = [DateTime]::Now; $read = 0
+        while (($read = $inStream.Read($buf, 0, $buf.Length)) -gt 0) {
+            $outFile.Write($buf, 0, $read); $totalRead += $read
+            $now = [DateTime]::Now
+            if (($now - $lastTime).TotalSeconds -ge 0.4) {
+                $speed = [math]::Round(($totalRead-$lastRead)/1KB/($now-$lastTime).TotalSeconds,0)
                 $lastRead = $totalRead; $lastTime = $now
-                $readMB   = [math]::Round($totalRead / 1MB, 1)
+                $readMB = [math]::Round($totalRead/1MB,1)
                 $line = if ($total -gt 0) {
-                    $pct = [math]::Round($totalRead / $total * 100, 0)
-                    "`r  {0}  {1}%  {2} / {3} MB  {4} KB/s   " -f $Label, $pct, $readMB, [math]::Round($total/1MB,1), $speed
-                } else {
-                    "`r  {0}  {1} MB  {2} KB/s   " -f $Label, $readMB, $speed
-                }
+                    "`r  {0}  {1}%  {2} / {3} MB  {4} KB/s   " -f $Label,
+                        [math]::Round($totalRead/$total*100,0),$readMB,[math]::Round($total/1MB,1),$speed
+                } else { "`r  {0}  {1} MB  {2} KB/s   " -f $Label,$readMB,$speed }
                 Write-Host $line -NoNewline -ForegroundColor Cyan
             }
         }
         $outFile.Close(); $inStream.Close(); $client.Dispose()
-        $avgSpd = [math]::Round($totalRead / 1KB / ([DateTime]::Now - $startTime).TotalSeconds, 0)
-        Write-Host ("`r  {0}  Done  {1} MB  avg {2} KB/s                    " -f $Label, [math]::Round($totalRead/1MB,1), $avgSpd) -ForegroundColor Green
+        $avg = [math]::Round($totalRead/1KB/([DateTime]::Now-$startTime).TotalSeconds,0)
+        Write-Host ("`r  {0}  Done  {1} MB  avg {2} KB/s                    " -f $Label,[math]::Round($totalRead/1MB,1),$avg) -ForegroundColor Green
         return $true
-    } catch {
-        Write-Host "`r  HttpClient failed, trying fallback...                " -ForegroundColor DarkGray
-        try {
-            $ProgressPreference = 'SilentlyContinue'
-            Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing `
-                -TimeoutSec $TimeoutSec -ErrorAction Stop
-            Write-Host "  [OK] $Label downloaded (fallback method)." -ForegroundColor Green
-            return $true
-        } catch {
-            Write-Host "  [FAIL] $Label download failed: $_" -ForegroundColor Red
-            return $false
+    } catch { Write-Host "`r  Method 1 failed — trying WebClient...                 " -ForegroundColor DarkGray }
+
+    function _spin($job, $destPath, $lbl) {
+        $sp = @('|','/','-','\'); $i = 0
+        while (-not $job.HasExited) {
+            $sz = if (Test-Path $destPath) { [math]::Round((Get-Item $destPath).Length/1MB,1) } else { 0 }
+            Write-Host ("`r  {0}  {1}  {2} MB   " -f $lbl, $sp[$i%4], $sz) -NoNewline -ForegroundColor Cyan
+            $i++; Start-Sleep -Milliseconds 150
         }
+        $sz = if (Test-Path $destPath) { [math]::Round((Get-Item $destPath).Length/1MB,1) } else { 0 }
+        Write-Host ("`r  {0}  Done  {1} MB                              " -f $lbl, $sz) -ForegroundColor Green
     }
+
+    # Method 2: WebClient
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($u,$d)
+            $wc = New-Object System.Net.WebClient
+            $wc.Proxy = [Net.WebRequest]::GetSystemWebProxy()
+            $wc.Proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials
+            $wc.DownloadFile($u, $d)
+        } -ArgumentList $Url, $Dest
+        _spin $job $Dest $Label
+        Receive-Job $job -ErrorAction Stop | Out-Null
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        if (Test-Path $Dest) { return $true }; throw "not found"
+    } catch { Write-Host "`r  Method 2 failed — trying Invoke-WebRequest...         " -ForegroundColor DarkGray }
+
+    # Method 3: Invoke-WebRequest
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($u,$d,$t) $ProgressPreference='SilentlyContinue'
+            Invoke-WebRequest -Uri $u -OutFile $d -UseBasicParsing -TimeoutSec $t -ErrorAction Stop
+        } -ArgumentList $Url, $Dest, $TimeoutSec
+        _spin $job $Dest $Label
+        Receive-Job $job -ErrorAction Stop | Out-Null
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        if (Test-Path $Dest) { return $true }; throw "not found"
+    } catch { Write-Host "`r  Method 3 failed — trying BITS...                      " -ForegroundColor DarkGray }
+
+    # Method 4: BITS Transfer
+    try {
+        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+            $job = Start-Job -ScriptBlock { param($u,$d) Start-BitsTransfer -Source $u -Destination $d -ErrorAction Stop } -ArgumentList $Url, $Dest
+            _spin $job $Dest $Label
+            Receive-Job $job -ErrorAction Stop | Out-Null
+            Remove-Job $job -Force -ErrorAction SilentlyContinue
+            if (Test-Path $Dest) { return $true }; throw "not found"
+        }
+    } catch { Write-Host "`r  Method 4 failed — trying certutil...                  " -ForegroundColor DarkGray }
+
+    # Method 5: certutil (every Windows version including 2008 R2)
+    try {
+        $job = Start-Job -ScriptBlock { param($u,$d) & certutil.exe -urlcache -split -f $u $d 2>&1 } -ArgumentList $Url, $Dest
+        _spin $job $Dest $Label
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        if (Test-Path $Dest) {
+            & certutil.exe -urlcache -f $Url delete 2>&1 | Out-Null
+            return $true
+        }
+    } catch { }
+
+    Write-Host "  [FAIL] All download methods failed for: $Label" -ForegroundColor Red
+    return $false
 }
 
 # --- PORTABLE PYTHON ---
