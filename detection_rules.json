@@ -230,21 +230,18 @@
 
   "eol_product_scan": [
     {
-      "_note": "Scans installed apps for EOL-trackable Microsoft products.",
+      "_note": "Products worth flagging EOL in presales — creates a real sales/upgrade conversation.",
       "_note2": "keyword: case-insensitive substring match against app Name+Publisher",
-      "_note3": "slug: endoflife.date API product identifier",
-      "_note4": "version_from: field path in app record to extract version (dot-separated)"
+      "_note3": "slug: endoflife.date API product slug (see endoflife.date for full list)",
+      "_note4": "Add new products here as you find them in client environments. No Python needed."
     },
-    {"keyword": "microsoft .net framework",      "slug": "dotnetfx",              "label": ".NET Framework",        "version_from": "Name"},
-    {"keyword": "sharepoint server",              "slug": "sharepoint-server",     "label": "SharePoint Server",     "version_from": "Version"},
-    {"keyword": "skype for business",             "slug": "skype-for-business-server", "label": "Skype for Business", "version_from": "Version"},
-    {"keyword": "lync server",                    "slug": "skype-for-business-server", "label": "Lync Server",       "version_from": "Version"},
-    {"keyword": "sql server",                     "slug": "microsoft-sql-server",  "label": "SQL Server",            "version_from": "Version"},
-    {"keyword": "visual studio 20",               "slug": "visual-studio",         "label": "Visual Studio",         "version_from": "Version"},
-    {"keyword": "system center",                  "slug": "system-center",         "label": "System Center",         "version_from": "Version"},
-    {"keyword": "dynamics crm",                   "slug": "dynamics-crm",          "label": "Dynamics CRM",          "version_from": "Version"},
-    {"keyword": "project server",                 "slug": "project-server",        "label": "Project Server",        "version_from": "Version"},
-    {"keyword": "biztalk",                        "slug": "biztalk-server",        "label": "BizTalk Server",        "version_from": "Version"}
+    {"keyword": "sharepoint server",              "slug": "sharepoint-server",           "label": "SharePoint Server"},
+    {"keyword": "skype for business",             "slug": "skype-for-business-server",   "label": "Skype for Business"},
+    {"keyword": "lync server",                    "slug": "skype-for-business-server",   "label": "Lync Server"},
+    {"keyword": "sql server",                     "slug": "microsoft-sql-server",        "label": "SQL Server"},
+    {"keyword": "veeam backup",                   "slug": "veeam-backup-and-replication","label": "Veeam Backup & Replication"},
+    {"keyword": "acronis backup",                 "slug": "acronis-cyber-protect",       "label": "Acronis Backup"},
+    {"keyword": "commvault",                      "slug": "commvault",                   "label": "Commvault"}
   ],
 
   "lifecycle": {

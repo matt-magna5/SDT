@@ -1929,11 +1929,6 @@ def build_eol_tab():
 
                 # Extract version from app record
                 ver_raw = app.get('Version', '')
-                # For .NET Framework, parse version from name ("Microsoft .NET Framework 4.8")
-                if 'dotnetfx' in slug and not ver_raw:
-                    import re as _re
-                    m = _re.search(r'(\d+\.\d+[\.\d]*)', app_nm)
-                    if m: ver_raw = m.group(1)
 
                 if not ver_raw:
                     _seen_per_server[key] = True; break
