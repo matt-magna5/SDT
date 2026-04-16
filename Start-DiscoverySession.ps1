@@ -27,7 +27,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $script:CredCacheFile = Join-Path $env:TEMP 'sdt-session-creds.xml'
-$script:SessionVersion  = '2.9'
+$script:SessionVersion  = '3.0'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
 $script:PendingInventories = [System.Collections.ArrayList]@()
@@ -1941,12 +1941,15 @@ Write-Host ""
 
 $planRows = [System.Collections.ArrayList]@()
 
+$probeIdx = 0
+$probeTotal = $allVMTargets.Count
 foreach ($vm in $allVMTargets) {
+    $probeIdx++
     # Pick the best address to connect to
     $addr = if ($vm.IP -and $vm.IP -ne '') { ($vm.IP -split ',')[0].Trim() } else { $vm.Name }
     $displayName = $vm.Name
 
-    Write-Host ("  Probing {0,-28} ({1})..." -f $displayName, $addr) -NoNewline -ForegroundColor Gray
+    Write-Host ("  [{0}/{1}]  Probing {2,-24} ({3})..." -f $probeIdx, $probeTotal, $displayName, $addr) -NoNewline -ForegroundColor Gray
 
     $row = [PSCustomObject]@{
         DisplayName   = $displayName
@@ -2403,25 +2406,34 @@ if ($script:vSphereSources.Count -gt 0) {
     } else {
         foreach ($vSrc in $script:vSphereSources) {
             Write-Host ""
-            Write-Host ("  [$($vSrc.Type)] $($vSrc.Host) -- 90-day perf collection starting...") -ForegroundColor Cyan
+            Write-Host ("  [$($vSrc.Type)] $($vSrc.Host) -- perf collection starting (120 days, fallback to 90/60/30)...") -ForegroundColor Cyan
             Write-Host "  (this can take a few minutes for large environments)" -ForegroundColor DarkGray
             $vUser = $vSrc.Cred.UserName
             $vPass = $vSrc.Cred.GetNetworkCredential().Password
             try {
-                & $pythonCmd $collectorScript `
-                    --vcenter $vSrc.Host `
-                    --user    $vUser     `
-                    --pass    $vPass     `
-                    --days    90         `
-                    --output  $sessionFolder
+                # Try 120 days, fall back to shorter windows if vCenter history is limited
+                $perfDays = $null
+                foreach ($tryDays in @(120, 90, 60, 30)) {
+                    Write-Host "  Trying ${tryDays}-day history window..." -ForegroundColor DarkGray
+                    & $pythonCmd $collectorScript `
+                        --vcenter $vSrc.Host `
+                        --user    $vUser     `
+                        --pass    $vPass     `
+                        --days    $tryDays   `
+                        --output  $sessionFolder
+                    $pf = Get-ChildItem $sessionFolder -Filter 'vsphere-perf*.json' -EA SilentlyContinue |
+                          Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                    if ($pf -and $pf.Length -gt 100) { $perfDays = $tryDays; break }
+                    Write-Host "  ${tryDays}-day window returned no data -- trying shorter window..." -ForegroundColor DarkGray
+                }
                 $perfFile = Get-ChildItem $sessionFolder -Filter 'vsphere-perf*.json' -EA SilentlyContinue |
                             Sort-Object LastWriteTime -Descending | Select-Object -First 1
-                if ($perfFile) {
+                if ($perfFile -and $perfFile.Length -gt 100) {
                     [void]$outputFiles.Add($perfFile.FullName)
-                    B-OK "Performance data: $($perfFile.Name)"
-                    Write-Log 'OK' $vSrc.Host "vSphere perf JSON: $($perfFile.Name)"
+                    B-OK "Performance data ($perfDays days): $($perfFile.Name)"
+                    Write-Log 'OK' $vSrc.Host "vSphere perf JSON ($perfDays days): $($perfFile.Name)"
                 } else {
-                    B-Warn "Perf collection ran but no vsphere-perf JSON found in $sessionFolder"
+                    B-Warn "Perf collection returned no data for any window (120/90/60/30 days)"
                 }
             } catch {
                 B-Err "vSphere perf collection failed for $($vSrc.Host): $_"

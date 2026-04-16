@@ -1777,10 +1777,165 @@ def build_sql_tab():
     return card('sql-all', f'SQL Server Inventory ({len(sql_servers)} Instance{"s" if len(sql_servers)>1 else ""})',
                 nav + summary + body)
 
+def build_eol_tab():
+    """EOL Summary — OS, SQL, Exchange, ESXi/vCenter across all servers."""
+    today = datetime.date.today()
+    rows  = []
+
+    def _eol_row(srv_name, component, version, eol_raw, status):
+        if not eol_raw and not status: return
+        try:
+            eol_dt = datetime.date.fromisoformat(str(eol_raw)[:10]) if eol_raw else None
+        except Exception:
+            eol_dt = None
+        days_left = (eol_dt - today).days if eol_dt else None
+        if status in ('EOL', 'Near EOL') or (days_left is not None and days_left < 365):
+            sev = 'critical' if status == 'EOL' or (days_left is not None and days_left < 0) else 'warning'
+        elif days_left is not None and days_left < 730:
+            sev = 'warning'
+        else:
+            sev = 'ok'
+        rows.append((sev, srv_name, component, h(version or ''), h(eol_raw or status or ''), days_left))
+
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d    = srv.get('data', {})
+        name = srv.get('name', '')
+        sys_ = d.get('System', {})
+        # OS
+        _eol_row(name, 'Windows OS',
+                 sys_.get('OSName', ''),
+                 sys_.get('OSEOLDate', sys_.get('EOLDate', '')),
+                 sys_.get('OSEOLStatus', sys_.get('EOLStatus', '')))
+        # SQL
+        sql_inst = d.get('SQL', {})
+        if isinstance(sql_inst, list) and sql_inst: sql_inst = sql_inst[0]
+        if isinstance(sql_inst, dict) and sql_inst.get('Edition'):
+            _eol_row(name, 'SQL Server',
+                     f'{sql_inst.get("Edition","")} {sql_inst.get("Version","")}',
+                     sql_inst.get('EOLDate', ''), sql_inst.get('EOLStatus', ''))
+        # Exchange
+        exch = d.get('Exchange', {})
+        if isinstance(exch, dict) and exch.get('Installed'):
+            _eol_row(name, 'Exchange',
+                     exch.get('VersionName', ''),
+                     exch.get('EOLDate', ''), exch.get('EOLStatus', ''))
+
+    # Add vCenter/ESXi from HV inventories
+    for inv in hv_inventories:
+        if inv.get('_type') not in ('vSphereInventory',): continue
+        hname = inv.get('Hostname', inv.get('Name', 'vSphere'))
+        ver   = inv.get('Version', '')
+        if ver:
+            _eol_row(hname, 'ESXi/vCenter', ver, '', '')
+
+    if not rows:
+        return '<div style="padding:32px;text-align:center;color:#6b6080;">No EOL data detected across discovered servers.</div>'
+
+    SEV_ORDER = {'critical': 0, 'warning': 1, 'ok': 2}
+    rows.sort(key=lambda r: (SEV_ORDER.get(r[0], 3), r[4]))
+
+    SEV_COLOR  = {'critical': '#fee2e2', 'warning': '#fef3c7', 'ok': '#f0fdf4'}
+    SEV_BADGE  = {'critical': ('#d63638', 'EOL'),  'warning': ('#b07a00', 'NEAR EOL'), 'ok': ('#065f46', 'OK')}
+    SEV_ICON   = {'critical': '!', 'warning': '~', 'ok': 'v'}
+
+    body  = '<div style="margin-bottom:16px;font-size:9pt;color:#6b6080;">All servers with EOL or near-EOL components. Click a server tab for full detail.</div>\n'
+    body += ('<table style="width:100%;border-collapse:collapse;font-size:9pt;">'
+             '<tr><th style="width:20px"></th><th>Server</th><th>Component</th>'
+             '<th>Version</th><th>EOL Date / Status</th><th>Days Left</th></tr>\n')
+    for sev, srv_name, comp, ver, eol, days_left in rows:
+        bg   = SEV_COLOR.get(sev, '#fff')
+        bc, bl = SEV_BADGE.get(sev, ('#666', ''))
+        badge = f'<span style="background:{bc};color:#fff;border-radius:3px;padding:1px 7px;font-size:7.5pt;font-weight:700;">{bl}</span>'
+        dl_str = (f'{days_left}d' if days_left is not None and days_left >= 0
+                  else f'<span style="color:#d63638;font-weight:700;">{abs(days_left)}d ago</span>' if days_left is not None
+                  else '—')
+        body += (f'<tr style="background:{bg}">'
+                 f'<td style="text-align:center;font-weight:700;color:{bc}">{SEV_ICON[sev]}</td>'
+                 f'<td style="font-weight:600">{h(srv_name)}</td>'
+                 f'<td>{h(comp)}</td><td style="font-size:8.5pt">{ver}</td>'
+                 f'<td>{eol} {badge}</td><td style="font-family:monospace">{dl_str}</td></tr>\n')
+    body += '</table>\n'
+
+    crit_cnt = sum(1 for r in rows if r[0] == 'critical')
+    warn_cnt = sum(1 for r in rows if r[0] == 'warning')
+    summary  = (f'<div style="display:flex;gap:16px;margin-bottom:16px;">'
+                f'<span class="pill pill-red">{crit_cnt} EOL</span>'
+                f'<span class="pill pill-yellow">{warn_cnt} Near EOL</span>'
+                f'</div>')
+    return summary + body
+
+
+def build_private_cloud_tab():
+    """Private cloud / Commvault sizing — vCPU, RAM, disk totals per server."""
+    rows = []
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d    = srv.get('data', {})
+        name = srv.get('name', '')
+        hw   = d.get('Hardware', {})
+        if not hw: continue
+        cores = hw.get('CPULogicalCount', hw.get('CPUCores', 0)) or 0
+        ram   = hw.get('RAMTotalGB', 0) or 0
+        disks = d.get('Disks', []) or []
+        total_disk = sum((dk.get('TotalGB', 0) or 0) for dk in disks if isinstance(dk, dict))
+        used_disk  = sum((dk.get('TotalGB', 0) - dk.get('FreeGB', 0))
+                         for dk in disks if isinstance(dk, dict)
+                         and dk.get('TotalGB') and dk.get('FreeGB') is not None)
+        if cores or ram or total_disk:
+            rows.append((name, int(cores), round(float(ram), 1),
+                         round(float(total_disk), 1), round(float(used_disk), 1)))
+
+    # Also pull from HV inventories (VMs on Hyper-V/vSphere)
+    vm_rows = []
+    for inv in hv_inventories:
+        vms = inv.get('VMs', []) or []
+        for vm in vms:
+            if not isinstance(vm, dict): continue
+            vm_rows.append((
+                vm.get('Name', ''), int(vm.get('vCPU', 0) or 0),
+                round(float(vm.get('RAMAllocatedGB', 0) or 0), 1),
+                round(float(vm.get('DiskTotalGB', 0) or vm.get('DiskGB', 0) or 0), 1), 0.0
+            ))
+
+    if not rows and not vm_rows:
+        return '<div style="padding:32px;text-align:center;color:#6b6080;">No hardware data collected.</div>'
+
+    def _tbl(title, data, col_label='Server'):
+        if not data: return ''
+        tot_cpu  = sum(r[1] for r in data)
+        tot_ram  = round(sum(r[2] for r in data), 1)
+        tot_disk = round(sum(r[3] for r in data), 1)
+        tot_used = round(sum(r[4] for r in data), 1)
+        out  = f'<div class="sub-title">{h(title)}</div>\n'
+        out += ('<table style="width:100%;border-collapse:collapse;font-size:9pt;">'
+                f'<tr><th>{col_label}</th><th>vCPU / Cores</th>'
+                '<th>RAM (GB)</th><th>Total Disk (GB)</th><th>Used Disk (GB)</th></tr>\n')
+        for i, (nm, cpu, ram, disk, used) in enumerate(sorted(data, key=lambda x: x[0])):
+            bg = 'background:#f5f4f8;' if i % 2 else ''
+            out += (f'<tr style="{bg}"><td style="font-weight:600">{h(nm)}</td>'
+                    f'<td>{cpu}</td><td>{ram}</td><td>{disk}</td>'
+                    f'<td>{used if used else "—"}</td></tr>\n')
+        out += (f'<tr style="background:#271e41;color:#fff;font-weight:700;">'
+                f'<td>TOTAL ({len(data)})</td><td>{tot_cpu}</td>'
+                f'<td>{tot_ram}</td><td>{tot_disk}</td><td>{tot_used if tot_used else "—"}</td></tr>\n')
+        out += '</table>\n'
+        return out
+
+    note = ('<div class="flag-info" style="margin-bottom:16px;">'
+            '<div class="flag-label">Private Cloud + Commvault Sizing</div>'
+            '<div class="flag-detail">Allocated figures — use 70-80% for right-sized targets. '
+            'Add 20% headroom for growth. Commvault source capacity = total used disk.</div></div>\n')
+
+    return note + _tbl('Physical / Discovered Servers', rows) + _tbl('Virtual Machines (from Hypervisor)', vm_rows, 'VM Name')
+
+
 # ── BUILD ALL TABS ─────────────────────────────────────────────────────────────
 tabs = [(build_linux_tab(s) if s.get('os_type') == 'linux' else build_server_tab(s)) for s in servers]
 virt_tab_html = build_hv_tab()
 sql_tab_html  = build_sql_tab()
+eol_tab_html  = build_eol_tab()
+cloud_tab_html = build_private_cloud_tab()
 
 # ── LOGO ──────────────────────────────────────────────────────────────────────
 if LOGO_B64:
@@ -1805,6 +1960,8 @@ _virt_label  = ('Hyper-V / ESX' if _has_hyperv and _has_vsphere
 tab_buttons += f'<button class="tab-btn" data-tab="tab-virt" onclick="showTab(\'virt\')">{_virt_label}</button>\n'
 if sql_tab_html:
     tab_buttons += '<button class="tab-btn" data-tab="tab-sql" onclick="showTab(\'sql\')">SQL</button>\n'
+tab_buttons += '<button class="tab-btn" data-tab="tab-eol" onclick="showTab(\'eol\')" style="border-top:3px solid #d63638;">EOL</button>\n'
+tab_buttons += '<button class="tab-btn" data-tab="tab-cloud" onclick="showTab(\'cloud\')" style="border-top:3px solid #5b1fa4;">Private Cloud</button>\n'
 
 tab_contents = ''
 for i, t in enumerate(tabs):
@@ -1813,6 +1970,8 @@ for i, t in enumerate(tabs):
 tab_contents += f'<div id="tab-virt" class="tab-content">\n{virt_tab_html}\n</div>\n'
 if sql_tab_html:
     tab_contents += f'<div id="tab-sql" class="tab-content">\n{sql_tab_html}\n</div>\n'
+tab_contents += f'<div id="tab-eol" class="tab-content"><div style="padding:24px;">{eol_tab_html}</div></div>\n'
+tab_contents += f'<div id="tab-cloud" class="tab-content"><div style="padding:24px;">{cloud_tab_html}</div></div>\n'
 
 # ── FULL HTML ─────────────────────────────────────────────────────────────────
 html_out = f'''<!DOCTYPE html>
@@ -1909,7 +2068,7 @@ details[open] summary::before {{ content: '\\25BC  '; }}
 </div>
 </div>
 <div style="text-align:center;padding:24px 0 32px;color:#a89bc8;font-size:8pt;letter-spacing:.3px;">
-  Generated {DATE} ET &middot; Magna5 Solutions Engineering &middot; SDT v2.9
+  Generated {DATE} ET &middot; Magna5 Solutions Engineering &middot; SDT v3.0
 </div>
 <script>
 var VIEW_DESCS = {{

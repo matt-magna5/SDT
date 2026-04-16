@@ -706,7 +706,7 @@ if __name__ == '__main__':
     parser.add_argument('--vcenter', required=True)
     parser.add_argument('--user',    required=True)
     parser.add_argument('--pass',    required=True, dest='password')
-    parser.add_argument('--days',    type=int, default=90)
+    parser.add_argument('--days',    type=int, default=120)
     parser.add_argument('--output',  default='.')
     args = parser.parse_args()
     run(args.vcenter, args.user, args.password, args.days, args.output)
