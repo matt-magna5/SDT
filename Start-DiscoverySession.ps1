@@ -717,22 +717,49 @@ function Invoke-UpdateCheck {
             ForEach-Object { Copy-Item $_.FullName $PSScriptRoot -Force }
         }
 
-        Remove-Item $extTmp -Recurse -Force -ErrorAction SilentlyContinue
+        # Verify update integrity before cleaning up the extract
+        $srcScript  = Join-Path $srcDir.FullName 'Start-DiscoverySession.ps1'
+        $destScript = Join-Path $PSScriptRoot     'Start-DiscoverySession.ps1'
+        $verifyOK   = $false
+        $verifyMsg  = ''
 
-        # Verify the update actually landed — check version string in updated script
-        $updatedScript = Join-Path $PSScriptRoot 'Start-DiscoverySession.ps1'
-        $verifyOK = $false
-        if (Test-Path $updatedScript) {
-            $verifyContent = Get-Content $updatedScript -Raw -ErrorAction SilentlyContinue
-            $verifyOK = $verifyContent -match "SessionVersion\s*=\s*'$latest'"
+        if (Test-Path $destScript) {
+            # Check 1: file size (must be > 50KB)
+            $destSize = (Get-Item $destScript).Length
+            if ($destSize -lt 51200) {
+                $verifyMsg = "file too small ($destSize bytes) — copy may be incomplete"
+            } else {
+                # Check 2: version string present
+                $content = Get-Content $destScript -Raw -ErrorAction SilentlyContinue
+                if ($content -notmatch "SessionVersion\s*=\s*'$latest'") {
+                    $verifyMsg = "version string v$latest not found in updated script"
+                } else {
+                    # Check 3: SHA256 matches source from zip
+                    if (Test-Path $srcScript) {
+                        $srcHash  = (Get-FileHash $srcScript  -Algorithm SHA256).Hash
+                        $destHash = (Get-FileHash $destScript -Algorithm SHA256).Hash
+                        if ($srcHash -ne $destHash) {
+                            $verifyMsg = "SHA256 mismatch — file may be corrupt"
+                        } else {
+                            $verifyOK = $true
+                        }
+                    } else {
+                        $verifyOK = $true  # no src to compare against, version check passed
+                    }
+                }
+            }
+        } else {
+            $verifyMsg = "Start-DiscoverySession.ps1 not found after copy"
         }
+
+        Remove-Item $extTmp -Recurse -Force -ErrorAction SilentlyContinue
 
         Write-Host ""
         if ($verifyOK) {
             Write-Host ("  SDT updated to v{0}. Re-run the script to use the new version." -f $latest) -ForegroundColor Green
         } else {
-            Write-Host "  Update downloaded but version mismatch detected." -ForegroundColor Yellow
-            Write-Host "  Files were copied — please re-run to confirm." -ForegroundColor DarkGray
+            Write-Host ("  Update verification failed: {0}" -f $verifyMsg) -ForegroundColor Red
+            Write-Host "  Try re-running to attempt the update again." -ForegroundColor DarkGray
         }
         Write-Host ""
         exit 0
