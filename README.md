@@ -5,16 +5,16 @@ PowerShell-based server and VM discovery tool for presales cloud migration scopi
 **Download and extract in one shot — paste this into PowerShell on the target machine:**
 
 ```powershell
-iwr https://github.com/trophyscar-bit/sdt/archive/refs/tags/v2.7.zip -OutFile C:\Temp\sdt.zip; Expand-Archive C:\Temp\sdt.zip C:\Temp -Force; cd C:\Temp\sdt-2.7
+iwr https://github.com/trophyscar-bit/sdt/archive/refs/tags/v2.9.zip -OutFile C:\Temp\sdt.zip; Expand-Archive C:\Temp\sdt.zip C:\Temp -Force; cd C:\Temp\sdt-2.9
 ```
 
-Then run `.\Start-DiscoverySession_2.0.ps1` — everything else is automatic.
+Then run `.\Start-DiscoverySession.ps1` — everything else is automatic.
 
 ---
 
 ## What It Does
 
-### 1. Session Launcher — `Start-DiscoverySession_2.0.ps1` (v2.0)
+### 1. Session Launcher — `Start-DiscoverySession.ps1` 
 
 Interactive session manager. Run this first on any domain-joined jump box or directly on a Hyper-V host.
 
@@ -52,7 +52,7 @@ Interactive session manager. Run this first on any domain-joined jump box or dir
 
 ---
 
-### 2. Server Discovery Agent — `Invoke-ServerDiscovery_2.0.ps1` (v2.0)
+### 2. Server Discovery Agent — `Invoke-ServerDiscovery.ps1` 
 
 Runs on each target server (locally or via WinRM). Read-only. Safe on Windows Server 2008 R2+. Collects:
 
@@ -80,7 +80,7 @@ Runs on each target server (locally or via WinRM). Read-only. Safe on Windows Se
 
 ---
 
-### 3. Report Generator — `gen_report.py` (v2.0)
+### 3. Report Generator — `gen_report.py` 
 
 Python script. Runs automatically at the end of each session via the bundled portable Python. Can also be called manually:
 
@@ -135,8 +135,8 @@ python gen_report.py <path-to-manifest.json>
 
 The folder contains:
 ```
-Start-DiscoverySession_2.0.ps1
-Invoke-ServerDiscovery_2.0.ps1
+Start-DiscoverySession.ps1
+Invoke-ServerDiscovery.ps1
 gen_report.py
 Get-PortablePython.ps1
 ```
@@ -153,7 +153,7 @@ Downloads the official Python 3.12 embeddable package (~10MB) into `SDT\python\`
 **Step 3 — Run discovery**
 
 ```powershell
-.\Start-DiscoverySession_2.0.ps1
+.\Start-DiscoverySession.ps1
 ```
 
 When discovery completes, the HTML report is generated automatically and saved to the session folder. Done.

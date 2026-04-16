@@ -66,7 +66,7 @@ function Test-ScriptIntegrity {
     return ($errs.Count -eq 0)
 }
 
-$invokeScriptName = 'Invoke-ServerDiscovery_2.0.ps1'
+$invokeScriptName = 'Invoke-ServerDiscovery.ps1'
 $DiscoveryScript  = Join-Path $PSScriptRoot $invokeScriptName
 
 if (Test-ScriptIntegrity $DiscoveryScript) {

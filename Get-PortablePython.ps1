@@ -190,5 +190,5 @@ if (Test-Path $PLINK_DEST) {
 }
 
 Write-Host ""
-Write-Host "  Setup complete. Run Start-DiscoverySession_2.0.ps1 to begin." -ForegroundColor Cyan
+Write-Host "  Setup complete. Run Start-DiscoverySession.ps1 to begin." -ForegroundColor Cyan
 Write-Host ""
