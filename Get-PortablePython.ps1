@@ -58,60 +58,78 @@ function Get-FileWithProgress {
         return $true
     } catch { Write-Host "`r  Method 1 failed — trying WebClient...                 " -ForegroundColor DarkGray }
 
-    function _spin($job, $destPath, $lbl) {
+    function _spin($job, $destPath, $lbl, [int]$stallSec = 30) {
         $sp = @('|','/','-','\'); $i = 0
+        $lastSz = -1; $lastGrowth = [DateTime]::Now
         while (-not $job.HasExited) {
-            $sz = if (Test-Path $destPath) { [math]::Round((Get-Item $destPath).Length/1MB,1) } else { 0 }
-            Write-Host ("`r  {0}  {1}  {2} MB   " -f $lbl, $sp[$i%4], $sz) -NoNewline -ForegroundColor Cyan
+            $sz = if (Test-Path $destPath) { (Get-Item $destPath -EA SilentlyContinue).Length } else { 0 }
+            if ($sz -gt $lastSz) { $lastSz = $sz; $lastGrowth = [DateTime]::Now }
+            if (([DateTime]::Now - $lastGrowth).TotalSeconds -gt $stallSec) {
+                Stop-Job $job -EA SilentlyContinue
+                Write-Host ("`r  {0}  stalled ({1}s) — skipping...                " -f $lbl, $stallSec) -ForegroundColor DarkGray
+                return $false
+            }
+            Write-Host ("`r  {0}  {1}  {2} MB   " -f $lbl, $sp[$i%4], [math]::Round($sz/1MB,1)) -NoNewline -ForegroundColor Cyan
             $i++; Start-Sleep -Milliseconds 150
         }
         $sz = if (Test-Path $destPath) { [math]::Round((Get-Item $destPath).Length/1MB,1) } else { 0 }
         Write-Host ("`r  {0}  Done  {1} MB                              " -f $lbl, $sz) -ForegroundColor Green
+        return $true
     }
 
     # Method 2: WebClient
     try {
+        if (Test-Path $Dest) { Remove-Item $Dest -Force -EA SilentlyContinue }
         $job = Start-Job -ScriptBlock {
             param($u,$d)
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             $wc = New-Object System.Net.WebClient
             $wc.Proxy = [Net.WebRequest]::GetSystemWebProxy()
             $wc.Proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials
             $wc.DownloadFile($u, $d)
         } -ArgumentList $Url, $Dest
-        _spin $job $Dest $Label
-        Receive-Job $job -ErrorAction Stop | Out-Null
-        Remove-Job $job -Force -ErrorAction SilentlyContinue
-        if (Test-Path $Dest) { return $true }; throw "not found"
-    } catch { Write-Host "`r  Method 2 failed — trying Invoke-WebRequest...         " -ForegroundColor DarkGray }
+        $ok = _spin $job $Dest $Label
+        Receive-Job $job -EA SilentlyContinue | Out-Null
+        Remove-Job $job -Force -EA SilentlyContinue
+        if ($ok -and (Test-Path $Dest)) { return $true }
+    } catch { }
+    Write-Host "`r  Method 2 failed — trying Invoke-WebRequest...         " -ForegroundColor DarkGray
 
     # Method 3: Invoke-WebRequest
     try {
+        if (Test-Path $Dest) { Remove-Item $Dest -Force -EA SilentlyContinue }
         $job = Start-Job -ScriptBlock {
-            param($u,$d,$t) $ProgressPreference='SilentlyContinue'
-            Invoke-WebRequest -Uri $u -OutFile $d -UseBasicParsing -TimeoutSec $t -ErrorAction Stop
+            param($u,$d,$t)
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $u -OutFile $d -UseBasicParsing -TimeoutSec $t -EA Stop
         } -ArgumentList $Url, $Dest, $TimeoutSec
-        _spin $job $Dest $Label
-        Receive-Job $job -ErrorAction Stop | Out-Null
-        Remove-Job $job -Force -ErrorAction SilentlyContinue
-        if (Test-Path $Dest) { return $true }; throw "not found"
-    } catch { Write-Host "`r  Method 3 failed — trying BITS...                      " -ForegroundColor DarkGray }
+        $ok = _spin $job $Dest $Label
+        Receive-Job $job -EA SilentlyContinue | Out-Null
+        Remove-Job $job -Force -EA SilentlyContinue
+        if ($ok -and (Test-Path $Dest)) { return $true }
+    } catch { }
+    Write-Host "`r  Method 3 failed — trying BITS...                      " -ForegroundColor DarkGray
 
     # Method 4: BITS Transfer
-    try {
-        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
-            $job = Start-Job -ScriptBlock { param($u,$d) Start-BitsTransfer -Source $u -Destination $d -ErrorAction Stop } -ArgumentList $Url, $Dest
-            _spin $job $Dest $Label
-            Receive-Job $job -ErrorAction Stop | Out-Null
-            Remove-Job $job -Force -ErrorAction SilentlyContinue
-            if (Test-Path $Dest) { return $true }; throw "not found"
-        }
-    } catch { Write-Host "`r  Method 4 failed — trying certutil...                  " -ForegroundColor DarkGray }
+    if (Get-Command Start-BitsTransfer -EA SilentlyContinue) {
+        try {
+            if (Test-Path $Dest) { Remove-Item $Dest -Force -EA SilentlyContinue }
+            $job = Start-Job -ScriptBlock { param($u,$d) Start-BitsTransfer -Source $u -Destination $d -EA Stop } -ArgumentList $Url, $Dest
+            $ok = _spin $job $Dest $Label
+            Receive-Job $job -EA SilentlyContinue | Out-Null
+            Remove-Job $job -Force -EA SilentlyContinue
+            if ($ok -and (Test-Path $Dest)) { return $true }
+        } catch { }
+        Write-Host "`r  Method 4 failed — trying certutil...                  " -ForegroundColor DarkGray
+    }
 
     # Method 5: certutil (every Windows version including 2008 R2)
     try {
+        if (Test-Path $Dest) { Remove-Item $Dest -Force -EA SilentlyContinue }
         $job = Start-Job -ScriptBlock { param($u,$d) & certutil.exe -urlcache -split -f $u $d 2>&1 } -ArgumentList $Url, $Dest
-        _spin $job $Dest $Label
-        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        _spin $job $Dest $Label -stallSec 60 | Out-Null
+        Remove-Job $job -Force -EA SilentlyContinue
         if (Test-Path $Dest) {
             & certutil.exe -urlcache -f $Url delete 2>&1 | Out-Null
             return $true
