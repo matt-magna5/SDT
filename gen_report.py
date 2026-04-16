@@ -2011,9 +2011,8 @@ def build_private_cloud_tab():
 
     # Commvault sizing
     cv_src    = tot_used if tot_used > 0 else tot_disk
-    cv_growth = round(cv_src * 1.2, 1)           # +20% growth buffer
-    cv_after  = round(cv_growth / 1.5, 1)         # ~1.5:1 dedup/compression
-    cv_repos  = max(1, round(cv_src / 2000))       # rough repo count (2TB capacity each)
+    cv_growth = round(cv_src * 1.2, 1)    # +20% growth buffer
+    cv_repos  = max(1, round(cv_growth / 2000, 1))  # repo count at 2TB each
 
     # Header note
     out = ('<div class="flag-info" style="margin-bottom:16px;">'
@@ -2059,14 +2058,14 @@ def build_private_cloud_tab():
     out += ('<div class="sub-title" style="margin-top:24px;">Commvault Sizing Estimate</div>\n'
             '<table style="width:60%;border-collapse:collapse;font-size:9pt;">'
             '<tr><th style="width:55%">Parameter</th><th>Value</th></tr>\n'
-            f'<tr><td>Source data (used disk)</td><td><strong>{cv_src} GB</strong></td></tr>\n'
-            f'<tr style="background:#f5f4f8"><td>With 20% growth buffer</td><td><strong>{cv_growth} GB</strong></td></tr>\n'
-            f'<tr><td>Est. after dedup/compression (~1.5:1)</td><td><strong>{cv_after} GB</strong></td></tr>\n'
+            f'<tr><td>Front-end source data (used disk)</td><td><strong>{cv_src} GB</strong></td></tr>\n'
+            f'<tr style="background:#f5f4f8"><td>CV repository size (match front end)</td><td><strong>{cv_src} GB</strong></td></tr>\n'
+            f'<tr><td>With 20% growth buffer</td><td><strong>{cv_growth} GB</strong></td></tr>\n'
             f'<tr style="background:#f5f4f8"><td>Est. repository count (2TB ea.)</td><td><strong>{cv_repos}</strong></td></tr>\n'
-            f'<tr><td>Servers to protect</td><td><strong>{len(all_rows)}</strong></td></tr>\n'
+            f'<tr><td>Servers to protect</td><td><strong>{len(sizing_rows)}</strong></td></tr>\n'
             '</table>\n'
             '<div style="font-size:8pt;color:#9ca3af;margin-top:8px;">'
-            'Estimates only. Actual CV sizing depends on change rate, retention, and workload type.</div>\n')
+            'Sizing per M5 BDR team rule of thumb: CV repository = front-end source data (1:1). Add 20% for growth.</div>\n')
     return out
 
 
