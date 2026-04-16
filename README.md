@@ -5,7 +5,7 @@ PowerShell-based server and VM discovery tool for presales cloud migration scopi
 **Download and extract in one shot — paste this into PowerShell on the target machine:**
 
 ```powershell
-iwr https://github.com/trophyscar-bit/sdt/archive/refs/tags/v2.5.zip -OutFile C:\Temp\sdt.zip; Expand-Archive C:\Temp\sdt.zip C:\Temp -Force; cd C:\Temp\sdt-2.5
+iwr https://github.com/trophyscar-bit/sdt/archive/refs/tags/v2.6.zip -OutFile C:\Temp\sdt.zip; Expand-Archive C:\Temp\sdt.zip C:\Temp -Force; cd C:\Temp\sdt-2.6
 ```
 
 Then run `.\Start-DiscoverySession_2.0.ps1` — everything else is automatic.
