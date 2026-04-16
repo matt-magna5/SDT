@@ -56,7 +56,7 @@ function Get-FileWithProgress {
         $avg = [math]::Round($totalRead/1KB/([DateTime]::Now-$startTime).TotalSeconds,0)
         Write-Host ("`r  {0}  Done  {1} MB  avg {2} KB/s                    " -f $Label,[math]::Round($totalRead/1MB,1),$avg) -ForegroundColor Green
         return $true
-    } catch { Write-Host "`r  Method 1 failed — trying WebClient...                 " -ForegroundColor DarkGray }
+    } catch { Write-Host "`r  Method 1 failed - trying WebClient...                 " -ForegroundColor DarkGray }
 
     function _spin($job, $destPath, $lbl) {
         $sp = @('|','/','-','\'); $i = 0
@@ -73,12 +73,12 @@ function Get-FileWithProgress {
             }
             if (-not $everHadBytes -and $waited -gt 10) {
                 Stop-Job $job -EA SilentlyContinue
-                Write-Host ("`r  {0}  no response — skipping...                 " -f $lbl) -ForegroundColor DarkGray
+                Write-Host ("`r  {0}  no response - skipping...                 " -f $lbl) -ForegroundColor DarkGray
                 return $false
             }
             if ($everHadBytes -and $waited -gt 60) {
                 Stop-Job $job -EA SilentlyContinue
-                Write-Host ("`r  {0}  stalled mid-transfer — skipping...        " -f $lbl) -ForegroundColor DarkGray
+                Write-Host ("`r  {0}  stalled mid-transfer - skipping...        " -f $lbl) -ForegroundColor DarkGray
                 return $false
             }
             Write-Host ("`r  {0}  {1}  {2} MB   " -f $lbl, $sp[$i%4], [math]::Round($sz/1MB,1)) -NoNewline -ForegroundColor Cyan
@@ -105,7 +105,7 @@ function Get-FileWithProgress {
         Remove-Job $job -Force -EA SilentlyContinue
         if ($ok -and (Test-Path $Dest)) { return $true }
     } catch { }
-    Write-Host "`r  Method 2 failed — trying Invoke-WebRequest...         " -ForegroundColor DarkGray
+    Write-Host "`r  Method 2 failed - trying Invoke-WebRequest...         " -ForegroundColor DarkGray
 
     # Method 3: Invoke-WebRequest
     try {
@@ -121,7 +121,7 @@ function Get-FileWithProgress {
         Remove-Job $job -Force -EA SilentlyContinue
         if ($ok -and (Test-Path $Dest)) { return $true }
     } catch { }
-    Write-Host "`r  Method 3 failed — trying BITS...                      " -ForegroundColor DarkGray
+    Write-Host "`r  Method 3 failed - trying BITS...                      " -ForegroundColor DarkGray
 
     # Method 4: BITS Transfer
     if (Get-Command Start-BitsTransfer -EA SilentlyContinue) {
@@ -133,7 +133,7 @@ function Get-FileWithProgress {
             Remove-Job $job -Force -EA SilentlyContinue
             if ($ok -and (Test-Path $Dest)) { return $true }
         } catch { }
-        Write-Host "`r  Method 4 failed — trying certutil...                  " -ForegroundColor DarkGray
+        Write-Host "`r  Method 4 failed - trying certutil...                  " -ForegroundColor DarkGray
     }
 
     # Method 5: certutil (every Windows version including 2008 R2)

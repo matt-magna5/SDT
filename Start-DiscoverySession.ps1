@@ -117,7 +117,7 @@ function Get-SuggestedHypervisors {
                     '*XEN*','*PROXMOX*','*PVE*','*VHOST*','*VIRT*')
     $found = [System.Collections.ArrayList]@()
 
-    # Try AD via ActiveDirectory module — run in job with 10s timeout to avoid hangs
+    # Try AD via ActiveDirectory module - run in job with 10s timeout to avoid hangs
     $adComps = $null
     try {
         $adJob = Start-Job -ScriptBlock {
@@ -165,7 +165,7 @@ function Get-SuggestedHypervisors {
         } catch { }
     }
 
-    # DNS forward-lookup sweep — fire all candidates in parallel, collect within 4s total
+    # DNS forward-lookup sweep - fire all candidates in parallel, collect within 4s total
     if ($found.Count -eq 0) {
         $prefixes = @('VH','HV','ESX','ESXI','VCENTER','VC','HYPERV',
                       'VMW','NTX','PRISM','XEN','PVE','VHOST')
@@ -205,7 +205,7 @@ function Get-SuggestedHypervisors {
 
 # -- SUGGESTED SERVER SCAN (AD - by OS type, bare metal path) -----------------
 function Get-SuggestedServers {
-    # Returns ALL Windows servers from AD — caller filters out known VMs.
+    # Returns ALL Windows servers from AD - caller filters out known VMs.
     # No nested jobs: this function runs inside an outer job with a hard timeout.
     $found = [System.Collections.ArrayList]@()
 
@@ -227,7 +227,7 @@ function Get-SuggestedServers {
         $adOK = $true
     } catch { }
 
-    # ADSI/LDAP fallback — works on any domain-joined machine, no module needed
+    # ADSI/LDAP fallback - works on any domain-joined machine, no module needed
     if (-not $adOK) {
         try {
             $root   = [ADSI]'LDAP://RootDSE'
@@ -398,7 +398,7 @@ function Invoke-LinuxDiscovery {
                         [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sshPassSec))
     }
 
-    # Bash discovery command — here-string prevents PowerShell from parsing || $ etc.
+    # Bash discovery command - here-string prevents PowerShell from parsing || $ etc.
     $bashCmd = @'
 echo '---HOSTNAME---'; hostname 2>/dev/null; echo '---OSRELEASE---'; cat /etc/os-release 2>/dev/null || echo 'ID=unknown'; echo '---UNAME---'; uname -srm 2>/dev/null; echo '---CPU---'; echo CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1); lscpu 2>/dev/null | grep 'Model name' || echo 'Model name: Unknown'; echo '---MEMORY---'; free -m 2>/dev/null; echo '---DISKS---'; df -h 2>/dev/null | grep -v tmpfs | grep -v udev | grep -v overlay | grep -v '^Filesystem'; echo '---NETWORK---'; ip -o addr show 2>/dev/null | grep ' inet ' || ifconfig 2>/dev/null | grep 'inet '; echo '---SERVICES---'; systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk '{print $1}' | head -40; echo '---DONE---'
 '@
@@ -412,7 +412,7 @@ echo '---HOSTNAME---'; hostname 2>/dev/null; echo '---OSRELEASE---'; cat /etc/os
         $outStr = $output -join "`n"
 
         if ($outStr -notmatch '---DONE---') {
-            # Host key not cached — pipe 'y' to accept it, then retry
+            # Host key not cached - pipe 'y' to accept it, then retry
             $output = "y`n" | & $PlinkPath -ssh -l $sshUser -pw $sshPass $target $bashCmd 2>&1
             $outStr = $output -join "`n"
         }
@@ -499,7 +499,7 @@ Write-Host ("=" * 72) -ForegroundColor DarkMagenta
 Write-Host ""
 
 # -----------------------------------------------------------------------------
-# DOWNLOAD HELPER — multi-method with live progress, self-healing fallbacks
+# DOWNLOAD HELPER - multi-method with live progress, self-healing fallbacks
 # -----------------------------------------------------------------------------
 
 function Invoke-DownloadWithProgress {
@@ -550,7 +550,7 @@ function Invoke-DownloadWithProgress {
         $avg = [math]::Round($totalRead/1KB/([DateTime]::Now-$startTime).TotalSeconds,0)
         Write-Host ("`r  {0}  Done  {1} MB  avg {2} KB/s                    " -f $Label,[math]::Round($totalRead/1MB,1),$avg) -ForegroundColor Green
         return $true
-    } catch { Write-Host "`r  Method 1 (HttpClient) failed — trying WebClient...    " -ForegroundColor DarkGray }
+    } catch { Write-Host "`r  Method 1 (HttpClient) failed - trying WebClient...    " -ForegroundColor DarkGray }
 
     # Spinner helper:
     #  - No bytes in 10s            -> can't connect, skip fast
@@ -573,13 +573,13 @@ function Invoke-DownloadWithProgress {
             # No connection at all after 10s
             if (-not $everHadBytes -and $waited -gt 10) {
                 Stop-Job $job -EA SilentlyContinue
-                Write-Host ("`r  {0}  no response in 10s — skipping...          " -f $lbl) -ForegroundColor DarkGray
+                Write-Host ("`r  {0}  no response in 10s - skipping...          " -f $lbl) -ForegroundColor DarkGray
                 return $false
             }
             # Mid-transfer stall after 60s
             if ($everHadBytes -and $waited -gt 60) {
                 Stop-Job $job -EA SilentlyContinue
-                Write-Host ("`r  {0}  stalled mid-transfer — skipping...         " -f $lbl) -ForegroundColor DarkGray
+                Write-Host ("`r  {0}  stalled mid-transfer - skipping...         " -f $lbl) -ForegroundColor DarkGray
                 return $false
             }
             Write-Host ("`r  {0}  {1}  {2} MB   " -f $lbl, $sp[$i%4], [math]::Round($sz/1MB,1)) -NoNewline -ForegroundColor Cyan
@@ -606,7 +606,7 @@ function Invoke-DownloadWithProgress {
         Remove-Job $job -Force -EA SilentlyContinue
         if (Test-Path $Dest) { return $true }  # file exists = success regardless of stall flag
     } catch { }
-    Write-Host "`r  Method 2 (WebClient) failed — trying Invoke-WebRequest..." -ForegroundColor DarkGray
+    Write-Host "`r  Method 2 (WebClient) failed - trying Invoke-WebRequest..." -ForegroundColor DarkGray
 
     # --- Method 3: Invoke-WebRequest (PS 3.0+) ---
     try {
@@ -622,7 +622,7 @@ function Invoke-DownloadWithProgress {
         Remove-Job $job -Force -EA SilentlyContinue
         if (Test-Path $Dest) { return $true }
     } catch { }
-    Write-Host "`r  Method 3 (Invoke-WebRequest) failed — trying BITS...   " -ForegroundColor DarkGray
+    Write-Host "`r  Method 3 (Invoke-WebRequest) failed - trying BITS...   " -ForegroundColor DarkGray
 
     # --- Method 4: BITS Transfer ---
     if (Get-Command Start-BitsTransfer -EA SilentlyContinue) {
@@ -634,7 +634,7 @@ function Invoke-DownloadWithProgress {
             Remove-Job $job -Force -EA SilentlyContinue
             if (Test-Path $Dest) { return $true }
         } catch { }
-        Write-Host "`r  Method 4 (BITS) failed — trying certutil...            " -ForegroundColor DarkGray
+        Write-Host "`r  Method 4 (BITS) failed - trying certutil...            " -ForegroundColor DarkGray
     }
 
     # --- Method 5: certutil (every Windows version, including 2008 R2) ---
@@ -681,13 +681,13 @@ function Invoke-UpdateCheck {
 
         $zipUrl = "https://github.com/trophyscar-bit/sdt/archive/refs/tags/v$latest.zip"
         $zipTmp = Join-Path $env:TEMP "sdt-update.zip"
-        $extTmp = Join-Path $env:TEMP "sdt-update-$latest"
+        $extTmp = Join-Path $env:TEMP ("sdt-upd-{0}-{1}" -f $latest, [guid]::NewGuid().ToString('N').Substring(0,6))
 
         $ok = Invoke-DownloadWithProgress -Url $zipUrl -Dest $zipTmp -Label "SDT v$latest"
         if (-not $ok) { return }
 
-        # Extract
-        if (Test-Path $extTmp) { Remove-Item $extTmp -Recurse -Force }
+        # Extract - unique folder avoids permission conflicts from prior runs
+        try { if (Test-Path $extTmp) { Remove-Item $extTmp -Recurse -Force -EA Stop } } catch { }
         Expand-Archive $zipTmp $extTmp -Force
         Remove-Item $zipTmp -Force -ErrorAction SilentlyContinue
 
@@ -709,7 +709,7 @@ function Invoke-UpdateCheck {
             }
         }
 
-        # Copy updated files — skip python\ folder and plink.exe
+        # Copy updated files - skip python\ folder and plink.exe
         $skipNames = @('plink.exe')
         foreach ($pattern in @('*.ps1','*.py','*.json')) {
             Get-ChildItem $srcDir.FullName -Filter $pattern |
@@ -727,7 +727,7 @@ function Invoke-UpdateCheck {
             # Check 1: file size (must be > 50KB)
             $destSize = (Get-Item $destScript).Length
             if ($destSize -lt 51200) {
-                $verifyMsg = "file too small ($destSize bytes) — copy may be incomplete"
+                $verifyMsg = "file too small ($destSize bytes) - copy may be incomplete"
             } else {
                 # Check 2: version string present
                 $content = Get-Content $destScript -Raw -ErrorAction SilentlyContinue
@@ -739,7 +739,7 @@ function Invoke-UpdateCheck {
                         $srcHash  = (Get-FileHash $srcScript  -Algorithm SHA256).Hash
                         $destHash = (Get-FileHash $destScript -Algorithm SHA256).Hash
                         if ($srcHash -ne $destHash) {
-                            $verifyMsg = "SHA256 mismatch — file may be corrupt"
+                            $verifyMsg = "SHA256 mismatch - file may be corrupt"
                         } else {
                             $verifyOK = $true
                         }
@@ -765,14 +765,14 @@ function Invoke-UpdateCheck {
         exit 0
 
     } catch {
-        # Silent fail — update check never blocks startup
+        # Silent fail - update check never blocks startup
     }
 }
 
 Invoke-UpdateCheck
 
 # -----------------------------------------------------------------------------
-# PORTABLE PYTHON — AUTO-SETUP
+# PORTABLE PYTHON - AUTO-SETUP
 # -----------------------------------------------------------------------------
 
 $portablePy     = Join-Path $PSScriptRoot 'python\python.exe'
@@ -932,7 +932,7 @@ function Connect-VSphere {
             return @{ OK=$true; Token=$token; Server=$Server; APIVer=$apiVer }
         } catch { $lastErr = $_.Exception.Message }
     }
-    return @{ OK=$false; Error="Could not connect to vSphere REST API on $Server — $lastErr" }
+    return @{ OK=$false; Error="Could not connect to vSphere REST API on $Server - $lastErr" }
 }
 
 function Get-VSphereVMs {
@@ -1647,7 +1647,7 @@ $manualTargets = [System.Collections.ArrayList]@()
 if ($hypervisorSources.Count -gt 0 -and $hypervisorVMs.Count -gt 0) {
     # ?? HV / vCenter mode: VMs already known  --  just ask for outliers ??????????
 
-    # ── SUGGESTED SERVERS — AD/DNS SCAN ──────────────────────────────────────
+    # -- SUGGESTED SERVERS - AD/DNS SCAN --------------------------------------
     Write-Phase "Step 3b - Suggested Servers"
     Write-Host "  Scan AD/DNS for servers not already in your discovery list?" -ForegroundColor White
     Write-Host "  (useful for bare-metal boxes or servers outside the hypervisor)" -ForegroundColor DarkGray
@@ -1812,7 +1812,7 @@ if ($hypervisorSources.Count -gt 0 -and $hypervisorVMs.Count -gt 0) {
             B-OK "$($manualTargets.Count) server(s) added from AD"
         }
     } else {
-        B-Line "No servers found in Active Directory — or no AD access from this machine."
+        B-Line "No servers found in Active Directory - or no AD access from this machine."
     }
 
     Write-Phase "Step 4 - Server Targets"
@@ -1995,7 +1995,7 @@ foreach ($vm in $allVMTargets) {
     $wmi = Test-WMIAccess -Target $addr -Cred $script:DomainCred
     if (-not $wmi.OK) {
         $row.Ping = $true
-        # Test SSH port 22 — open port is a reliable Linux/appliance indicator
+        # Test SSH port 22 - open port is a reliable Linux/appliance indicator
         Write-Host " WMI failed, probing SSH..." -NoNewline -ForegroundColor DarkGray
         $sshOpen = $false
         try {
@@ -2376,7 +2376,7 @@ if ($script:vSphereSources.Count -gt 0) {
     B-Line "collecting 90-day CPU/RAM/IOPS history from vSphere..."
     Write-Host ""
 
-    # Locate Python — portable bundle takes priority over system install
+    # Locate Python - portable bundle takes priority over system install
     $pythonCmd = $null
     $portablePy = Join-Path $PSScriptRoot 'python\python.exe'
     if (Test-Path $portablePy) {
@@ -2452,7 +2452,7 @@ if ($linuxRows.Count -gt 0) {
         $plinkExe = Join-Path $PSScriptRoot 'plink.exe'
         if (-not (Test-Path $plinkExe)) {
             B-Warn "plink.exe not found. Run Get-PortablePython.ps1 to download it."
-            B-Warn "Skipping SSH discovery — boxes will appear as placeholders."
+            B-Warn "Skipping SSH discovery - boxes will appear as placeholders."
         } else {
             # Ask if all boxes share the same SSH credentials
             $sharedUser = ''; $sharedPass = ''
@@ -2524,9 +2524,9 @@ if ($outputFiles.Count -gt 0) {
     Write-Host "  JSON files collected:" -ForegroundColor White
     $outputFiles | ForEach-Object { Write-Host ("    " + (Split-Path $_ -Leaf)) -ForegroundColor Cyan }
 
-    # ── MANIFEST GENERATION ─────────────────────────────────────────────────
+    # -- MANIFEST GENERATION -------------------------------------------------
     Write-Host ""
-    $clientShort = (Read-Host "  Client name (appears in report header — e.g. 'Acme Corporation')").Trim()
+    $clientShort = (Read-Host "  Client name (appears in report header - e.g. 'Acme Corporation')").Trim()
     if (-not $clientShort) { $clientShort = "CLIENT" }
     $clientFull  = $clientShort
 
@@ -2558,7 +2558,7 @@ if ($outputFiles.Count -gt 0) {
         })
     }
 
-    # Linux/appliance entries — SSH-discovered and placeholder-only
+    # Linux/appliance entries - SSH-discovered and placeholder-only
     foreach ($lr in $linuxRows) {
         $lName   = $lr.DisplayName
         $lId     = ($lName.ToLower() -replace '[^a-z0-9]', '') + 'lnx'
@@ -2594,7 +2594,7 @@ if ($outputFiles.Count -gt 0) {
     $manifest | ConvertTo-Json -Depth 5 | Out-File $manifestFile -Encoding UTF8 -Force
     B-OK "Manifest: $(Split-Path $manifestFile -Leaf)"
 
-    # ── AUTO-GENERATE HTML REPORT ────────────────────────────────────────────
+    # -- AUTO-GENERATE HTML REPORT --------------------------------------------
     $genReportScript = Join-Path $PSScriptRoot 'gen_report.py'
     $portablePy      = Join-Path $PSScriptRoot 'python\python.exe'
 
