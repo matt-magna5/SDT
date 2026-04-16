@@ -1083,11 +1083,29 @@ function Get-VSphereInventory {
                 })
             }
         }
+        # Guest OS: prefer per-VM detail (most accurate), fall back to list enumeration
+        $guestOSStr = ''
+        if ($det -and $det.guest_OS) {
+            $guestOSStr = ($det.guest_OS -replace '_',' ').Trim()
+        }
+        if (-not $guestOSStr -and $vm.GuestOS) { $guestOSStr = $vm.GuestOS }
+
+        # Also try guest identity endpoint (requires VMware Tools) for human-readable name
+        if (-not $guestOSStr -or $guestOSStr -eq '') {
+            try {
+                $giUri  = "$base/" + $(if ($v7) { "api/vcenter/vm/$($vm.VMID)/guest/identity" } else { "rest/vcenter/vm/$($vm.VMID)/guest/identity" })
+                $giRaw  = Invoke-VSphereRest -Uri $giUri -Headers $hdr
+                $giData = if ($v7) { $giRaw } else { $giRaw.value }
+                if ($giData.full_name.default_message) { $guestOSStr = $giData.full_name.default_message }
+                elseif ($giData.name)                  { $guestOSStr = $giData.name }
+            } catch { }
+        }
+
         [void]$vmDetails.Add([PSCustomObject]@{
             Name       = $vm.Name
             VMID       = $vm.VMID
             PowerState = $vm.PowerState
-            GuestOS    = $vm.GuestOS
+            GuestOS    = $guestOSStr
             IPs        = $vm.IP
             vCPU       = $cpu
             RAMgb      = $ramGB
