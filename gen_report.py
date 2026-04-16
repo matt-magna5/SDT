@@ -1867,67 +1867,93 @@ def build_eol_tab():
 
 
 def build_private_cloud_tab():
-    """Private cloud / Commvault sizing — vCPU, RAM, disk totals per server."""
-    rows = []
+    """Private cloud + Commvault sizing. Merged view: WinRM data first, hypervisor fills gaps."""
+
+    merged = {}  # keyed by uppercase name -> (name, cpu, ram, total_disk, used_disk, source)
+
+    # Primary: WinRM-discovered servers (best data — real disk usage)
     for srv in servers:
         if srv.get('os_type') == 'linux': continue
         d    = srv.get('data', {})
         name = srv.get('name', '')
         hw   = d.get('Hardware', {})
         if not hw: continue
-        cores = hw.get('CPULogicalCount', hw.get('CPUCores', 0)) or 0
-        ram   = hw.get('RAMTotalGB', 0) or 0
-        disks = d.get('Disks', []) or []
-        total_disk = sum((dk.get('TotalGB', 0) or 0) for dk in disks if isinstance(dk, dict))
-        used_disk  = sum((dk.get('TotalGB', 0) - dk.get('FreeGB', 0))
-                         for dk in disks if isinstance(dk, dict)
-                         and dk.get('TotalGB') and dk.get('FreeGB') is not None)
+        cores = int(hw.get('CPUCores', hw.get('CPULogicalCount', 0)) or 0)
+        ram   = round(float(hw.get('RAMTotalGB', 0) or 0), 1)
+        disks_raw = as_list(d.get('Disks', []))
+        total_disk = round(sum(float(dk.get('TotalGB', 0) or 0) for dk in disks_raw if isinstance(dk, dict)), 1)
+        used_disk  = round(sum(float(dk.get('TotalGB', 0) or 0) - float(dk.get('FreeGB', 0) or 0)
+                               for dk in disks_raw if isinstance(dk, dict)
+                               and dk.get('TotalGB') is not None and dk.get('FreeGB') is not None), 1)
         if cores or ram or total_disk:
-            rows.append((name, int(cores), round(float(ram), 1),
-                         round(float(total_disk), 1), round(float(used_disk), 1)))
+            merged[name.upper()] = (name, cores, ram, total_disk, used_disk, 'WinRM')
 
-    # Also pull from HV inventories (VMs on Hyper-V/vSphere)
-    vm_rows = []
+    # Fill gaps: hypervisor inventory (VMs not WinRM-discovered — ODNS, vCenter, etc.)
     for inv in hv_inventories:
-        vms = inv.get('VMs', []) or []
-        for vm in vms:
+        for vm in (inv.get('VMs', []) or []):
             if not isinstance(vm, dict): continue
-            vm_rows.append((
-                vm.get('Name', ''), int(vm.get('vCPU', 0) or 0),
-                round(float(vm.get('RAMAllocatedGB', 0) or 0), 1),
-                round(float(vm.get('DiskTotalGB', 0) or vm.get('DiskGB', 0) or 0), 1), 0.0
-            ))
+            nm = vm.get('Name', '')
+            if nm.upper() in merged: continue  # already have better WinRM data
+            cores = int(vm.get('vCPU', 0) or 0)
+            ram   = round(float(vm.get('RAMgb', vm.get('RAMAllocatedGB', 0)) or 0), 1)
+            vm_disks = as_list(vm.get('Disks', []))
+            # vSphere uses CapacityGB; Hyper-V uses TotalGB
+            total_disk = round(sum(float(dk.get('CapacityGB', dk.get('TotalGB', 0)) or 0)
+                                   for dk in vm_disks if isinstance(dk, dict)), 1)
+            merged[nm.upper()] = (nm, cores, ram, total_disk, 0.0, 'Hypervisor')
 
-    if not rows and not vm_rows:
+    if not merged:
         return '<div style="padding:32px;text-align:center;color:#6b6080;">No hardware data collected.</div>'
 
-    def _tbl(title, data, col_label='Server'):
-        if not data: return ''
-        tot_cpu  = sum(r[1] for r in data)
-        tot_ram  = round(sum(r[2] for r in data), 1)
-        tot_disk = round(sum(r[3] for r in data), 1)
-        tot_used = round(sum(r[4] for r in data), 1)
-        out  = f'<div class="sub-title">{h(title)}</div>\n'
-        out += ('<table style="width:100%;border-collapse:collapse;font-size:9pt;">'
-                f'<tr><th>{col_label}</th><th>vCPU / Cores</th>'
-                '<th>RAM (GB)</th><th>Total Disk (GB)</th><th>Used Disk (GB)</th></tr>\n')
-        for i, (nm, cpu, ram, disk, used) in enumerate(sorted(data, key=lambda x: x[0])):
-            bg = 'background:#f5f4f8;' if i % 2 else ''
-            out += (f'<tr style="{bg}"><td style="font-weight:600">{h(nm)}</td>'
-                    f'<td>{cpu}</td><td>{ram}</td><td>{disk}</td>'
-                    f'<td>{used if used else "—"}</td></tr>\n')
-        out += (f'<tr style="background:#271e41;color:#fff;font-weight:700;">'
-                f'<td>TOTAL ({len(data)})</td><td>{tot_cpu}</td>'
-                f'<td>{tot_ram}</td><td>{tot_disk}</td><td>{tot_used if tot_used else "—"}</td></tr>\n')
-        out += '</table>\n'
-        return out
+    all_rows = sorted(merged.values(), key=lambda r: r[0])
+    tot_cpu   = sum(r[1] for r in all_rows)
+    tot_ram   = round(sum(r[2] for r in all_rows), 1)
+    tot_disk  = round(sum(r[3] for r in all_rows), 1)
+    tot_used  = round(sum(r[4] for r in all_rows), 1)
 
-    note = ('<div class="flag-info" style="margin-bottom:16px;">'
-            '<div class="flag-label">Private Cloud + Commvault Sizing</div>'
-            '<div class="flag-detail">Allocated figures — use 70-80% for right-sized targets. '
-            'Add 20% headroom for growth. Commvault source capacity = total used disk.</div></div>\n')
+    # Commvault sizing
+    cv_src    = tot_used if tot_used > 0 else tot_disk
+    cv_growth = round(cv_src * 1.2, 1)           # +20% growth buffer
+    cv_after  = round(cv_growth / 1.5, 1)         # ~1.5:1 dedup/compression
+    cv_repos  = max(1, round(cv_src / 2000))       # rough repo count (2TB capacity each)
 
-    return note + _tbl('Physical / Discovered Servers', rows) + _tbl('Virtual Machines (from Hypervisor)', vm_rows, 'VM Name')
+    # Header note
+    out = ('<div class="flag-info" style="margin-bottom:16px;">'
+           '<div class="flag-label">Private Cloud + Commvault Sizing</div>'
+           '<div class="flag-detail">WinRM-discovered servers show actual used disk. '
+           'Hypervisor-only entries show allocated disk (no usage data). '
+           'Add 20% headroom for growth.</div></div>\n')
+
+    # Main sizing table
+    out += ('<div class="sub-title">Server Inventory</div>\n'
+            '<table style="width:100%;border-collapse:collapse;font-size:9pt;">'
+            '<tr><th>Server</th><th>Source</th><th>vCPU / Cores</th>'
+            '<th>RAM (GB)</th><th>Total Disk (GB)</th><th>Used Disk (GB)</th></tr>\n')
+    for i, (nm, cpu, ram, disk, used, src) in enumerate(all_rows):
+        bg     = 'background:#f5f4f8;' if i % 2 else ''
+        src_cl = 'color:#065f46;font-size:8pt;' if src == 'WinRM' else 'color:#6b6080;font-size:8pt;'
+        out   += (f'<tr style="{bg}"><td style="font-weight:600">{h(nm)}</td>'
+                  f'<td style="{src_cl}">{h(src)}</td>'
+                  f'<td>{cpu}</td><td>{ram}</td><td>{disk}</td>'
+                  f'<td>{"—" if not used else used}</td></tr>\n')
+    out += (f'<tr style="background:#271e41;color:#fff;font-weight:700;">'
+            f'<td colspan="2">TOTAL ({len(all_rows)} servers)</td>'
+            f'<td>{tot_cpu}</td><td>{tot_ram}</td><td>{tot_disk}</td><td>{tot_used if tot_used else "—"}</td></tr>\n'
+            '</table>\n')
+
+    # Commvault sizing card
+    out += ('<div class="sub-title" style="margin-top:24px;">Commvault Sizing Estimate</div>\n'
+            '<table style="width:60%;border-collapse:collapse;font-size:9pt;">'
+            '<tr><th style="width:55%">Parameter</th><th>Value</th></tr>\n'
+            f'<tr><td>Source data (used disk)</td><td><strong>{cv_src} GB</strong></td></tr>\n'
+            f'<tr style="background:#f5f4f8"><td>With 20% growth buffer</td><td><strong>{cv_growth} GB</strong></td></tr>\n'
+            f'<tr><td>Est. after dedup/compression (~1.5:1)</td><td><strong>{cv_after} GB</strong></td></tr>\n'
+            f'<tr style="background:#f5f4f8"><td>Est. repository count (2TB ea.)</td><td><strong>{cv_repos}</strong></td></tr>\n'
+            f'<tr><td>Servers to protect</td><td><strong>{len(all_rows)}</strong></td></tr>\n'
+            '</table>\n'
+            '<div style="font-size:8pt;color:#9ca3af;margin-top:8px;">'
+            'Estimates only. Actual CV sizing depends on change rate, retention, and workload type.</div>\n')
+    return out
 
 
 # ── BUILD ALL TABS ─────────────────────────────────────────────────────────────
