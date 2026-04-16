@@ -235,13 +235,11 @@
       "_note3": "slug: endoflife.date API product slug (see endoflife.date for full list)",
       "_note4": "Add new products here as you find them in client environments. No Python needed."
     },
-    {"keyword": "sharepoint server",              "slug": "sharepoint-server",           "label": "SharePoint Server"},
-    {"keyword": "skype for business",             "slug": "skype-for-business-server",   "label": "Skype for Business"},
-    {"keyword": "lync server",                    "slug": "skype-for-business-server",   "label": "Lync Server"},
-    {"keyword": "sql server",                     "slug": "microsoft-sql-server",        "label": "SQL Server"},
-    {"keyword": "veeam backup",                   "slug": "veeam-backup-and-replication","label": "Veeam Backup & Replication"},
-    {"keyword": "acronis backup",                 "slug": "acronis-cyber-protect",       "label": "Acronis Backup"},
-    {"keyword": "commvault",                      "slug": "commvault",                   "label": "Commvault"}
+    {"keyword": "sharepoint server",   "slug": "sharepoint",                   "label": "SharePoint Server"},
+    {"keyword": "sharepoint 20",       "slug": "sharepoint",                   "label": "SharePoint Server"},
+    {"keyword": "sql server",          "slug": "mssqlserver",                  "label": "SQL Server"},
+    {"keyword": "veeam backup",        "slug": "veeam-backup-and-replication", "label": "Veeam Backup & Replication"},
+    {"keyword": "commvault",           "slug": "commvault",                    "label": "Commvault"}
   ],
 
   "lifecycle": {
