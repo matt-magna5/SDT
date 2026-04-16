@@ -228,6 +228,25 @@
     "browser":    ["chrome", "firefox", "edge", "opera", "browser"]
   },
 
+  "eol_product_scan": [
+    {
+      "_note": "Scans installed apps for EOL-trackable Microsoft products.",
+      "_note2": "keyword: case-insensitive substring match against app Name+Publisher",
+      "_note3": "slug: endoflife.date API product identifier",
+      "_note4": "version_from: field path in app record to extract version (dot-separated)"
+    },
+    {"keyword": "microsoft .net framework",      "slug": "dotnetfx",              "label": ".NET Framework",        "version_from": "Name"},
+    {"keyword": "sharepoint server",              "slug": "sharepoint-server",     "label": "SharePoint Server",     "version_from": "Version"},
+    {"keyword": "skype for business",             "slug": "skype-for-business-server", "label": "Skype for Business", "version_from": "Version"},
+    {"keyword": "lync server",                    "slug": "skype-for-business-server", "label": "Lync Server",       "version_from": "Version"},
+    {"keyword": "sql server",                     "slug": "microsoft-sql-server",  "label": "SQL Server",            "version_from": "Version"},
+    {"keyword": "visual studio 20",               "slug": "visual-studio",         "label": "Visual Studio",         "version_from": "Version"},
+    {"keyword": "system center",                  "slug": "system-center",         "label": "System Center",         "version_from": "Version"},
+    {"keyword": "dynamics crm",                   "slug": "dynamics-crm",          "label": "Dynamics CRM",          "version_from": "Version"},
+    {"keyword": "project server",                 "slug": "project-server",        "label": "Project Server",        "version_from": "Version"},
+    {"keyword": "biztalk",                        "slug": "biztalk-server",        "label": "BizTalk Server",        "version_from": "Version"}
+  ],
+
   "lifecycle": {
     "vmware-esxi": {
       "6.0": {"eol": "2020-03-12", "status": "EOL"},

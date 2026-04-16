@@ -1905,6 +1905,47 @@ def build_eol_tab():
                      exch.get('VersionName', ''),
                      exch.get('EOLDate', ''), exch.get('EOLStatus', ''))
 
+    # Installed app scan — detect EOL-trackable MS products from detection_rules.json
+    _eol_scan = [r for r in RULES.get('eol_product_scan', []) if 'keyword' in r]
+    _seen_per_server = {}  # avoid dupes: (server, slug) pairs
+
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d    = srv.get('data', {})
+        name = srv.get('name', '')
+        apps = as_list(d.get('Apps', d.get('Applications', [])))
+        if not apps: continue
+        for app in apps:
+            if not isinstance(app, dict): continue
+            app_nm  = (app.get('Name', '') or '').lower()
+            app_pub = (app.get('Publisher', '') or '').lower()
+            combined = app_nm + ' ' + app_pub
+            for rule in _eol_scan:
+                kw   = rule['keyword'].lower()
+                slug = rule['slug']
+                if kw not in combined: continue
+                key = (name, slug)
+                if key in _seen_per_server: break
+
+                # Extract version from app record
+                ver_raw = app.get('Version', '')
+                # For .NET Framework, parse version from name ("Microsoft .NET Framework 4.8")
+                if 'dotnetfx' in slug and not ver_raw:
+                    import re as _re
+                    m = _re.search(r'(\d+\.\d+[\.\d]*)', app_nm)
+                    if m: ver_raw = m.group(1)
+
+                if not ver_raw:
+                    _seen_per_server[key] = True; break
+
+                eol_date, eol_status, src = get_product_eol(slug, ver_raw)
+                if src == 'unavailable':
+                    _seen_per_server[key] = True; break  # skip if API down
+                if eol_date or eol_status:
+                    _eol_row(name, rule['label'], ver_raw, eol_date, eol_status)
+                _seen_per_server[key] = True
+                break  # only match first rule per app
+
     # vSphere (vCenter + ESXi ship together on same version) — live lookup
     for inv in hv_inventories:
         if inv.get('_type') not in ('vSphereInventory',): continue
