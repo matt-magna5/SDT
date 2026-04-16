@@ -499,6 +499,66 @@ Write-Host ("=" * 72) -ForegroundColor DarkMagenta
 Write-Host ""
 
 # -----------------------------------------------------------------------------
+# DOWNLOAD HELPER — chunked HttpClient with live progress + speed
+# -----------------------------------------------------------------------------
+
+function Invoke-DownloadWithProgress {
+    param([string]$Url, [string]$Dest, [string]$Label = 'Downloading', [int]$TimeoutSec = 120)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    # Primary: HttpClient chunked stream with live progress
+    try {
+        $client  = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+        $response = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
+        $response.EnsureSuccessStatusCode() | Out-Null
+        $total    = $response.Content.Headers.ContentLength
+        $inStream = $response.Content.ReadAsStreamAsync().Result
+        $outFile  = New-Object System.IO.FileStream($Dest, [System.IO.FileMode]::Create,
+                        [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $buffer    = New-Object byte[] 65536
+        $totalRead = [long]0; $lastRead = [long]0
+        $lastTime  = [DateTime]::Now; $startTime = [DateTime]::Now
+        $read      = 0
+        while (($read = $inStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $outFile.Write($buffer, 0, $read)
+            $totalRead += $read
+            $now     = [DateTime]::Now
+            $elapsed = ($now - $lastTime).TotalSeconds
+            if ($elapsed -ge 0.4) {
+                $speed    = [math]::Round(($totalRead - $lastRead) / 1KB / $elapsed, 0)
+                $lastRead = $totalRead; $lastTime = $now
+                $readMB   = [math]::Round($totalRead / 1MB, 1)
+                $line = if ($total -gt 0) {
+                    $pct = [math]::Round($totalRead / $total * 100, 0)
+                    "`r  {0}  {1}%  {2} / {3} MB  {4} KB/s   " -f $Label, $pct, $readMB, [math]::Round($total/1MB,1), $speed
+                } else {
+                    "`r  {0}  {1} MB  {2} KB/s   " -f $Label, $readMB, $speed
+                }
+                Write-Host $line -NoNewline -ForegroundColor Cyan
+            }
+        }
+        $outFile.Close(); $inStream.Close(); $client.Dispose()
+        $avgSpd = [math]::Round($totalRead / 1KB / ([DateTime]::Now - $startTime).TotalSeconds, 0)
+        Write-Host ("`r  {0}  Done  {1} MB  avg {2} KB/s                    " -f $Label, [math]::Round($totalRead/1MB,1), $avgSpd) -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "`r  HttpClient failed, trying fallback...                " -ForegroundColor DarkGray
+        try {
+            # Fallback: Invoke-WebRequest (no progress, but reliable)
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing `
+                -TimeoutSec $TimeoutSec -ErrorAction Stop
+            Write-Host "  [OK] $Label downloaded (fallback method)." -ForegroundColor Green
+            return $true
+        } catch {
+            Write-Host "  [FAIL] $Label download failed: $_" -ForegroundColor Red
+            return $false
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
 # AUTO-UPDATE CHECK
 # -----------------------------------------------------------------------------
 
@@ -524,26 +584,12 @@ function Invoke-UpdateCheck {
             return
         }
 
-        # Download with spinner
         $zipUrl = "https://github.com/trophyscar-bit/sdt/archive/refs/tags/v$latest.zip"
         $zipTmp = Join-Path $env:TEMP "sdt-update.zip"
         $extTmp = Join-Path $env:TEMP "sdt-update-$latest"
-        $spin = @('|','/','-','\'); $si = 0
 
-        $dlJob = Start-Job -ScriptBlock {
-            param($u,$o)
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing
-        } -ArgumentList $zipUrl, $zipTmp
-
-        Write-Host "  Downloading v$latest...  " -NoNewline -ForegroundColor Cyan
-        while (-not $dlJob.HasExited) {
-            Write-Host ("`r  Downloading v$latest...  $($spin[$si % 4])") -NoNewline -ForegroundColor Cyan
-            $si++; Start-Sleep -Milliseconds 150
-        }
-        Receive-Job $dlJob -ErrorAction Stop | Out-Null
-        Remove-Job $dlJob -Force -ErrorAction SilentlyContinue
-        Write-Host "`r  Download complete.                    " -ForegroundColor DarkGray
+        $ok = Invoke-DownloadWithProgress -Url $zipUrl -Dest $zipTmp -Label "SDT v$latest"
+        if (-not $ok) { return }
 
         # Extract
         if (Test-Path $extTmp) { Remove-Item $extTmp -Recurse -Force }
