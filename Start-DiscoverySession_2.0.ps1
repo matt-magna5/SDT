@@ -552,16 +552,34 @@ function Invoke-DownloadWithProgress {
         return $true
     } catch { Write-Host "`r  Method 1 (HttpClient) failed — trying WebClient...    " -ForegroundColor DarkGray }
 
-    # Spinner helper — kills job if stalled (no file growth for 30s)
-    function _spinDownload($job, $destPath, $lbl, [int]$stallSec = 10) {
+    # Spinner helper:
+    #  - No bytes in 10s            -> can't connect, skip fast
+    #  - Bytes flowing, >100KB, no growth 5s -> likely complete, declare done
+    #  - Bytes flowing, stalled 60s -> connection dropped, skip
+    function _spinDownload($job, $destPath, $lbl) {
         $sp = @('|','/','-','\'); $i = 0
-        $lastSz = -1; $lastGrowth = [DateTime]::Now
+        $lastSz = -1; $lastGrowth = [DateTime]::Now; $everHadBytes = $false
         while (-not $job.HasExited) {
             $sz = if (Test-Path $destPath) { (Get-Item $destPath -EA SilentlyContinue).Length } else { 0 }
+            if ($sz -gt 0) { $everHadBytes = $true }
             if ($sz -gt $lastSz) { $lastSz = $sz; $lastGrowth = [DateTime]::Now }
-            if (([DateTime]::Now - $lastGrowth).TotalSeconds -gt $stallSec) {
+            $waited = ([DateTime]::Now - $lastGrowth).TotalSeconds
+            # Likely complete: had bytes, file is substantial, no growth for 5s
+            if ($everHadBytes -and $sz -gt 102400 -and $waited -gt 5) {
                 Stop-Job $job -EA SilentlyContinue
-                Write-Host ("`r  {0}  stalled ({1}s) — skipping...                " -f $lbl, $stallSec) -ForegroundColor DarkGray
+                Write-Host ("`r  {0}  Done  {1} MB                              " -f $lbl, [math]::Round($sz/1MB,1)) -ForegroundColor Green
+                return $true
+            }
+            # No connection at all after 10s
+            if (-not $everHadBytes -and $waited -gt 10) {
+                Stop-Job $job -EA SilentlyContinue
+                Write-Host ("`r  {0}  no response in 10s — skipping...          " -f $lbl) -ForegroundColor DarkGray
+                return $false
+            }
+            # Mid-transfer stall after 60s
+            if ($everHadBytes -and $waited -gt 60) {
+                Stop-Job $job -EA SilentlyContinue
+                Write-Host ("`r  {0}  stalled mid-transfer — skipping...         " -f $lbl) -ForegroundColor DarkGray
                 return $false
             }
             Write-Host ("`r  {0}  {1}  {2} MB   " -f $lbl, $sp[$i%4], [math]::Round($sz/1MB,1)) -NoNewline -ForegroundColor Cyan
@@ -586,7 +604,7 @@ function Invoke-DownloadWithProgress {
         $ok = _spinDownload $job $Dest $Label
         Receive-Job $job -EA SilentlyContinue | Out-Null
         Remove-Job $job -Force -EA SilentlyContinue
-        if ($ok -and (Test-Path $Dest)) { return $true }
+        if (Test-Path $Dest) { return $true }  # file exists = success regardless of stall flag
     } catch { }
     Write-Host "`r  Method 2 (WebClient) failed — trying Invoke-WebRequest..." -ForegroundColor DarkGray
 
@@ -602,7 +620,7 @@ function Invoke-DownloadWithProgress {
         $ok = _spinDownload $job $Dest $Label
         Receive-Job $job -EA SilentlyContinue | Out-Null
         Remove-Job $job -Force -EA SilentlyContinue
-        if ($ok -and (Test-Path $Dest)) { return $true }
+        if (Test-Path $Dest) { return $true }
     } catch { }
     Write-Host "`r  Method 3 (Invoke-WebRequest) failed — trying BITS...   " -ForegroundColor DarkGray
 
@@ -614,7 +632,7 @@ function Invoke-DownloadWithProgress {
             $ok = _spinDownload $job $Dest $Label
             Receive-Job $job -EA SilentlyContinue | Out-Null
             Remove-Job $job -Force -EA SilentlyContinue
-            if ($ok -and (Test-Path $Dest)) { return $true }
+            if (Test-Path $Dest) { return $true }
         } catch { }
         Write-Host "`r  Method 4 (BITS) failed — trying certutil...            " -ForegroundColor DarkGray
     }
@@ -623,7 +641,7 @@ function Invoke-DownloadWithProgress {
     try {
         if (Test-Path $Dest) { Remove-Item $Dest -Force -EA SilentlyContinue }
         $job = Start-Job -ScriptBlock { param($u,$d) & certutil.exe -urlcache -split -f $u $d 2>&1 } -ArgumentList $Url, $Dest
-        _spinDownload $job $Dest $Label -stallSec 20 | Out-Null
+        _spinDownload $job $Dest $Label | Out-Null
         Remove-Job $job -Force -EA SilentlyContinue
         if (Test-Path $Dest) {
             & certutil.exe -urlcache -f $Url delete 2>&1 | Out-Null

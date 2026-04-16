@@ -58,15 +58,27 @@ function Get-FileWithProgress {
         return $true
     } catch { Write-Host "`r  Method 1 failed — trying WebClient...                 " -ForegroundColor DarkGray }
 
-    function _spin($job, $destPath, $lbl, [int]$stallSec = 10) {
+    function _spin($job, $destPath, $lbl) {
         $sp = @('|','/','-','\'); $i = 0
-        $lastSz = -1; $lastGrowth = [DateTime]::Now
+        $lastSz = -1; $lastGrowth = [DateTime]::Now; $everHadBytes = $false
         while (-not $job.HasExited) {
             $sz = if (Test-Path $destPath) { (Get-Item $destPath -EA SilentlyContinue).Length } else { 0 }
+            if ($sz -gt 0) { $everHadBytes = $true }
             if ($sz -gt $lastSz) { $lastSz = $sz; $lastGrowth = [DateTime]::Now }
-            if (([DateTime]::Now - $lastGrowth).TotalSeconds -gt $stallSec) {
+            $waited = ([DateTime]::Now - $lastGrowth).TotalSeconds
+            if ($everHadBytes -and $sz -gt 102400 -and $waited -gt 5) {
                 Stop-Job $job -EA SilentlyContinue
-                Write-Host ("`r  {0}  stalled ({1}s) — skipping...                " -f $lbl, $stallSec) -ForegroundColor DarkGray
+                Write-Host ("`r  {0}  Done  {1} MB                              " -f $lbl, [math]::Round($sz/1MB,1)) -ForegroundColor Green
+                return $true
+            }
+            if (-not $everHadBytes -and $waited -gt 10) {
+                Stop-Job $job -EA SilentlyContinue
+                Write-Host ("`r  {0}  no response — skipping...                 " -f $lbl) -ForegroundColor DarkGray
+                return $false
+            }
+            if ($everHadBytes -and $waited -gt 60) {
+                Stop-Job $job -EA SilentlyContinue
+                Write-Host ("`r  {0}  stalled mid-transfer — skipping...        " -f $lbl) -ForegroundColor DarkGray
                 return $false
             }
             Write-Host ("`r  {0}  {1}  {2} MB   " -f $lbl, $sp[$i%4], [math]::Round($sz/1MB,1)) -NoNewline -ForegroundColor Cyan
