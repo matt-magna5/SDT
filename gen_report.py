@@ -3,7 +3,7 @@ gen_report.py — Magna5 Server Discovery Report Generator
 Usage: python gen_report.py <manifest.json>
 Produces a single HTML file matching the MEKE gold-standard design.
 """
-import json, html as htmlmod, sys, io, os, re, datetime
+import json, html as htmlmod, sys, io, os, re, datetime, urllib.request, urllib.error
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
@@ -45,6 +45,69 @@ def _load_rules():
     return rules
 
 RULES = _load_rules()
+
+# ── LIFECYCLE LOOKUP ──────────────────────────────────────────────────────────
+# Fetches EOL dates from endoflife.date API (community-maintained, no auth).
+# Falls back to detection_rules.json lifecycle section if offline.
+# Returns dict: major.minor -> {'eol': 'YYYY-MM-DD', 'status': 'EOL'|''}
+
+_LIFECYCLE_CACHE = {}
+
+def get_lifecycle(product):
+    """Return {major_minor: {'eol': date_str, 'status': str}} for a product."""
+    global _LIFECYCLE_CACHE
+    if product in _LIFECYCLE_CACHE:
+        return _LIFECYCLE_CACHE[product]
+
+    result = {}
+
+    # Primary: endoflife.date public API
+    try:
+        url = f'https://endoflife.date/api/{product}.json'
+        req = urllib.request.Request(url, headers={'User-Agent': 'SDT-Report/3.0'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.load(r)
+        for entry in data:
+            cycle = str(entry.get('cycle', ''))
+            eol   = entry.get('eol', '')
+            # eol can be bool (False = supported) or a date string
+            if eol is False or eol == 'false':
+                eol_str, status = '', ''
+            elif eol is True or eol == 'true':
+                eol_str, status = '', 'EOL'
+            else:
+                eol_str = str(eol)
+                try:
+                    eol_dt = datetime.date.fromisoformat(eol_str[:10])
+                    status = 'EOL' if eol_dt <= datetime.date.today() else ''
+                except Exception:
+                    status = ''
+            result[cycle] = {'eol': eol_str, 'status': status}
+    except Exception:
+        # Fallback: detection_rules.json lifecycle section
+        lifecycle = RULES.get('lifecycle', {}).get(product, {})
+        result = lifecycle
+
+    _LIFECYCLE_CACHE[product] = result
+    return result
+
+
+def get_product_eol(product, version_str):
+    """Given a product and version string, return (eol_date, status, source)."""
+    lc = get_lifecycle(product)
+    if not lc:
+        return '', '', 'unavailable'
+
+    version_str = str(version_str or '')
+    # Try progressively shorter version matches: 7.0.3 -> 7.0 -> 7
+    parts = version_str.split('.')
+    for depth in range(len(parts), 0, -1):
+        key = '.'.join(parts[:depth])
+        if key in lc:
+            entry = lc[key]
+            return entry.get('eol', ''), entry.get('status', ''), 'endoflife.date'
+
+    return '', '', 'no-match'
 
 if len(sys.argv) < 2:
     print("Usage: python gen_report.py <manifest.json>")
@@ -1783,7 +1846,7 @@ def build_eol_tab():
     rows  = []
 
     def _eol_row(srv_name, component, version, eol_raw, status):
-        if not eol_raw and not status: return
+        if not eol_raw and not status and not version: return
         try:
             eol_dt = datetime.date.fromisoformat(str(eol_raw)[:10]) if eol_raw else None
         except Exception:
@@ -1821,13 +1884,19 @@ def build_eol_tab():
                      exch.get('VersionName', ''),
                      exch.get('EOLDate', ''), exch.get('EOLStatus', ''))
 
-    # Add vCenter/ESXi from HV inventories
+    # vSphere (vCenter + ESXi ship together on same version) — live lookup
     for inv in hv_inventories:
         if inv.get('_type') not in ('vSphereInventory',): continue
         hname = inv.get('Hostname', inv.get('Name', 'vSphere'))
-        ver   = inv.get('Version', '')
-        if ver:
-            _eol_row(hname, 'ESXi/vCenter', ver, '', '')
+        ver   = str(inv.get('Version', '') or '')
+        if not ver: continue
+        major_minor = '.'.join(ver.split('.')[:2])
+        eol_date, eol_status, src = get_product_eol('vmware-esxi', ver)
+        if not eol_date and src == 'unavailable':
+            eol_status = 'EOL data unavailable - check vmware.com/support/lifecycle'
+        elif not eol_date and src == 'no-match':
+            eol_status = f'Unknown version {major_minor} - check VMware lifecycle'
+        _eol_row(hname, f'vSphere {major_minor} (vCenter + ESXi)', ver, eol_date, eol_status)
 
     if not rows:
         return '<div style="padding:32px;text-align:center;color:#6b6080;">No EOL data detected across discovered servers.</div>'

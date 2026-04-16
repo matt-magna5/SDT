@@ -228,6 +228,31 @@
     "browser":    ["chrome", "firefox", "edge", "opera", "browser"]
   },
 
+  "lifecycle": {
+    "vmware-esxi": {
+      "6.0": {"eol": "2020-03-12", "status": "EOL"},
+      "6.5": {"eol": "2022-10-15", "status": "EOL"},
+      "6.7": {"eol": "2022-10-15", "status": "EOL"},
+      "7.0": {"eol": "2025-04-02", "status": "EOL"},
+      "8.0": {"eol": "2027-10-15", "status": ""}
+    },
+    "vmware-vcenter": {
+      "6.5": {"eol": "2022-10-15", "status": "EOL"},
+      "6.7": {"eol": "2022-10-15", "status": "EOL"},
+      "7.0": {"eol": "2025-04-02", "status": "EOL"},
+      "8.0": {"eol": "2027-10-15", "status": ""}
+    },
+    "windows-server": {
+      "2008": {"eol": "2020-01-14", "status": "EOL"},
+      "2008 r2": {"eol": "2020-01-14", "status": "EOL"},
+      "2012": {"eol": "2023-10-10", "status": "EOL"},
+      "2012 r2": {"eol": "2023-10-10", "status": "EOL"},
+      "2016": {"eol": "2027-01-11", "status": ""},
+      "2019": {"eol": "2029-01-09", "status": ""},
+      "2022": {"eol": "2031-10-14", "status": ""}
+    }
+  },
+
   "safe_paths": [
     "c:\\windows\\",
     "\"c:\\windows\\",
