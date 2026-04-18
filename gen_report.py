@@ -422,7 +422,7 @@ def categorize_svcs(svc_l):
     return cats
 
 def categorize_apps(app_l):
-    cats = {'Security': [], 'Management': [], 'Browser': [], 'Other': []}
+    cats = {'Security': [], 'Management': [], 'LOB': [], 'Browser': [], 'Other': []}
     skip_nm = ('microsoft visual c++', 'microsoft .net', 'windows sdk',
                'microsoft update health', 'update for windows', 'security update for')
     for app in app_l:
@@ -430,17 +430,21 @@ def categorize_apps(app_l):
         nm  = (app.get('Name') or '').lower()
         pub = (app.get('Publisher') or '').lower()
         if any(s in nm for s in skip_nm): continue
-        if pub == 'microsoft corporation' and not any(k in nm for k in ('edge', 'defender')): continue
+        if pub == 'microsoft corporation' and not any(k in nm for k in ('edge', 'defender', 'dynamics', 'business central')): continue
         combined = nm + ' ' + pub
         _ak = RULES.get('app_keywords', {})
         if any(k in combined for k in _ak.get('security', [])):
             cats['Security'].append(app)
         elif any(k in combined for k in _ak.get('management', [])):
             cats['Management'].append(app)
-        elif any(k in combined for k in _ak.get('browser', [])):
-            cats['Browser'].append(app)
         else:
-            cats['Other'].append(app)
+            lob_match = next(((k, v) for k, v in _ak.get('lob', []) if k in combined), None)
+            if lob_match:
+                cats['LOB'].append({**app, '_lob_label': lob_match[1]})
+            elif any(k in combined for k in _ak.get('browser', [])):
+                cats['Browser'].append(app)
+            else:
+                cats['Other'].append(app)
     return cats
 
 def detect_security(app_l, svc_l):
@@ -466,24 +470,34 @@ def detect_security(app_l, svc_l):
 
     return edr, rmm, pam, bdr, rmt
 
-_SAFE_PATH = tuple(RULES.get('safe_paths', [
-    'c:\\windows\\', '"c:\\windows\\',
-    'c:\\program files\\common files\\microsoft',
-    'c:\\program files\\windows defender',
-    'c:\\program files\\microsoft',
-    '"c:\\program files\\microsoft', '"c:\\program files\\windows'
+_SUSPICIOUS_PATH_FRAGS = tuple(RULES.get('suspicious_paths', [
+    'c:\\users\\', '\\appdata\\', 'c:\\windows\\temp\\',
+    'c:\\temp\\', 'c:\\tmp\\', 'c:\\programdata\\temp\\',
+    '$recycle.bin', '\\recycler\\'
 ]))
 
+_BUILTIN_ACCT_PREFIXES = (
+    'localsystem', 'local system', 'nt authority\\', 'nt service\\',
+    'localservice', 'local service', 'networkservice', 'network service',
+)
+
 def find_svc_anomalies(svc_l):
+    """Flag services in suspicious locations or running as custom domain accounts."""
     out = []
     for svc in svc_l:
         if not isinstance(svc, dict): continue
         if svc.get('State', '') != 'Running': continue
-        path = (svc.get('Path', '') or '').strip().lower()
-        if not path: continue
-        if any(path.startswith(p) or path.lstrip('"').startswith(p.lstrip('"')) for p in _SAFE_PATH): continue
-        if 'c:\\windows\\' in path: continue
-        out.append({**svc, '_reason': f'Binary outside standard install dirs: {svc.get("Path","")[:120]}'})
+        path = (svc.get('Path', '') or '').strip().lower().lstrip('"')
+        acct = (svc.get('StartName', '') or '').strip().lower()
+
+        reason = None
+        if path and any(frag in path for frag in _SUSPICIOUS_PATH_FRAGS):
+            reason = f'Executable in suspicious location: {svc.get("Path","")[:120]}'
+        elif acct and '\\' in acct and not any(acct.startswith(p) for p in _BUILTIN_ACCT_PREFIXES):
+            reason = f'Custom domain account as service identity: {svc.get("StartName","")}'
+
+        if reason:
+            out.append({**svc, '_reason': reason})
     return out
 
 # ── BUILD PER-SERVER TAB ──────────────────────────────────────────────────────
@@ -967,11 +981,11 @@ def build_server_tab(srv):
     # ── NAV BAR ───────────────────────────────────────────────────────────────
     sect_links = [('Alerts', f'{sid}-alerts'), ('Overview', f'{sid}-overview'),
                   ('Hardware', f'{sid}-hardware'), ('Applications', f'{sid}-apps'),
-                  ('Roles', f'{sid}-roles'), ('Role Config', f'{sid}-roleconfig'),
-                  ('Disks', f'{sid}-disks'), ('Network', f'{sid}-network'),
-                  ('Listening Ports', f'{sid}-lports'), ('Services', f'{sid}-services')]
-    if svc_anomalies: sect_links.append(('Errors', f'{sid}-svc-anomalies'))
+                  ('Roles', f'{sid}-roles'), ('Role Config', f'{sid}-roleconfig')]
     if real_shares:   sect_links.append(('File Shares', f'{sid}-shares'))
+    sect_links += [('Disks', f'{sid}-disks'), ('Network', f'{sid}-network'),
+                   ('Listening Ports', f'{sid}-lports'), ('Services', f'{sid}-services')]
+    if svc_anomalies: sect_links.append(('Svc Flags', f'{sid}-svc-anomalies'))
 
     role_conf_links = {}
     if has_adds:  role_conf_links['Active Directory'] = f'{sid}-roleconf-ad'
@@ -1078,18 +1092,30 @@ def build_server_tab(srv):
     # ── INSTALLED APPS CARD ───────────────────────────────────────────────────
     apps_body = ''
     cat_order = [('Security', 'Security &amp; EDR'), ('Management', 'Management &amp; RMM'),
+                 ('LOB', 'Line of Business / ERP / CRM'),
                  ('Browser', 'Browser'), ('Other', 'Other')]
     for cat_key, cat_lbl in cat_order:
         ca = app_cats.get(cat_key, [])
         if not ca: continue
         apps_body += sub(cat_lbl)
-        apps_body += '<table><tr><th>Application</th><th>Version</th><th>Publisher</th><th>Install Date</th></tr>\n'
-        for i, ap in enumerate(ca):
-            bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
-            apps_body += (f'<tr{bg}><td>{h(ap.get("Name",""))}</td>'
-                         f'<td style="font-family:monospace;font-size:8.5pt">{h(ap.get("Version",""))}</td>'
-                         f'<td>{h(ap.get("Publisher",""))}</td>'
-                         f'<td>{h(ap.get("InstallDate","") or "&mdash;")}</td></tr>\n')
+        if cat_key == 'LOB':
+            apps_body += '<table><tr><th>Application</th><th>Detected As</th><th>Version</th><th>Publisher</th><th>Install Date</th></tr>\n'
+            for i, ap in enumerate(ca):
+                bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                lob_lbl = ap.get('_lob_label', '')
+                apps_body += (f'<tr{bg}><td>{h(ap.get("Name",""))}</td>'
+                             f'<td style="color:#5b1fa4;font-weight:600;font-size:8.5pt">{h(lob_lbl)}</td>'
+                             f'<td style="font-family:monospace;font-size:8.5pt">{h(ap.get("Version",""))}</td>'
+                             f'<td>{h(ap.get("Publisher",""))}</td>'
+                             f'<td>{h(ap.get("InstallDate","") or "&mdash;")}</td></tr>\n')
+        else:
+            apps_body += '<table><tr><th>Application</th><th>Version</th><th>Publisher</th><th>Install Date</th></tr>\n'
+            for i, ap in enumerate(ca):
+                bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                apps_body += (f'<tr{bg}><td>{h(ap.get("Name",""))}</td>'
+                             f'<td style="font-family:monospace;font-size:8.5pt">{h(ap.get("Version",""))}</td>'
+                             f'<td>{h(ap.get("Publisher",""))}</td>'
+                             f'<td>{h(ap.get("InstallDate","") or "&mdash;")}</td></tr>\n')
         apps_body += '</table>\n'
     if not apps_body:
         apps_body = ('<div class="flag-info"><div class="flag-label">No Data Collected</div>'
@@ -1245,14 +1271,50 @@ def build_server_tab(srv):
     if has_nps:
         rc += f'<div id="{sid}-roleconf-nps"></div>\n'
         rc += sub('NPS / RADIUS', 'margin-top:24px')
-        if isinstance(nps, dict) and (nps.get('NetworkPolicies') or nps.get('RadiusClients')):
-            np_c = len(as_list(nps.get('NetworkPolicies', [])))
-            rc_c = len(as_list(nps.get('RadiusClients', [])))
-            rc += f'<div style="font-size:9pt;margin-bottom:8px">{np_c} network policies, {rc_c} RADIUS clients configured.</div>\n'
+        if isinstance(nps, dict) and nps.get('Installed'):
+            nps_clients  = as_list(nps.get('Clients', nps.get('RadiusClients', [])))
+            nps_policies = as_list(nps.get('Policies', nps.get('NetworkPolicies', [])))
+            rc += f'<div class="stat-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:14px;">'
+            rc += f'<div class="stat-box"><div class="stat-num">{len(nps_clients)}</div><div class="stat-lbl">RADIUS Clients</div></div>'
+            rc += f'<div class="stat-box"><div class="stat-num">{len(nps_policies)}</div><div class="stat-lbl">Network Policies</div></div>'
+            rc += '</div>\n'
+            if nps_clients:
+                rc += sub('RADIUS Clients (Authorized Devices)', 'margin-top:8px')
+                rc += '<table><tr><th>Client Name</th><th>IP Address</th><th>Status</th></tr>\n'
+                for i, cl in enumerate(nps_clients):
+                    if not isinstance(cl, dict): continue
+                    bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                    raw_val = cl.get('Raw', '')
+                    if raw_val:
+                        rc += f'<tr{bg}><td colspan="3" style="font-family:monospace;font-size:8.5pt">{h(raw_val)}</td></tr>\n'
+                    else:
+                        enabled = cl.get('Enabled', True)
+                        st = pill('Enabled', 'green') if enabled else pill('Disabled', 'gray')
+                        rc += (f'<tr{bg}><td style="font-weight:600">{h(cl.get("Name",""))}</td>'
+                               f'<td style="font-family:monospace;font-size:8.5pt">{h(cl.get("Address",""))}</td>'
+                               f'<td>{st}</td></tr>\n')
+                rc += '</table>\n'
+            if nps_policies:
+                rc += sub('Network Policies', 'margin-top:14px')
+                rc += '<table><tr><th style="width:40px">#</th><th>Policy Name</th><th>Status</th></tr>\n'
+                for i, pol in enumerate(sorted(nps_policies, key=lambda x: x.get('ProcessingOrder', 99) if isinstance(x, dict) else 99)):
+                    if not isinstance(pol, dict): continue
+                    bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                    enabled = pol.get('Enabled', True)
+                    st = pill('Active', 'green') if enabled else pill('Disabled', 'gray')
+                    order = pol.get('ProcessingOrder', '—')
+                    rc += (f'<tr{bg}><td style="text-align:center;color:#6b6080">{h(str(order))}</td>'
+                           f'<td style="font-weight:600">{h(pol.get("Name",""))}</td>'
+                           f'<td>{st}</td></tr>\n')
+                rc += '</table>\n'
+            if not nps_clients and not nps_policies and nps.get('Partial'):
+                rc += ('<div class="flag-info"><div class="flag-label">Partial NPS Data</div>'
+                      '<div class="flag-detail">NPS module unavailable — netsh fallback used. '
+                      'Export full config with: <code>netsh nps export filename=nps_config.xml exportPSK=YES</code></div></div>\n')
         else:
             rc += ('<div class="flag-info"><div class="flag-label">NPS Installed</div>'
                   '<div class="flag-detail">Network Policy Server (RADIUS) is installed. '
-                  'Policies and RADIUS clients must be exported and migrated during DC replacement.</div></div>\n')
+                  'Run discovery with an account that has NPS module access to collect client and policy details.</div></div>\n')
 
     # Hyper-V
     if has_hv:
@@ -1455,8 +1517,9 @@ def build_server_tab(srv):
     # ── SERVICE ANOMALIES CARD ────────────────────────────────────────────────
     anom_body = ''
     if svc_anomalies:
-        anom_body  = ('<div class="flag-info" style="margin-bottom:14px"><div class="flag-label">Manual Review Required</div>'
-                     '<div class="flag-detail">These services warrant manual review. Not all are malicious — confirm with client before taking action.</div></div>\n')
+        anom_body  = ('<div class="flag-info" style="margin-bottom:14px"><div class="flag-label">Service Security Flags</div>'
+                     '<div class="flag-detail">Services running from suspicious paths (temp/user dirs) or as custom domain accounts. '
+                     'Review with client — LOB app service accounts are often legitimate.</div></div>\n')
         anom_body += ('<table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:8.5pt">'
                      '<colgroup><col style="width:18%"><col style="width:22%"><col style="width:14%"><col style="width:46%"></colgroup>'
                      '<tr><th style="padding:6px 8px;text-align:left">Name</th>'
@@ -1509,16 +1572,16 @@ def build_server_tab(srv):
     tab_html += card(f'{sid}-overview',   'System Overview',         overview_body)
     tab_html += card(f'{sid}-hardware',   'Hardware',                hw_body)
     tab_html += card(f'{sid}-apps',       'Installed Applications',  apps_body)
-    tab_html += card(f'{sid}-roles',      'Roles &amp; Features',    roles_body, collapsed=True)
+    tab_html += card(f'{sid}-roles',      'Roles &amp; Features',    roles_body)
     tab_html += card(f'{sid}-roleconfig', 'Role Configuration',      rc)
+    if shares_body:
+        tab_html += card(f'{sid}-shares', f'File Shares ({len(sl)})', shares_body)
     tab_html += card(f'{sid}-disks',      'Disk Storage',            disk_body)
     tab_html += card(f'{sid}-network',    'Network',                 net_body)
     tab_html += card(f'{sid}-lports',     'Listening Ports',         lp_body, collapsed=True)
     tab_html += card(f'{sid}-services',   'Services',                svc_body)
     if anom_body:
-        tab_html += card(f'{sid}-svc-anomalies', 'Service Anomalies', anom_body)
-    if shares_body:
-        tab_html += card(f'{sid}-shares', f'File Shares ({len(sl)})', shares_body)
+        tab_html += card(f'{sid}-svc-anomalies', 'Service Security Flags', anom_body)
 
     return {'id': sid, 'name': name, 'role_label': rlabel,
             'in_scope': in_sc, 'crit': crit, 'warn': warn, 'tab_html': tab_html}

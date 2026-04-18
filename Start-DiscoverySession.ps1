@@ -137,8 +137,10 @@ function Get-SuggestedHypervisors {
             $n = $c.Name.ToUpper()
             if ($hvPatterns | Where-Object { $n -like $_ }) {
                 if (-not ($found | Where-Object { $_.Name -ieq $c.Name })) {
+                    # Fix 19 -- IPv4Address may not exist on older AD schema; guard before access
+                    $ipv4 = if ($c | Get-Member -Name IPv4Address -ErrorAction SilentlyContinue) { $c.IPv4Address | Select-Object -First 1 } else { $null }
                     [void]$found.Add([PSCustomObject]@{
-                        Name = $c.Name; IP = $c.IPv4Address; Source = 'AD'
+                        Name = $c.Name; IP = $ipv4; Source = 'AD'
                         Description = $c.Description; OS = $c.OperatingSystem
                     })
                 }
@@ -218,8 +220,10 @@ function Get-SuggestedServers {
         foreach ($c in $adComps) {
             if ($c.OperatingSystem -notmatch 'Server') { continue }
             if (-not ($found | Where-Object { $_.Name -ieq $c.Name })) {
+                # Fix 19 -- IPv4Address may not exist on older AD schema; guard before access
+                $ipv4 = if ($c | Get-Member -Name IPv4Address -ErrorAction SilentlyContinue) { $c.IPv4Address | Select-Object -First 1 } else { $null }
                 [void]$found.Add([PSCustomObject]@{
-                    Name=$c.Name; IP=$c.IPv4Address; Source='AD'
+                    Name=$c.Name; IP=$ipv4; Source='AD'
                     Description=$c.Description; OS=$c.OperatingSystem
                 })
             }
@@ -236,7 +240,7 @@ function Get-SuggestedServers {
             $srch   = New-Object DirectoryServices.DirectorySearcher([ADSI]"LDAP://$base", $filter)
             $srch.ClientTimeout   = [TimeSpan]::FromSeconds(10)
             $srch.ServerTimeLimit = [TimeSpan]::FromSeconds(10)
-            $srch.PageSize        = 500
+            $srch.PageSize        = 1000   # Fix 18 -- increased from 500 to handle environments with >1000 computers
             @('name','dNSHostName','description','operatingSystem') | ForEach-Object { [void]$srch.PropertiesToLoad.Add($_) }
             $srch.FindAll() | ForEach-Object {
                 $n   = if ($_.Properties['name'].Count)            { $_.Properties['name'][0] }            else { '' }
@@ -778,12 +782,13 @@ Invoke-UpdateCheck
 $portablePy     = Join-Path $PSScriptRoot 'python\python.exe'
 $setupScript    = Join-Path $PSScriptRoot 'Get-PortablePython.ps1'
 
+$script:PythonAvailable = $false   # Fix 20 -- flag tracked through session; warn at end if false
 if (-not (Test-Path $portablePy)) {
     $hasSysPython = $false
     foreach ($pyCandidate in @('python','python3','py')) {
         try {
             $pyOut = & $pyCandidate --version 2>&1
-            if ($pyOut -match 'Python [23]') { $hasSysPython = $true; break }
+            if ($pyOut -match 'Python [23]') { $hasSysPython = $true; $script:PythonAvailable = $true; break }
         } catch { }
     }
 
@@ -794,20 +799,30 @@ if (-not (Test-Path $portablePy)) {
                 & $setupScript
                 if (Test-Path $portablePy) {
                     Write-Host ""
+                    $script:PythonAvailable = $true
                 } else {
+                    # Fix 20 -- after all download attempts, check if python is actually usable
+                    $script:PythonAvailable = $false
                     Write-Host "  Setup completed but python.exe not found -- report will need manual generation." -ForegroundColor Yellow
+                    Write-Host "  WARNING: HTML report generation will fail at the end of this session." -ForegroundColor Red
                     Write-Host ""
                 }
             } catch {
+                $script:PythonAvailable = $false
                 Write-Host "  Python setup failed: $_ -- report will need manual generation." -ForegroundColor Yellow
+                Write-Host "  WARNING: HTML report generation will fail at the end of this session." -ForegroundColor Red
                 Write-Host ""
             }
         } else {
+            $script:PythonAvailable = $false
             Write-Host "  Python not found and Get-PortablePython.ps1 is missing." -ForegroundColor Yellow
             Write-Host "  Discovery will run normally -- HTML report will need manual generation." -ForegroundColor DarkGray
+            Write-Host "  WARNING: HTML report generation will fail at the end of this session." -ForegroundColor Red
             Write-Host ""
         }
     }
+} else {
+    $script:PythonAvailable = $true
 }
 
 # -----------------------------------------------------------------------------
@@ -921,15 +936,20 @@ function Connect-VSphere {
     $pass = $Cred.GetNetworkCredential().Password
     $b64  = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("${user}:${pass}"))
     $authHeader = @{ Authorization = "Basic $b64" }
-    # Try vSphere API v7+ first, then v6.x fallback
+    # Fix 16 -- vSphere API version detection: try v7 first, fall back to v6
+    # Store which session endpoint responded so all downstream calls stay consistent
     $lastErr = ''
     foreach ($apiPath in @('/api/session', '/rest/com/vmware/cis/session')) {
         try {
             $uri   = "https://$Server$apiPath"
             $token = Invoke-VSphereRest -Uri $uri -Method POST -Headers $authHeader
-            $apiVer = if ($apiPath -match '^/api') { 'v7' } else { 'v6' }
-            B-OK "Connected to vSphere ($apiVer API) at $Server"
-            return @{ OK=$true; Token=$token; Server=$Server; APIVer=$apiVer }
+            # Determine API version from which endpoint actually responded
+            $apiVer = if ($apiPath -eq '/api/session') { 'v7' } else { 'v6' }
+            B-OK "Connected to vSphere ($apiVer API) at $Server  [session endpoint: $apiPath]"
+            # Return connection context with version locked to the responding endpoint
+            # All downstream calls (Get-VSphereVMs, Get-VSphereInventory, Disconnect-VSphere)
+            # branch on $Conn.APIVer to ensure v6/v7 endpoints are never mixed.
+            return @{ OK=$true; Token=$token; Server=$Server; APIVer=$apiVer; SessionEndpoint=$apiPath }
         } catch { $lastErr = $_.Exception.Message }
     }
     return @{ OK=$false; Error="Could not connect to vSphere REST API on $Server - $lastErr" }
@@ -971,6 +991,8 @@ function Get-VSphereVMs {
                 } | Select-Object -ExpandProperty ip_address
                 $ip = ($ips | Select-Object -First 2) -join ', '
             } catch { }
+            # Fix 15 -- VMware Tools not running = blank IP; mark it explicitly so report is clear
+            if (-not $ip -or $ip.Trim() -eq '') { $ip = '(VMware Tools not running)' }
             [void]$list.Add([PSCustomObject]@{
                 Name       = $name
                 IP         = $ip
@@ -1364,12 +1386,14 @@ function Invoke-PingSweep {
     param([string[]]$IPs)
     B-Line "Ping sweeping $($IPs.Count) addresses (~10-20 seconds)..."
     # Use .NET async pings -- avoids spawning one PS process per host (254 Start-Jobs = freeze)
+    # Fix 17 -- increased per-ping timeout from 1500ms to 3000ms for slower networks
     $tasks = $IPs | ForEach-Object {
         $p = [System.Net.NetworkInformation.Ping]::new()
-        [PSCustomObject]@{ IP=$_; Ping=$p; Task=$p.SendPingAsync($_, 1500) }
+        [PSCustomObject]@{ IP=$_; Ping=$p; Task=$p.SendPingAsync($_, 3000) }
     }
     $spin = 0; $spinC = @('|','/','-','\')
-    $timeout = (Get-Date).AddSeconds(25)
+    # Total wait window scaled up proportionally (was 25s, now 50s to match doubled per-ping timeout)
+    $timeout = (Get-Date).AddSeconds(50)
     while (($tasks | Where-Object { -not $_.Task.IsCompleted }).Count -gt 0 -and (Get-Date) -lt $timeout) {
         $done = ($tasks | Where-Object { $_.Task.IsCompleted }).Count
         Write-Host ("`r  (o_o)  scanning... $($spinC[$spin%4])  $done/$($tasks.Count)   ") -NoNewline -ForegroundColor DarkCyan
@@ -1416,16 +1440,29 @@ function Enable-WinRMViaWMI {
         $psRemCmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Enable-PSRemoting -Force -SkipNetworkProfileCheck 2>&1|Out-Null"'
         Invoke-WmiOrCimMethod -ClassName 'Win32_Process' -ComputerName $Target -Cred $Cred `
                               -MethodName 'Create' -Arguments @{ CommandLine=$psRemCmd } -UseDCOM | Out-Null
-        Start-Sleep -Seconds 6
+        # Fix 4 -- increased sleep (was 6s) to give WinRM service time to fully bind port 5985
+        Start-Sleep -Seconds 15
+        # Retry loop: up to 3 attempts with 5s between, rather than fail immediately after sleep
+        $winrmUp = $false
         for ($i=0; $i -lt 3; $i++) {
             try {
                 $wp = @{ ComputerName=$Target; EA='Stop' }
                 if ($Cred) { $wp.Credential=$Cred }
-                Test-WSMan @wp | Out-Null; return $true
-            } catch { Start-Sleep -Seconds 3 }
+                Test-WSMan @wp | Out-Null
+                $winrmUp = $true
+                break
+            } catch {
+                if ($i -lt 2) {
+                    Write-Log 'INFO' $Target "Test-WSMan attempt $($i+1)/3 failed - retrying in 5s..."
+                    Start-Sleep -Seconds 5
+                }
+            }
         }
-        B-Err "WinRM started on $Target but port 5985 still not answering (firewall?)"
-        return $false
+        if (-not $winrmUp) {
+            B-Err "WinRM started on $Target but port 5985 still not answering after 3 attempts (firewall?)"
+            return $false
+        }
+        return $true
     } catch { B-Err "Enable-WinRM failed on $Target`: $_"; return $false }
 }
 
@@ -1459,8 +1496,26 @@ function Invoke-Cleanup {
         }
         B-OK "WinRM cleanup complete."
     }
+    # Fix 10 -- credential cache cleanup: delete cred XML on all exit paths
+    # (written when user selects [B] restart; must be purged even if session crashes)
+    if (Test-Path $script:CredCacheFile) {
+        try {
+            Remove-Item $script:CredCacheFile -Force -ErrorAction Stop
+        } catch {
+            # If deletion fails, log it but don't crash cleanup
+            if ($script:SessionLog) {
+                try { Add-Content -Path $script:SessionLog -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] [WARN] [Cleanup] Cred cache delete failed: $_" -EA SilentlyContinue } catch { }
+            }
+        }
+    }
 }
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { Invoke-Cleanup } | Out-Null
+
+# Fix 10 -- trap Ctrl+C and unhandled terminating errors so cred cache is always purged
+trap {
+    Invoke-Cleanup
+    break
+}
 
 # -----------------------------------------------------------------------------
 # PHASE 0 - ENVIRONMENT TYPE
@@ -2357,43 +2412,51 @@ foreach ($row in $autoRows) {
     Write-Host ""
     $ok = $false
     $discError = ''
+    # Fix 9 -- WinRM restore runs in finally so it fires even if discovery throws or Ctrl+C
     try {
-        if ($isLocal) {
-            & $DiscoveryScript -OutputPath $sessionFolder
-        } else {
-            & $DiscoveryScript -ComputerName $target -Credential $script:DomainCred -OutputPath $sessionFolder
+        try {
+            if ($isLocal) {
+                & $DiscoveryScript -OutputPath $sessionFolder
+            } else {
+                & $DiscoveryScript -ComputerName $target -Credential $script:DomainCred -OutputPath $sessionFolder
+            }
+            $ok = $true
+        } catch {
+            $discError = $_.ToString()
+            B-Err "Discovery script exception on $target`: $discError"
+            Write-Log 'FAIL' $row.DisplayName "Discovery script threw exception: $discError"
         }
-        $ok = $true
-    } catch {
-        $discError = $_.ToString()
-        B-Err "Discovery script exception on $target`: $discError"
-        Write-Log 'FAIL' $row.DisplayName "Discovery script threw exception: $discError"
-    }
 
-    # Find output JSON
-    $hostname = if ($row.ResolvedHost) { $row.ResolvedHost } else { $row.DisplayName }
-    $dateStr  = (Get-Date).ToString("yyyy-MM-dd")
-    $jsonPath = Join-Path $sessionFolder "$hostname-discovery-$dateStr.json"
-    if (-not (Test-Path $jsonPath)) {
-        $jsonPath = Get-ChildItem $sessionFolder -Filter "*discovery*$dateStr*.json" -EA SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Select-Object -ExpandProperty FullName
-    }
-    if ($jsonPath -and (Test-Path $jsonPath)) {
-        [void]$outputFiles.Add($jsonPath)
-        $successCount++
-        B-OK "JSON saved: $(Split-Path $jsonPath -Leaf)"
-        Write-Log 'OK' $row.DisplayName "Success - $(Split-Path $jsonPath -Leaf)"
-    } else {
-        B-Err "No JSON output found for $($row.DisplayName) ($target)"
-        Write-Log 'FAIL' $row.DisplayName "No JSON file produced. Script exit ok=$ok. Prior error: $(if($discError){"$discError"}else{'none - check Invoke-ServerDiscovery output above'})"
-        $failCount++
-    }
-
-    # -- Restore WinRM ---------------------------------------------------------
-    if (-not $isLocal -and $weEnabled) {
-        Write-Host ""
-        Restore-WinRMState -Target $target -Cred $script:DomainCred -Orig $ws
-        $script:WinRMRestoreMap.Remove($target)
+        # Find output JSON
+        $hostname = if ($row.ResolvedHost) { $row.ResolvedHost } else { $row.DisplayName }
+        $dateStr  = (Get-Date).ToString("yyyy-MM-dd")
+        $jsonPath = Join-Path $sessionFolder "$hostname-discovery-$dateStr.json"
+        if (-not (Test-Path $jsonPath)) {
+            $jsonPath = Get-ChildItem $sessionFolder -Filter "*discovery*$dateStr*.json" -EA SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Select-Object -ExpandProperty FullName
+        }
+        if ($jsonPath -and (Test-Path $jsonPath)) {
+            [void]$outputFiles.Add($jsonPath)
+            $successCount++
+            B-OK "JSON saved: $(Split-Path $jsonPath -Leaf)"
+            Write-Log 'OK' $row.DisplayName "Success - $(Split-Path $jsonPath -Leaf)"
+        } else {
+            B-Err "No JSON output found for $($row.DisplayName) ($target)"
+            Write-Log 'FAIL' $row.DisplayName "No JSON file produced. Script exit ok=$ok. Prior error: $(if($discError){"$discError"}else{'none - check Invoke-ServerDiscovery output above'})"
+            $failCount++
+        }
+    } finally {
+        # Fix 9 -- always restore WinRM state, even on exception
+        if (-not $isLocal -and $weEnabled) {
+            Write-Host ""
+            try {
+                Restore-WinRMState -Target $target -Cred $script:DomainCred -Orig $ws
+                $script:WinRMRestoreMap.Remove($target)
+            } catch {
+                Write-Log 'WARN' $target "WinRM restore failed in finally block: $_"
+                B-Warn "WinRM restore failed on $target - may need manual restore: $_"
+            }
+        }
     }
     Write-Divider
 }
@@ -2554,6 +2617,14 @@ Write-Host ("=" * 72) -ForegroundColor DarkMagenta
 Write-Host ("  Targets total  : " + $planRows.Count + "  (auto: $($autoRows.Count)  manual: $($manualRows.Count)  skip: $($skipRows.Count))") -ForegroundColor Gray
 Write-Host ("  Succeeded      : $successCount") -ForegroundColor Green
 if ($failCount -gt 0) { Write-Host ("  Failed         : $failCount") -ForegroundColor Red }
+# Fix 20 -- warn prominently at session end if Python is unavailable
+if (-not $script:PythonAvailable) {
+    Write-Host ""
+    Write-Host "  WARNING: Python was not found or failed to install." -ForegroundColor Red
+    Write-Host "  HTML report generation will fail. To fix:" -ForegroundColor Yellow
+    Write-Host "    1. Run: .\Get-PortablePython.ps1" -ForegroundColor DarkGray
+    Write-Host "    2. Then: python gen_report.py <manifest-file>" -ForegroundColor DarkGray
+}
 Write-Host ("  Runtime        : ${elapsed}s") -ForegroundColor DarkGray
 Write-Host ("  Output folder  : $sessionFolder") -ForegroundColor White
 Write-Host ("=" * 72) -ForegroundColor DarkMagenta

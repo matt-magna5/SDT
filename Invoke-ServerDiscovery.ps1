@@ -47,6 +47,9 @@ $script:ScriptVersion  = '2.0'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
+# Fix 1 -- TLS 1.2 for older .NET (ensures HTTPS downloads work on .NET 4.0 / PS 3/4)
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
 $script:IsRemote = ($ComputerName -ne $env:COMPUTERNAME -and
                     $ComputerName -ne 'localhost'         -and
                     $ComputerName -ne '127.0.0.1'         -and
@@ -899,11 +902,22 @@ $CollectionBlock = {
                     return $result
                 } catch { }
             }
-            # Fallback: net share + WMI Win32_Share
+            # Fix 8 -- WMI Win32_Share fallback (PS 3 or when Get-SmbShare is unavailable)
+            # Maps Name, Path, Description, Type to match the Get-SmbShare output structure
             $wmiShares = Safe-Wmi Win32_Share FileShares
             if ($wmiShares) {
-                $result.Shares = @($wmiShares | Where-Object { $_.Type -eq 0 -and $_.Name -notmatch '^\w\$$|^IPC\$$' } |
-                    Select-Object @{N='Name';E={$_.Name}}, @{N='Path';E={$_.Path}}, @{N='Description';E={$_.Description}})
+                $result.Shares = @($wmiShares |
+                    Where-Object { $_.Type -eq 0 -and $_.Name -notmatch '^\w\$$|^IPC\$$|^ADMIN\$$|^PRINT\$$' } |
+                    ForEach-Object {
+                        @{
+                            Name        = [string]$_.Name
+                            Path        = [string]$_.Path
+                            Description = [string]$_.Description
+                            Type        = [int]$_.Type
+                            Permissions = @()   # Win32_Share has no ACL method -- left empty for fallback
+                        }
+                    })
+                $result.Partial = $true
             }
         } catch {
             cb-Log "FileShares" "Outer error: $_"
@@ -930,12 +944,36 @@ $CollectionBlock = {
                     return $result
                 }
             } catch { }
-            # Fallback: parse netsh nps output
+            # Fix 5 -- robust netsh nps fallback parsing
+            # Parses 'Name = ' and 'Address = ' fields from netsh output into structured objects
             try {
-                $npsExport = netsh nps show client 2>&1
-                $clients = @($npsExport | Where-Object { $_ -match 'Client Name|IP Address' } | ForEach-Object { $_.Trim() })
-                $result.Clients = @($clients | ForEach-Object { @{ Raw = $_ } })
+                $npsClientOut = netsh nps show client 2>&1
+                $npsNpOut     = netsh nps show np 2>&1
+
+                # Parse clients: each block has Name = ... and Address = ... lines
+                $parsedClients = [System.Collections.ArrayList]@()
+                $curName = ''; $curAddr = ''
+                foreach ($ln in $npsClientOut) {
+                    if ($ln -match '^\s*Name\s*=\s*(.+)$')    { $curName = $matches[1].Trim() }
+                    if ($ln -match '^\s*Address\s*=\s*(.+)$') { $curAddr = $matches[1].Trim() }
+                    if ($curName -and $curAddr) {
+                        [void]$parsedClients.Add([ordered]@{ Name=$curName; Address=$curAddr })
+                        $curName = ''; $curAddr = ''
+                    }
+                }
+                $result.Clients = @($parsedClients)
+
+                # Parse network policies: Name = ... lines
+                $parsedPolicies = [System.Collections.ArrayList]@()
+                foreach ($ln in $npsNpOut) {
+                    if ($ln -match '^\s*Name\s*=\s*(.+)$') {
+                        [void]$parsedPolicies.Add([ordered]@{ Name=$matches[1].Trim(); Address='' })
+                    }
+                }
+                $result.Policies = @($parsedPolicies)
+
                 $result.Partial = $true
+                cb-Log "NPS" "Used netsh fallback - $($parsedClients.Count) client(s), $($parsedPolicies.Count) polic(ies) found"
             } catch { cb-Log "NPS" "netsh nps fallback failed: $_" }
         } catch {
             cb-Log "NPS" "Outer error: $_"
@@ -1041,7 +1079,7 @@ $CollectionBlock = {
                     $svc = Get-WmiObject Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
                     if ($svc) { $inst.ServiceAccount = $svc.StartName }
                 } catch { }
-                # SQL deep connect — pull database-level details via integrated security
+                # SQL deep connect - pull database-level details via integrated security
                 $inst.Connected = $false
                 try {
                     $sqlServer = if ($instName -eq 'MSSQLSERVER') { '.' } else { ".\$instName" }
@@ -1107,10 +1145,14 @@ ORDER BY data_size_mb DESC
                     $conn.Close()
                     $inst.Databases = $dbs
                 } catch {
+                    # Fix 6 -- capture connect error detail so report can show why it failed
+                    $connErrMsg = $_.Exception.Message
+                    if ($connErrMsg.Length -gt 200) { $connErrMsg = $connErrMsg.Substring(0, 200) }
                     cb-Log "SQL-$instName" "Deep connect failed: $_"
-                    $inst.Connected  = $false
-                    $inst.Databases  = @()
-                    $inst.Partial    = $true
+                    $inst.Connected     = $false
+                    $inst.ConnectError  = $connErrMsg
+                    $inst.Databases     = @()
+                    $inst.Partial       = $true
                 }
             } catch {
                 cb-Log "SQL-$instName" "Instance collection error: $_"
@@ -1196,6 +1238,20 @@ ORDER BY data_size_mb DESC
             $hvSvc = Get-Service -Name vmms -ErrorAction SilentlyContinue
             if (-not $hvSvc -or $hvSvc.Status -ne 'Running') { return $result }
             $result.Installed = $true
+            # Fix 3 -- Hyper-V WMI namespace fallback (root\virtualization\v2 = Server 2012+;
+            # root\virtualization = Server 2008 R2 / early HV; try v2 first, fall back gracefully)
+            $hvNS = 'root\virtualization\v2'
+            try {
+                Get-WmiObject -Namespace 'root\virtualization\v2' -Class Msvm_ComputerSystem -ErrorAction Stop | Out-Null
+            } catch {
+                try {
+                    Get-WmiObject -Namespace 'root\virtualization' -Class Msvm_ComputerSystem -ErrorAction Stop | Out-Null
+                    $hvNS = 'root\virtualization'
+                    cb-Log "HyperV" "root\virtualization\v2 not present - using legacy root\virtualization namespace"
+                } catch {
+                    cb-Log "HyperV" "No Hyper-V WMI namespace found - HV may not be fully installed"
+                }
+            }
             try {
                 if (Get-Module -ListAvailable -Name Hyper-V -ErrorAction SilentlyContinue) {
                     Import-Module Hyper-V -ErrorAction Stop
@@ -1266,7 +1322,7 @@ ORDER BY data_size_mb DESC
 
             if ($null -eq $bestFile) {
                 $result.HyperVPerfAvailable = $false
-                $result.HyperVPerfNote      = 'No 30-day PerfMon history found — performance data unavailable'
+                $result.HyperVPerfNote      = 'No 30-day PerfMon history found - performance data unavailable'
             } else {
                 # Attempt to read Hyper-V counters from the log file
                 try {
@@ -1285,7 +1341,7 @@ ORDER BY data_size_mb DESC
                     # Group by instance (VM name) and calculate avg/max
                     $vmStats = @{}
                     foreach ($sample in $cpuData) {
-                        # Counter instance is like "vm name:0" — strip the colon-suffix
+                        # Counter instance is like "vm name:0" - strip the colon-suffix
                         $instLabel = ($sample.InstanceName -replace ':\d+$', '').Trim()
                         if ($instLabel -eq '_total' -or $instLabel -eq '') { continue }
                         if (-not $vmStats.ContainsKey($instLabel)) {
@@ -1294,7 +1350,7 @@ ORDER BY data_size_mb DESC
                         [void]$vmStats[$instLabel].CpuSamples.Add([double]$sample.CookedValue)
                     }
 
-                    # Pull RAM samples — wrap in try so missing counter doesn't abort
+                    # Pull RAM samples - wrap in try so missing counter doesn't abort
                     try {
                         $ramData = Import-Counter -Path $blgPath -Counter $ramCounter -MaxSamples 9999999 -ErrorAction Stop |
                                    Select-Object -ExpandProperty CounterSamples
@@ -1349,7 +1405,7 @@ ORDER BY data_size_mb DESC
                 }
             }
         } catch {
-            # Entire perf check failed — non-fatal
+            # Entire perf check failed - non-fatal
             $result.HyperVPerfAvailable = $false
             $result.HyperVPerfNote      = "PerfMon check error: $_"
             cb-Log "HyperV-Perf" "Outer perf check error: $_"
@@ -1486,18 +1542,39 @@ ORDER BY data_size_mb DESC
             $cutoff  = (Get-Date).AddHours(-24)
             $logs    = @('System','Application')
             $allEvts = [System.Collections.ArrayList]@()
+            # Fix 11 -- Get-EventLog wrapped in Start-Job/Wait-Job with 15s timeout
+            # Prevents the call from hanging indefinitely on large or corrupt event logs
             foreach ($log in $logs) {
                 try {
-                    $evts = Get-EventLog -LogName $log -EntryType Error,Warning,Critical -After $cutoff -Newest 200 -ErrorAction SilentlyContinue
-                    if ($evts) { foreach ($e in $evts) { [void]$allEvts.Add($e) } }
-                } catch { }
+                    $evtJob = Start-Job -ScriptBlock {
+                        param($logName, $after)
+                        Get-EventLog -LogName $logName -EntryType Error,Warning,Information -After $after -Newest 200 -ErrorAction SilentlyContinue |
+                            Select-Object TimeGenerated, EntryType, Source,
+                                @{ N='Message'; E={ ($_.Message -replace '\r?\n',' ').Substring(0, [Math]::Min(200, ($_.Message -replace '\r?\n',' ').Length)) } }
+                    } -ArgumentList $log, $cutoff
+                    $evtDone = Wait-Job $evtJob -Timeout 15
+                    if ($evtDone) {
+                        $evts = Receive-Job $evtJob -ErrorAction SilentlyContinue
+                        if ($evts) { foreach ($e in $evts) { [void]$allEvts.Add($e) } }
+                    } else {
+                        cb-Log "EventLog" "Get-EventLog timed out on $log log (>15s) - partial results"
+                        $result.Partial = $true
+                    }
+                    Remove-Job $evtJob -Force -ErrorAction SilentlyContinue
+                } catch { cb-Log "EventLog" "Job error on $log`: $_" }
             }
             $result.CriticalCount = @($allEvts | Where-Object { $_.EntryType -eq 'Error' }).Count
             $result.TopSources    = @($allEvts | Group-Object Source | Sort-Object Count -Descending | Select-Object -First 10 |
                 ForEach-Object { @{ Source=$_.Name; Count=$_.Count } })
             $result.RecentCritical = @($allEvts | Where-Object { $_.EntryType -eq 'Error' } |
                 Sort-Object TimeGenerated -Descending | Select-Object -First 10 |
-                ForEach-Object { @{ Time=$_.TimeGenerated.ToString("yyyy-MM-dd HH:mm"); Source=$_.Source; Message=($_.Message -replace '\r?\n',' ' | Select-Object -First 200) } })
+                ForEach-Object {
+                    # TimeGenerated may be a DateTime (live) or already a string (deserialized from job)
+                    $timeStr = try { if ($_.TimeGenerated -is [datetime]) { $_.TimeGenerated.ToString("yyyy-MM-dd HH:mm") } else { [string]$_.TimeGenerated } } catch { '' }
+                    # Message is pre-truncated to 200 chars in the job Select-Object; just use it as-is
+                    $msgStr  = [string]$_.Message
+                    @{ Time=$timeStr; Source=$_.Source; Message=$msgStr }
+                })
         } catch {
             cb-Log "EventLog" "Outer error: $_"
             $result.Partial = $true
@@ -1558,6 +1635,36 @@ ORDER BY data_size_mb DESC
         Flags      = $cbFlags
         Errors     = $cbErrors
     }
+
+    # Fix 7 -- ensure array fields are never $null (prevents JSON key omission on PS 3/4)
+    # Array fields: replace $null with @(); string fields: replace $null with ''
+    $arrayFields = @{
+        'Disks'    = @('Disks')
+        'Network'  = @('Adapters','ListeningPorts','EstablishedConns')
+        'Roles'    = @('InstalledRoles','InstalledFeatures')
+        'AD'       = @('StaleUsers','StaleComputers','FSMORoles')
+        'DNS'      = @('Zones','Forwarders')
+        'DHCP'     = @('Scopes')
+        'FileShares' = @('Shares')
+        'NPS'      = @('Clients','Policies')
+        'IIS'      = @('Sites','AppPools')
+        'SQL'      = @('Instances')
+        'Exchange' = @('DatabaseSizes')
+        'HyperV'   = @('VMs','VirtualSwitches')
+        'EventLog' = @('TopSources','RecentCritical')
+    }
+    foreach ($section in $arrayFields.Keys) {
+        if ($Discovery[$section]) {
+            foreach ($field in $arrayFields[$section]) {
+                if ($null -eq $Discovery[$section][$field]) { $Discovery[$section][$field] = @() }
+            }
+        }
+    }
+    # Top-level array sections returned directly (Apps, Tasks, Services, Printers)
+    if ($null -eq $Discovery.Apps)     { $Discovery.Apps     = @() }
+    if ($null -eq $Discovery.Tasks)    { $Discovery.Tasks    = @() }
+    if ($null -eq $Discovery.Services) { $Discovery.Services = @() }
+    if ($null -eq $Discovery.Printers) { $Discovery.Printers = @() }
 
     return $Discovery
 }
