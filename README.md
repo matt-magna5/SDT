@@ -164,7 +164,7 @@ All LOB app keywords are stored in `detection_rules.json` and can be extended wi
 **1. Download to the jump box — paste this into PowerShell:**
 
 ```powershell
-iwr https://github.com/trophyscar-bit/sdt/archive/refs/tags/v3.0.zip -OutFile C:\Temp\sdt.zip; Expand-Archive C:\Temp\sdt.zip C:\Temp -Force; cd C:\Temp\sdt-3.0
+iwr https://github.com/matt-magna5/SDT/archive/refs/tags/v3.0.zip -OutFile C:\Temp\sdt.zip; Expand-Archive C:\Temp\sdt.zip C:\Temp -Force; cd C:\Temp\sdt-3.0
 ```
 
 **2. Launch:**

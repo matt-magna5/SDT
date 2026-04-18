@@ -665,7 +665,7 @@ function Invoke-UpdateCheck {
     try {
         $ProgressPreference = 'SilentlyContinue'
         $resp = Invoke-WebRequest `
-            -Uri 'https://api.github.com/repos/trophyscar-bit/sdt/releases/latest' `
+            -Uri 'https://api.github.com/repos/matt-magna5/SDT/releases/latest' `
             -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
         $rel    = $resp.Content | ConvertFrom-Json
         $latest = ($rel.tag_name -replace '^v','').Trim()
@@ -683,7 +683,7 @@ function Invoke-UpdateCheck {
             return
         }
 
-        $zipUrl = "https://github.com/trophyscar-bit/sdt/archive/refs/tags/v$latest.zip"
+        $zipUrl = "https://github.com/matt-magna5/SDT/archive/refs/tags/v$latest.zip"
         $zipTmp = Join-Path $env:TEMP "sdt-update.zip"
         $extTmp = Join-Path $env:TEMP ("sdt-upd-{0}-{1}" -f $latest, [guid]::NewGuid().ToString('N').Substring(0,6))
 
