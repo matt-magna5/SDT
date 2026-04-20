@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '3.10'
+$script:ScriptVersion  = '3.11'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -2034,41 +2034,59 @@ if ($json) {
         exit 1
     }
 } else {
-    Write-BuddyErr "Output" "ConvertTo-Json failed. Last error: $jsonErr"
-    Write-Host "  Falling back to CLI-XML (PowerShell native serializer - handles all .NET types)..." -ForegroundColor DarkYellow
+    Write-BuddyWarn "ConvertTo-Json failed: $jsonErr"
+    Write-Host "  Auto-recovery: exporting to CLI-XML and re-importing to strip problem types..." -ForegroundColor DarkYellow
 
-    # PRIMARY FALLBACK: CLI-XML (.clixml) - Export-Clixml handles every PS/.NET
-    # type including CIM objects with PSParameterizedProperty members. A Python
-    # converter (clixml_to_json.py) turns this back into the standard JSON
-    # schema so the report generator works unchanged.
+    # AUTO-RECOVERY: Export-Clixml -> Import-Clixml roundtrip strips
+    # PSParameterizedProperty members (they don't survive CLI-XML deserialization).
+    # Then ConvertTo-Json on the deserialized object works cleanly.
     $xmlFile = Join-Path $OutputPath "${hostname}-discovery-${dateStr}.clixml"
-    $xmlOK = $false
+    $recovered = $false
     try {
         Export-Clixml -InputObject $discoveryResult -Path $xmlFile -Depth 20 -Force -ErrorAction Stop
         $xmlSize = (Get-Item $xmlFile -ErrorAction SilentlyContinue).Length
-        if ($xmlSize -gt 1000) {
-            Write-BuddyOK "CLI-XML saved: $xmlFile ($xmlSize bytes)"
-            $xmlOK = $true
+        Write-Host ("  CLI-XML saved: {0} bytes" -f $xmlSize) -ForegroundColor DarkGray
+
+        # Re-import the deserialized object - PS strips the indexer members on roundtrip
+        $reimported = Import-Clixml -Path $xmlFile -ErrorAction Stop
+
+        # Run it through our sanitizers again for good measure
+        $safeResult2 = Invoke-StrictSanitize (ConvertTo-SafeObject $reimported)
+
+        foreach ($depth in @(20, 10, 6)) {
+            try {
+                $json = $safeResult2 | ConvertTo-Json -Depth $depth -ErrorAction Stop
+                Write-BuddyOK "Serialized at depth $depth (via CLI-XML roundtrip)"
+                break
+            } catch {
+                $jsonErr = "roundtrip depth $depth failed: $_"
+            }
+        }
+
+        if ($json) {
+            [System.IO.File]::WriteAllText($outputFile, $json, [System.Text.Encoding]::UTF8)
+            Write-BuddyOK "Saved: $outputFile"
+            # Keep the .clixml as an audit/forensic backup
+            Write-Host "  (CLI-XML backup retained: $xmlFile)" -ForegroundColor DarkGray
+            $recovered = $true
         }
     } catch {
-        Write-BuddyWarn "CLI-XML export failed: $($_.Exception.Message)"
+        Write-BuddyWarn "CLI-XML recovery failed: $($_.Exception.Message)"
     }
 
-    # Secondary fallback: dump Python-friendly primitive-only text
-    try {
-        $fallbackFile = Join-Path $OutputPath "discovery-error-$(Get-Date -f yyyyMMdd-HHmmss).txt"
-        $discoveryResult | Out-File $fallbackFile -ErrorAction SilentlyContinue
-        Write-Host "  Human-readable dump also saved: $fallbackFile" -ForegroundColor DarkGray
-    } catch { }
-
-    if ($xmlOK) {
+    if (-not $recovered) {
+        Write-BuddyErr "Output" "All serialization paths failed. Emergency dumps:"
+        Write-Host "    $xmlFile" -ForegroundColor DarkGray
+        try {
+            $txtFile = Join-Path $OutputPath "discovery-error-$(Get-Date -f yyyyMMdd-HHmmss).txt"
+            $discoveryResult | Out-File $txtFile -ErrorAction SilentlyContinue
+            Write-Host "    $txtFile" -ForegroundColor DarkGray
+        } catch { }
         Write-Host ""
-        Write-Host "  Next step (on your report host):" -ForegroundColor Cyan
-        Write-Host "    python clixml_to_json.py `"$xmlFile`"" -ForegroundColor DarkCyan
-        Write-Host "  That produces ${hostname}-discovery-${dateStr}.json for the report generator." -ForegroundColor DarkGray
-        exit 0  # CLI-XML counts as success - data is recoverable
+        Write-Host "  Manual recovery (paste on this server):" -ForegroundColor Cyan
+        Write-Host "    `$d=Import-Clixml '$xmlFile'; `$d|ConvertTo-Json -Depth 20|Set-Content '$outputFile' -Encoding utf8" -ForegroundColor DarkCyan
+        exit 1
     }
-    exit 1
 }
 
 # -- VERIFY OUTPUT FILE EXISTS AND HAS CONTENT --------------------------------
