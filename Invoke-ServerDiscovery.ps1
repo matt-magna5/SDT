@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '3.9'
+$script:ScriptVersion  = '3.10'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -2034,13 +2034,40 @@ if ($json) {
         exit 1
     }
 } else {
-    Write-BuddyErr "Output" "All JSON serialization attempts failed. Last error: $jsonErr"
-    Write-Host "  Saving raw object dump as emergency fallback..." -ForegroundColor DarkYellow
+    Write-BuddyErr "Output" "ConvertTo-Json failed. Last error: $jsonErr"
+    Write-Host "  Falling back to CLI-XML (PowerShell native serializer - handles all .NET types)..." -ForegroundColor DarkYellow
+
+    # PRIMARY FALLBACK: CLI-XML (.clixml) - Export-Clixml handles every PS/.NET
+    # type including CIM objects with PSParameterizedProperty members. A Python
+    # converter (clixml_to_json.py) turns this back into the standard JSON
+    # schema so the report generator works unchanged.
+    $xmlFile = Join-Path $OutputPath "${hostname}-discovery-${dateStr}.clixml"
+    $xmlOK = $false
+    try {
+        Export-Clixml -InputObject $discoveryResult -Path $xmlFile -Depth 20 -Force -ErrorAction Stop
+        $xmlSize = (Get-Item $xmlFile -ErrorAction SilentlyContinue).Length
+        if ($xmlSize -gt 1000) {
+            Write-BuddyOK "CLI-XML saved: $xmlFile ($xmlSize bytes)"
+            $xmlOK = $true
+        }
+    } catch {
+        Write-BuddyWarn "CLI-XML export failed: $($_.Exception.Message)"
+    }
+
+    # Secondary fallback: dump Python-friendly primitive-only text
     try {
         $fallbackFile = Join-Path $OutputPath "discovery-error-$(Get-Date -f yyyyMMdd-HHmmss).txt"
         $discoveryResult | Out-File $fallbackFile -ErrorAction SilentlyContinue
-        Write-BuddyWarn "Emergency fallback saved: $fallbackFile"
+        Write-Host "  Human-readable dump also saved: $fallbackFile" -ForegroundColor DarkGray
     } catch { }
+
+    if ($xmlOK) {
+        Write-Host ""
+        Write-Host "  Next step (on your report host):" -ForegroundColor Cyan
+        Write-Host "    python clixml_to_json.py `"$xmlFile`"" -ForegroundColor DarkCyan
+        Write-Host "  That produces ${hostname}-discovery-${dateStr}.json for the report generator." -ForegroundColor DarkGray
+        exit 0  # CLI-XML counts as success - data is recoverable
+    }
     exit 1
 }
 
