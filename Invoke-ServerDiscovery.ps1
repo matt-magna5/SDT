@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '3.4'
+$script:ScriptVersion  = '3.5'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -55,25 +55,56 @@ $script:IsRemote = ($ComputerName -ne $env:COMPUTERNAME -and
                     $ComputerName -ne '127.0.0.1'         -and
                     $ComputerName -ne '.')
 
-# -- SILENT AUTO-UPDATE (ONLY WHEN RUNNING LOCALLY, NOT REMOTE) ----------------
-# Check GitHub for a newer tag. If newer, download and replace this script,
-# then re-launch from the updated copy. Silent on failure - never blocks.
+# -- AUTO-UPDATE (LOUD) --------------------------------------------------------
+# Check GitHub for a newer tag EVERY run. If newer, download, replace this
+# script, refresh detection rules, and re-launch. Prints status on every run
+# so failures are visible. Opt out: set $env:SDT_NO_AUTOUPDATE = '1'.
 function Invoke-SelfUpdate {
-    if ($script:IsRemote) { return }
-    if ($env:SDT_NO_AUTOUPDATE -eq '1') { return }
+    if ($script:IsRemote) {
+        Write-Host ("  [auto-update] skipped (remote mode)") -ForegroundColor DarkGray
+        return
+    }
+    if ($env:SDT_NO_AUTOUPDATE -eq '1') {
+        Write-Host ("  [auto-update] skipped (SDT_NO_AUTOUPDATE=1)") -ForegroundColor DarkGray
+        return
+    }
     if ($env:SDT_UPDATED_CHILD -eq '1') { return }   # prevent re-launch loop
+    Write-Host ("  [auto-update] checking GitHub for newer version (local v{0})..." -f $script:ScriptVersion) -ForegroundColor DarkCyan
+    $latest = $null
     try {
         $ProgressPreference = 'SilentlyContinue'
+        # Try releases API first (auth'd requests have higher limits; anon 60/hr)
         $resp = Invoke-WebRequest `
             -Uri 'https://api.github.com/repos/matt-magna5/SDT/releases/latest' `
-            -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
         $latest = ((($resp.Content | ConvertFrom-Json).tag_name) -replace '^v','').Trim()
-        if (-not $latest) { return }
-        try { $newer = ([version]$latest -gt [version]$script:ScriptVersion) } catch { return }
-        if (-not $newer) { return }
-
-        Write-Host ("  [auto-update] v{0} available (local v{1}) - updating..." -f $latest, $script:ScriptVersion) -ForegroundColor Yellow
-
+    } catch {
+        Write-Host ("  [auto-update] releases API failed: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+        # Fallback: probe common next-version zip URLs (covers rate-limit case)
+        try {
+            $cur = [version]$script:ScriptVersion
+            for ($minor = $cur.Minor + 1; $minor -lt $cur.Minor + 10; $minor++) {
+                $try = "{0}.{1}" -f $cur.Major, $minor
+                $zu  = "https://github.com/matt-magna5/SDT/archive/refs/tags/v$try.zip"
+                try {
+                    $h = Invoke-WebRequest -Uri $zu -Method Head -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                    if ($h.StatusCode -eq 200) { $latest = $try }
+                } catch { break }
+            }
+            if ($latest) { Write-Host ("  [auto-update] fallback found v{0}" -f $latest) -ForegroundColor DarkCyan }
+        } catch { }
+    }
+    if (-not $latest) {
+        Write-Host "  [auto-update] unable to determine latest version - proceeding with current" -ForegroundColor DarkYellow
+        return
+    }
+    try { $newer = ([version]$latest -gt [version]$script:ScriptVersion) } catch { $newer = $false }
+    if (-not $newer) {
+        Write-Host ("  [auto-update] up to date (v{0})" -f $script:ScriptVersion) -ForegroundColor DarkGreen
+        return
+    }
+    Write-Host ("  [auto-update] v{0} available (local v{1}) - downloading..." -f $latest, $script:ScriptVersion) -ForegroundColor Yellow
+    try {
         $zipUrl = "https://github.com/matt-magna5/SDT/archive/refs/tags/v$latest.zip"
         $zipTmp = Join-Path $env:TEMP "sdt-inv-update.zip"
         $extTmp = Join-Path $env:TEMP ("sdt-inv-upd-{0}-{1}" -f $latest, [guid]::NewGuid().ToString('N').Substring(0,6))
@@ -83,20 +114,16 @@ function Invoke-SelfUpdate {
         Remove-Item $zipTmp -Force -ErrorAction SilentlyContinue
 
         $srcDir = Get-ChildItem $extTmp -Directory | Select-Object -First 1
-        if (-not $srcDir) { return }
+        if (-not $srcDir) { throw "extracted folder not found" }
         $newInv = Join-Path $srcDir.FullName 'Invoke-ServerDiscovery.ps1'
-        if (-not (Test-Path $newInv)) { return }
-        # Validate size + version string
+        if (-not (Test-Path $newInv)) { throw "new Invoke-ServerDiscovery.ps1 not found in zip" }
         $size = (Get-Item $newInv).Length
         $body = Get-Content $newInv -Raw -ErrorAction SilentlyContinue
-        if ($size -lt 10240 -or $body -notmatch "ScriptVersion\s*=\s*'$latest'") {
-            Write-Host "  [auto-update] validation failed - skipping" -ForegroundColor DarkYellow
-            Remove-Item $extTmp -Recurse -Force -EA SilentlyContinue
-            return
-        }
+        if ($size -lt 10240) { throw "new file too small ($size bytes)" }
+        if ($body -notmatch "ScriptVersion\s*=\s*'$latest'") { throw "version string v$latest not present in downloaded script" }
+
         Copy-Item $newInv $PSCommandPath -Force
-        # Also refresh detection_rules.json + hardware_eol.json if present
-        foreach ($aux in @('detection_rules.json','hardware_eol.json')) {
+        foreach ($aux in @('detection_rules.json','hardware_eol.json','gen_report.py')) {
             $src = Join-Path $srcDir.FullName $aux
             $dst = Join-Path (Split-Path -Parent $PSCommandPath) $aux
             if (Test-Path $src) { Copy-Item $src $dst -Force }
@@ -106,10 +133,11 @@ function Invoke-SelfUpdate {
         Write-Host ("  [auto-update] updated to v{0} - re-launching..." -f $latest) -ForegroundColor Green
         $env:SDT_UPDATED_CHILD = '1'
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @PSBoundParameters
+        $ec = $LASTEXITCODE
         $env:SDT_UPDATED_CHILD = $null
-        exit $LASTEXITCODE
+        exit $ec
     } catch {
-        # Silent fail - never block the real work
+        Write-Host ("  [auto-update] update failed: {0} - running current v{1}" -f $_.Exception.Message, $script:ScriptVersion) -ForegroundColor Red
     }
 }
 Invoke-SelfUpdate
@@ -122,7 +150,6 @@ $localPSStr   = "$localPSMajor.$localPSMinor"
 
 # -- BANNER --------------------------------------------------------------------
 
-Clear-Host
 Write-Host ""
 Write-Host ("=" * 72) -ForegroundColor DarkMagenta
 Write-Host "  MAGNA5 SERVER DISCOVERY  v$script:ScriptVersion" -ForegroundColor Magenta
@@ -1696,9 +1723,8 @@ ORDER BY data_size_mb DESC
     }
 
     # Fix 7 -- ensure array fields are never $null (prevents JSON key omission on PS 3/4)
-    # Array fields: replace $null with @(); string fields: replace $null with ''
+    # NESTED array fields: section is a hashtable, inner field is a list.
     $arrayFields = @{
-        'Disks'    = @('Disks')
         'Network'  = @('Adapters','ListeningPorts','EstablishedConns')
         'Roles'    = @('InstalledRoles','InstalledFeatures')
         'AD'       = @('StaleUsers','StaleComputers','FSMORoles')
@@ -1713,17 +1739,19 @@ ORDER BY data_size_mb DESC
         'EventLog' = @('TopSources','RecentCritical')
     }
     foreach ($section in $arrayFields.Keys) {
-        if ($Discovery[$section]) {
+        $sec = $Discovery[$section]
+        # Only walk nested fields when the section is a dictionary. A plain
+        # array section (Disks, Apps, Tasks, ...) is handled separately below.
+        if ($sec -is [System.Collections.IDictionary]) {
             foreach ($field in $arrayFields[$section]) {
-                if ($null -eq $Discovery[$section][$field]) { $Discovery[$section][$field] = @() }
+                if ($null -eq $sec[$field]) { $sec[$field] = @() }
             }
         }
     }
-    # Top-level array sections returned directly (Apps, Tasks, Services, Printers)
-    if ($null -eq $Discovery.Apps)     { $Discovery.Apps     = @() }
-    if ($null -eq $Discovery.Tasks)    { $Discovery.Tasks    = @() }
-    if ($null -eq $Discovery.Services) { $Discovery.Services = @() }
-    if ($null -eq $Discovery.Printers) { $Discovery.Printers = @() }
+    # Top-level array sections returned directly (flat lists, no subkeys)
+    foreach ($topArr in @('Disks','Apps','Tasks','Services','Printers')) {
+        if ($null -eq $Discovery[$topArr]) { $Discovery[$topArr] = @() }
+    }
 
     return $Discovery
 }

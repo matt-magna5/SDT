@@ -27,7 +27,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $script:CredCacheFile = Join-Path $env:TEMP 'sdt-session-creds.xml'
-$script:SessionVersion  = '3.4'
+$script:SessionVersion  = '3.5'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
 $script:PendingInventories = [System.Collections.ArrayList]@()
@@ -662,18 +662,43 @@ function Invoke-DownloadWithProgress {
 # -----------------------------------------------------------------------------
 
 function Invoke-UpdateCheck {
+    if ($env:SDT_NO_AUTOUPDATE -eq '1') {
+        Write-Host "  [auto-update] skipped (SDT_NO_AUTOUPDATE=1)" -ForegroundColor DarkGray
+        return
+    }
+    Write-Host ("  [auto-update] checking GitHub for newer version (local v{0})..." -f $script:SessionVersion) -ForegroundColor DarkCyan
+    $latest = $null
     try {
         $ProgressPreference = 'SilentlyContinue'
         $resp = Invoke-WebRequest `
             -Uri 'https://api.github.com/repos/matt-magna5/SDT/releases/latest' `
-            -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
         $rel    = $resp.Content | ConvertFrom-Json
         $latest = ($rel.tag_name -replace '^v','').Trim()
-        if (-not $latest) { return }
+    } catch {
+        Write-Host ("  [auto-update] releases API failed: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+        try {
+            $cur = [version]$script:SessionVersion
+            for ($minor = $cur.Minor + 1; $minor -lt $cur.Minor + 10; $minor++) {
+                $try = "{0}.{1}" -f $cur.Major, $minor
+                $zu  = "https://github.com/matt-magna5/SDT/archive/refs/tags/v$try.zip"
+                try {
+                    $h = Invoke-WebRequest -Uri $zu -Method Head -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                    if ($h.StatusCode -eq 200) { $latest = $try }
+                } catch { break }
+            }
+            if ($latest) { Write-Host ("  [auto-update] fallback found v{0}" -f $latest) -ForegroundColor DarkCyan }
+        } catch { }
+    }
+    if (-not $latest) { Write-Host "  [auto-update] unable to determine latest - continuing" -ForegroundColor DarkYellow; return }
 
-        try { $newer = ([version]$latest -gt [version]$script:SessionVersion) } catch { return }
-        if (-not $newer) { return }
+    try { $newer = ([version]$latest -gt [version]$script:SessionVersion) } catch { $newer = $false }
+    if (-not $newer) {
+        Write-Host ("  [auto-update] up to date (v{0})" -f $script:SessionVersion) -ForegroundColor DarkGreen
+        return
+    }
 
+    try {
         Write-Host ""
         Write-Host ("  Update available: v{0}  (you have v{1}) - auto-applying..." -f $latest, $script:SessionVersion) -ForegroundColor Yellow
 
@@ -763,7 +788,7 @@ function Invoke-UpdateCheck {
         exit 0
 
     } catch {
-        # Silent fail - update check never blocks startup
+        Write-Host ("  [auto-update] failed: {0} - running current v{1}" -f $_.Exception.Message, $script:SessionVersion) -ForegroundColor Red
     }
 }
 
