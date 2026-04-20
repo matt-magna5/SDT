@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '3.8'
+$script:ScriptVersion  = '3.9'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -864,23 +864,41 @@ $CollectionBlock = {
             try { $result.UserCount     = (Get-ADUser     -Filter * -ErrorAction Stop).Count              } catch { }
             try { $result.ComputerCount = (Get-ADComputer -Filter * -ErrorAction Stop).Count              } catch { }
             try { $result.OUCount       = (Get-ADOrganizationalUnit -Filter * -ErrorAction Stop).Count    } catch { }
-            # Stale accounts (90 days inactive)
+            # Stale accounts (90 days inactive). CRITICAL: convert each result to
+            # a plain hashtable BEFORE it enters $result. AD module returns .NET
+            # types with PSParameterizedProperty indexer members that break JSON.
             try {
                 $cutoff = (Get-Date).AddDays(-90)
-                $staleUsers = Get-ADUser -Filter { LastLogonDate -lt $cutoff -and Enabled -eq $true } -Properties LastLogonDate -ErrorAction Stop |
-                    Select-Object Name, SamAccountName, @{N='LastLogon';E={$_.LastLogonDate}} |
-                    Select-Object -First 50
-                $result.StaleUsers = @($staleUsers)
-                if ($staleUsers.Count -gt 0) {
-                    cb-Flag 'warning' "Stale AD Accounts: $($staleUsers.Count)" "$($staleUsers.Count) enabled users haven't logged in for 90+ days. Review before migration."
+                $staleUsersRaw = Get-ADUser -Filter { LastLogonDate -lt $cutoff -and Enabled -eq $true } -Properties LastLogonDate -ErrorAction Stop | Select-Object -First 50
+                $staleUsersClean = @()
+                foreach ($u in $staleUsersRaw) {
+                    $ll = ''
+                    try { if ($u.LastLogonDate) { $ll = $u.LastLogonDate.ToString('yyyy-MM-dd HH:mm:ss') } } catch { }
+                    $staleUsersClean += @{
+                        Name           = [string]$u.Name
+                        SamAccountName = [string]$u.SamAccountName
+                        LastLogon      = $ll
+                    }
+                }
+                $result.StaleUsers = $staleUsersClean
+                if ($staleUsersClean.Count -gt 0) {
+                    cb-Flag 'warning' "Stale AD Accounts: $($staleUsersClean.Count)" "$($staleUsersClean.Count) enabled users haven't logged in for 90+ days. Review before migration."
                 }
             } catch { }
             try {
                 $cutoff = (Get-Date).AddDays(-90)
-                $staleComps = Get-ADComputer -Filter { LastLogonDate -lt $cutoff -and Enabled -eq $true } -Properties LastLogonDate -ErrorAction Stop |
-                    Select-Object Name, @{N='LastLogon';E={$_.LastLogonDate}} |
-                    Select-Object -First 50
-                $result.StaleComputers = @($staleComps)
+                $staleCompsRaw = Get-ADComputer -Filter { LastLogonDate -lt $cutoff -and Enabled -eq $true } -Properties LastLogonDate -ErrorAction Stop | Select-Object -First 50
+                $staleCompsClean = @()
+                foreach ($c in $staleCompsRaw) {
+                    $ll = ''
+                    try { if ($c.LastLogonDate) { $ll = $c.LastLogonDate.ToString('yyyy-MM-dd HH:mm:ss') } } catch { }
+                    $staleCompsClean += @{
+                        Name           = [string]$c.Name
+                        SamAccountName = [string]$c.SamAccountName
+                        LastLogon      = $ll
+                    }
+                }
+                $result.StaleComputers = $staleCompsClean
             } catch { }
         } catch {
             cb-Log "AD" "Outer error: $_"
