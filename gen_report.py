@@ -137,7 +137,8 @@ def jload(path):
     with open(path, encoding='utf-8-sig') as f:
         return json.load(f)
 
-inv = jload(os.path.join(SESSION_DIR, CFG['inventory_file']))
+_inv_file = CFG.get('inventory_file', '') or ''
+inv = jload(os.path.join(SESSION_DIR, _inv_file)) if _inv_file else {}
 
 # Auto-load all non-empty HV inventory files from the session directory
 hv_inventories = []
