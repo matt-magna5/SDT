@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '3.3'
+$script:ScriptVersion  = '3.4'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -352,9 +352,9 @@ $CollectionBlock = {
     $cbFlags  = [System.Collections.ArrayList]@()
 
     function cb-Log  { param([string]$ctx,[string]$msg) [void]$cbErrors.Add("[$ctx] $msg") }
-    function cb-Flag { param([string]$sev,[string]$title,[string]$detail) {
+    function cb-Flag { param([string]$sev,[string]$title,[string]$detail)
         [void]$cbFlags.Add([PSCustomObject]@{ Severity=$sev; Title=$title; Detail=$detail })
-    }}
+    }
 
     # PS version inside the target
     $PSMaj = $PSVersionTable.PSVersion.Major
