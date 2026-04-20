@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '2.0'
+$script:ScriptVersion  = '3.3'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -54,6 +54,65 @@ $script:IsRemote = ($ComputerName -ne $env:COMPUTERNAME -and
                     $ComputerName -ne 'localhost'         -and
                     $ComputerName -ne '127.0.0.1'         -and
                     $ComputerName -ne '.')
+
+# -- SILENT AUTO-UPDATE (ONLY WHEN RUNNING LOCALLY, NOT REMOTE) ----------------
+# Check GitHub for a newer tag. If newer, download and replace this script,
+# then re-launch from the updated copy. Silent on failure - never blocks.
+function Invoke-SelfUpdate {
+    if ($script:IsRemote) { return }
+    if ($env:SDT_NO_AUTOUPDATE -eq '1') { return }
+    if ($env:SDT_UPDATED_CHILD -eq '1') { return }   # prevent re-launch loop
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        $resp = Invoke-WebRequest `
+            -Uri 'https://api.github.com/repos/matt-magna5/SDT/releases/latest' `
+            -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        $latest = ((($resp.Content | ConvertFrom-Json).tag_name) -replace '^v','').Trim()
+        if (-not $latest) { return }
+        try { $newer = ([version]$latest -gt [version]$script:ScriptVersion) } catch { return }
+        if (-not $newer) { return }
+
+        Write-Host ("  [auto-update] v{0} available (local v{1}) - updating..." -f $latest, $script:ScriptVersion) -ForegroundColor Yellow
+
+        $zipUrl = "https://github.com/matt-magna5/SDT/archive/refs/tags/v$latest.zip"
+        $zipTmp = Join-Path $env:TEMP "sdt-inv-update.zip"
+        $extTmp = Join-Path $env:TEMP ("sdt-inv-upd-{0}-{1}" -f $latest, [guid]::NewGuid().ToString('N').Substring(0,6))
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipTmp -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        if (Test-Path $extTmp) { Remove-Item $extTmp -Recurse -Force -EA SilentlyContinue }
+        Expand-Archive $zipTmp $extTmp -Force
+        Remove-Item $zipTmp -Force -ErrorAction SilentlyContinue
+
+        $srcDir = Get-ChildItem $extTmp -Directory | Select-Object -First 1
+        if (-not $srcDir) { return }
+        $newInv = Join-Path $srcDir.FullName 'Invoke-ServerDiscovery.ps1'
+        if (-not (Test-Path $newInv)) { return }
+        # Validate size + version string
+        $size = (Get-Item $newInv).Length
+        $body = Get-Content $newInv -Raw -ErrorAction SilentlyContinue
+        if ($size -lt 10240 -or $body -notmatch "ScriptVersion\s*=\s*'$latest'") {
+            Write-Host "  [auto-update] validation failed - skipping" -ForegroundColor DarkYellow
+            Remove-Item $extTmp -Recurse -Force -EA SilentlyContinue
+            return
+        }
+        Copy-Item $newInv $PSCommandPath -Force
+        # Also refresh detection_rules.json + hardware_eol.json if present
+        foreach ($aux in @('detection_rules.json','hardware_eol.json')) {
+            $src = Join-Path $srcDir.FullName $aux
+            $dst = Join-Path (Split-Path -Parent $PSCommandPath) $aux
+            if (Test-Path $src) { Copy-Item $src $dst -Force }
+        }
+        Remove-Item $extTmp -Recurse -Force -EA SilentlyContinue
+
+        Write-Host ("  [auto-update] updated to v{0} - re-launching..." -f $latest) -ForegroundColor Green
+        $env:SDT_UPDATED_CHILD = '1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @PSBoundParameters
+        $env:SDT_UPDATED_CHILD = $null
+        exit $LASTEXITCODE
+    } catch {
+        # Silent fail - never block the real work
+    }
+}
+Invoke-SelfUpdate
 
 # -- PS VERSION & CAPABILITY PROBE ---------------------------------------------
 

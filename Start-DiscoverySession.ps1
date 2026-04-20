@@ -27,7 +27,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $script:CredCacheFile = Join-Path $env:TEMP 'sdt-session-creds.xml'
-$script:SessionVersion  = '3.0'
+$script:SessionVersion  = '3.3'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
 $script:PendingInventories = [System.Collections.ArrayList]@()
@@ -675,13 +675,7 @@ function Invoke-UpdateCheck {
         if (-not $newer) { return }
 
         Write-Host ""
-        Write-Host ("  Update available: v{0}  (you have v{1})" -f $latest, $script:SessionVersion) -ForegroundColor Yellow
-        $ans = (Read-Host "  Update now? [Y/N]").Trim().ToUpper()
-        if ($ans -ne 'Y') {
-            Write-Host "  Skipping update." -ForegroundColor DarkGray
-            Write-Host ""
-            return
-        }
+        Write-Host ("  Update available: v{0}  (you have v{1}) - auto-applying..." -f $latest, $script:SessionVersion) -ForegroundColor Yellow
 
         $zipUrl = "https://github.com/matt-magna5/SDT/archive/refs/tags/v$latest.zip"
         $zipTmp = Join-Path $env:TEMP "sdt-update.zip"
