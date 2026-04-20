@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '3.5'
+$script:ScriptVersion  = '3.6'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -1876,11 +1876,20 @@ function ConvertTo-SafeObject {
     if ($Obj -is [System.Management.Automation.PSObject]) {
         $h = [ordered]@{}
         foreach ($prop in $Obj.PSObject.Properties) {
-            try { $h[$prop.Name] = ConvertTo-SafeObject $prop.Value ($Depth+1) } catch { $h[$prop.Name] = $null }
+            # Skip indexer-style properties (e.g. Item[int] on CIM/WMI objects).
+            # ConvertTo-Json can't serialize them and they cause circular walks.
+            if ($prop -is [System.Management.Automation.PSParameterizedProperty]) { continue }
+            if ($prop.MemberType -eq 'ParameterizedProperty') { continue }
+            # Skip known noisy / circular-prone property names from CIM/WMI/AD
+            if ($prop.Name -in @('PSAdapted','PSBase','PSObject','PSComputerName','PSShowComputerName','CimClass','CimInstanceProperties','CimSystemProperties','SyncRoot','Site','Parent','SubFeatures','ParentFeature','PropertyNames')) { continue }
+            $v = $null
+            try { $v = $prop.Value } catch { continue }
+            try { $h[$prop.Name] = ConvertTo-SafeObject $v ($Depth+1) } catch { $h[$prop.Name] = $null }
         }
         return $h
     }
-    return $Obj.ToString()
+    # Last-resort string conversion with guard
+    try { return $Obj.ToString() } catch { return $null }
 }
 
 Write-BuddyPhase "Output" "assembling and saving JSON..."
