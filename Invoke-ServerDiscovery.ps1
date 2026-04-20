@@ -149,10 +149,10 @@ function Write-BuddyPhase {
 
 function Write-BuddyOK   { param([string]$msg) Write-Host ("  (^_^)  $msg") -ForegroundColor DarkGreen  }
 function Write-BuddyWarn { param([string]$msg) Write-Host ("  (>_<)  $msg") -ForegroundColor DarkYellow }
-function Write-BuddyErr  { param([string]$ctx, [string]$msg) {
+function Write-BuddyErr  { param([string]$ctx, [string]$msg)
     Write-Host ("  (x_x)  [$ctx] $msg") -ForegroundColor DarkRed
     [void]$script:CollectErrors.Add("[$ctx] $msg")
-}}
+}
 
 # -- REMOTE PREFLIGHT ----------------------------------------------------------
 
