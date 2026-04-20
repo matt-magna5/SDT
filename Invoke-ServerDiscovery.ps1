@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '3.7'
+$script:ScriptVersion  = '3.8'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -1954,6 +1954,34 @@ $outputFile = Join-Path $OutputPath $filename
 # hashtables/arrays/primitives so ConvertTo-Json never walks into circular graphs.
 Write-Host "  Sanitizing result object..." -ForegroundColor DarkGray
 $safeResult = ConvertTo-SafeObject $discoveryResult
+
+# Second pass: strict allow-list. Only null/string/bool/numeric/hashtable/array
+# survive. Anything else gets stringified. If the first pass missed an exotic
+# type (PSParameterizedProperty, CimClass, etc.) this pass guarantees JSON-safe.
+function Invoke-StrictSanitize {
+    param($Obj, [int]$Depth = 0)
+    if ($Depth -gt 30) { return '[deep]' }
+    if ($null -eq $Obj) { return $null }
+    if ($Obj -is [string] -or $Obj -is [bool]) { return $Obj }
+    if ($Obj -is [int] -or $Obj -is [long] -or $Obj -is [double] -or $Obj -is [decimal] -or $Obj -is [single] -or $Obj -is [byte]) { return $Obj }
+    if ($Obj -is [datetime]) { return $Obj.ToString('yyyy-MM-dd HH:mm:ss') }
+    if ($Obj -is [System.Collections.IDictionary]) {
+        $h = [ordered]@{}
+        foreach ($k in @($Obj.Keys)) {
+            try { $h["$k"] = Invoke-StrictSanitize $Obj[$k] ($Depth+1) } catch { $h["$k"] = $null }
+        }
+        return $h
+    }
+    if ($Obj -is [System.Collections.IEnumerable]) {
+        $a = [System.Collections.ArrayList]@()
+        foreach ($i in $Obj) {
+            try { [void]$a.Add((Invoke-StrictSanitize $i ($Depth+1))) } catch { [void]$a.Add($null) }
+        }
+        return ,$a
+    }
+    try { return [string]$Obj } catch { return $null }
+}
+$safeResult = Invoke-StrictSanitize $safeResult
 
 # Serialize to JSON
 $json = $null
