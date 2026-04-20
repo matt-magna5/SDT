@@ -27,7 +27,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $script:CredCacheFile = Join-Path $env:TEMP 'sdt-session-creds.xml'
-$script:SessionVersion  = '3.6'
+$script:SessionVersion  = '3.7'
 $script:SessionStart    = Get-Date
 $script:WinRMRestoreMap = @{}
 $script:PendingInventories = [System.Collections.ArrayList]@()

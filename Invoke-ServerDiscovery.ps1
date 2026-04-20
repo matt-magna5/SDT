@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '3.6'
+$script:ScriptVersion  = '3.7'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -1853,6 +1853,26 @@ function ConvertTo-SafeObject {
     if ($Obj -is [bool])        { return $Obj }
     if ($Obj -is [datetime])    { return $Obj.ToString('yyyy-MM-dd HH:mm:ss') }
     if ($Obj -is [System.Enum]) { return $Obj.ToString() }
+    # PS metadata objects - never recurse into these, they carry self-refs
+    $typeName = ''
+    try { $typeName = $Obj.GetType().FullName } catch {}
+    if ($typeName -match 'System\.Management\.Automation\.PS(Parameterized|Method|Event|DynamicMember)') {
+        return '[ps-member]'
+    }
+    # CIM/WMI instances - extract only the property bag, ignore metadata
+    if ($typeName -match 'Microsoft\.Management\.Infrastructure\.CimInstance' -or
+        $typeName -match 'System\.Management\.ManagementBaseObject') {
+        $h = [ordered]@{}
+        try {
+            foreach ($p in $Obj.CimInstanceProperties) {
+                try { $h[$p.Name] = ConvertTo-SafeObject $p.Value ($Depth+1) } catch { $h[$p.Name] = $null }
+            }
+        } catch {
+            # Fall back to dict-like enumeration
+            try { foreach ($k in $Obj.Keys) { $h["$k"] = ConvertTo-SafeObject $Obj[$k] ($Depth+1) } } catch { }
+        }
+        return $h
+    }
     $t = $Obj.GetType()
     if ($t.IsPrimitive -or $t.IsValueType) { return $Obj }
     # Unwrap PSObject so we operate on the base
@@ -1905,6 +1925,11 @@ if (-not $discoveryResult) {
 foreach ($e in $script:CollectErrors) {
     try { $discoveryResult.Errors.Add($e) | Out-Null } catch { }
 }
+
+# Guard: $OutputPath might be empty if the script was re-launched via splatting
+# with no bound params. Fall back to the script directory, then cwd.
+if (-not $OutputPath) { $OutputPath = $PSScriptRoot }
+if (-not $OutputPath) { $OutputPath = (Get-Location).Path }
 
 # Validate output path exists before attempting write
 if (-not (Test-Path $OutputPath)) {
