@@ -36,19 +36,24 @@ Say ""
 # ----- Resolve latest tag ----------------------------------------------------
 if ($Version -eq 'latest') {
     Say "Resolving latest release..." DarkCyan
+    $Version = $null
+    # Query /releases (not /latest) so prereleases/alphas are included.
     try {
-        $rel = Invoke-WebRequest 'https://api.github.com/repos/matt-magna5/SDT/releases/latest' -UseBasicParsing -TimeoutSec 10
-        $Version = ($rel.Content | ConvertFrom-Json).tag_name
+        $rel = Invoke-WebRequest 'https://api.github.com/repos/matt-magna5/SDT/releases?per_page=20' -UseBasicParsing -TimeoutSec 10
+        $tags = ($rel.Content | ConvertFrom-Json) | ForEach-Object { $_.tag_name }
+        # Prefer tags that contain Start-DiscoverySessionGUI.ps1 (v4+). Sort by creation order (first = newest).
+        $guiTag = $tags | Where-Object { $_ -match '^v4' -or $_ -match 'alpha' -or $_ -match 'beta' } | Select-Object -First 1
+        if ($guiTag) { $Version = $guiTag } else { $Version = $tags[0] }
     } catch {
         Say "Releases API failed: $($_.Exception.Message)" Yellow
-        for ($minor = 15; $minor -ge 0; $minor--) {
-            $try = "v3.$minor"
+        # Probe fallback
+        foreach ($try in @('v4.0-alpha','v3.11','v3.10','v3.9','v3.8')) {
             try {
                 $h = Invoke-WebRequest "https://github.com/matt-magna5/SDT/archive/refs/tags/$try.zip" -Method Head -UseBasicParsing -TimeoutSec 5
                 if ($h.StatusCode -eq 200) { $Version = $try; break }
             } catch { continue }
         }
-        if (-not $Version -or $Version -eq 'latest') { throw "Could not determine SDT version" }
+        if (-not $Version) { throw "Could not determine SDT version" }
     }
     Say "Version: $Version" DarkGreen
 }
