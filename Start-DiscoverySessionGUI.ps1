@@ -141,6 +141,16 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 .footer{text-align:center;padding:30px 0 10px;color:var(--dim);font-size:11px;}
 .callout{background:rgba(245,158,11,0.08);border-left:3px solid var(--warn);padding:10px 14px;
   border-radius:6px;font-size:12px;color:#fcd34d;margin:12px 0;}
+.hint{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
+  background:var(--elevated-2);color:var(--muted);font-size:10px;font-weight:700;margin-left:8px;cursor:help;
+  border:1px solid var(--border-2);vertical-align:middle;user-select:none;position:relative;}
+.hint:hover{background:var(--accent);color:#fff;border-color:var(--accent);}
+.hint::after{content:attr(data-tip);position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);
+  background:#0b1220;color:var(--text);border:1px solid var(--border-2);border-radius:8px;padding:10px 14px;
+  font-size:11.5px;font-weight:500;white-space:normal;width:280px;text-align:left;line-height:1.5;letter-spacing:.1px;
+  box-shadow:0 8px 24px rgba(0,0,0,.35);opacity:0;pointer-events:none;transition:opacity .15s;z-index:150;}
+.hint:hover::after{opacity:1;}
+.hint.right::after{left:auto;right:-8px;transform:none;}
 .banner-run{background:linear-gradient(125deg,rgba(79,140,255,0.18) 0%,rgba(139,92,246,0.14) 100%);
   border:1px solid var(--border-2);border-radius:14px;padding:20px 24px;margin-bottom:18px;
   display:flex;justify-content:space-between;align-items:center;}
@@ -149,6 +159,15 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 </style></head><body>
 <div class="hdr">
   <div style="display:flex;align-items:center;gap:14px;">
+    <!-- M5 logo mark -->
+    <svg width="34" height="34" viewBox="0 0 34 34" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0;">
+      <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#4F8CFF"/>
+        <stop offset="100%" stop-color="#8B5CF6"/>
+      </linearGradient></defs>
+      <rect x="1" y="1" width="32" height="32" rx="8" fill="url(#lg)"/>
+      <text x="17" y="22" text-anchor="middle" font-family="Segoe UI Variable Display, Segoe UI, system-ui" font-size="13" font-weight="700" fill="#fff" letter-spacing="-0.5">M5</text>
+    </svg>
     <div class="brand">MAGNA5</div>
     <div style="color:var(--dim);">/</div>
     <div class="sub">SDT - Discovery Session</div>
@@ -167,44 +186,71 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 <form id="setupForm" onsubmit="submitSetup(event)">
 
 <div class="card">
-<div class="card-title">Session</div>
+<div class="card-title">Session <span class="hint" data-tip="Client name appears in the final HTML report header. Output folder is where every JSON, log, and final report for this discovery run gets written.">i</span></div>
 <div class="card-sub">Client name and output folder. Credentials live in memory only - never saved to disk.</div>
 <div class="grid2">
-<div class="field"><label>Client name</label>
+<div class="field"><label>Client name <span class="hint" data-tip="Appears in the report header. Use the sales-facing name (e.g. Acme Corporation).">i</span></label>
 <input name="client" required placeholder="Acme Corporation"></div>
-<div class="field"><label>Output folder</label>
+<div class="field"><label>Output folder <span class="hint" data-tip="Discovery JSONs + HTML report land here. Default is fine; a per-client subfolder is created automatically.">i</span></label>
 <input name="outputDir" value="C:\Temp\sdt\sessions" required></div>
 </div>
 </div>
 
 <div class="card">
-<div class="card-title">Hypervisor (optional)</div>
-<div class="card-sub">Connect to vCenter or an ESXi host to pull VM inventory. Leave "None" if targeting bare metal only.</div>
+<div class="card-title">Hypervisor (optional) <span class="hint" data-tip="Hit 'Scan Hypervisor' to connect, list every VM, and tick which ones to collect Windows data from. Skip this whole section if you're running against bare-metal servers only.">i</span></div>
+<div class="card-sub">Connect to vCenter or an ESXi host. Hit <strong>Scan Hypervisor</strong> to discover VMs, then tick which ones to collect Windows data from. Or leave "None" for bare-metal-only runs.</div>
 <div class="grid3">
-<div class="field"><label>Type</label>
+<div class="field"><label>Type <span class="hint" data-tip="vCenter/ESXi uses the vSphere SOAP API (works against both). Hyper-V is stubbed for now. 'None' skips hypervisor inventory entirely.">i</span></label>
 <select name="hvType"><option value="none">None</option><option value="vsphere">vCenter / ESXi</option><option value="hyperv">Hyper-V Host</option></select></div>
-<div class="field"><label>IP / FQDN</label>
+<div class="field"><label>IP / FQDN <span class="hint" data-tip="Hostname or IP of your vCenter server (or single ESXi host). Port 443 must be reachable.">i</span></label>
 <input name="hvHost" placeholder="192.168.10.75"></div>
-<div class="field"><label>User</label>
+<div class="field"><label>User <span class="hint" data-tip="vCenter SSO account (e.g. administrator@vsphere.local) or local ESXi root. Needs read access to inventory + perf counters.">i</span></label>
 <input name="hvUser" placeholder="administrator@vsphere.local"></div>
 </div>
-<div class="field"><label>Password</label>
+<div class="grid2">
+<div class="field"><label>Password <span class="hint" data-tip="Password for the hypervisor account. Held in memory only for this session.">i</span></label>
 <input name="hvPass" type="password" autocomplete="off"></div>
+<div class="field" style="display:flex;align-items:flex-end;">
+<button type="button" class="btn btn-secondary" id="scanHvBtn" onclick="scanHv()">Scan Hypervisor</button>
+</div>
+</div>
+<div id="scanStatus" style="margin-top:10px;font-size:12px;color:var(--muted);"></div>
+</div>
+
+<!-- Discovered VMs (appears after hypervisor scan) -->
+<div class="card" id="discoveredCard" style="display:none;">
+<div class="card-title">Discovered VMs <span class="hint" data-tip="Every VM found on the hypervisor. Ticked rows get per-server WinRM/Windows discovery in addition to the HV inventory. Use the Filter input to narrow by name, IP, or OS.">i</span></div>
+<div class="card-sub">Tick rows to include in per-server Windows discovery. Linux / appliance / vCenter boxes are auto-unchecked.</div>
+<div style="display:flex;gap:10px;align-items:center;margin:10px 0;">
+<input id="vmFilter" placeholder="Filter by name, IP, OS..." oninput="renderVmTable()" style="flex:1;">
+<button type="button" class="btn btn-secondary" onclick="toggleAllVms(true)">Select all</button>
+<button type="button" class="btn btn-secondary" onclick="toggleAllVms(false)">Clear</button>
+</div>
+<div id="vmTableWrap" style="max-height:360px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;">
+<table class="dt" id="vmTable" style="width:100%;font-size:12.5px;"><thead><tr>
+<th style="width:40px;text-align:center;padding:8px 10px;"><input type="checkbox" id="vmAllCbx" onclick="toggleAllVms(this.checked)"></th>
+<th style="padding:8px 10px;">Name</th>
+<th style="padding:8px 10px;">IP</th>
+<th style="padding:8px 10px;">Guest OS</th>
+<th style="padding:8px 10px;">Power</th>
+</tr></thead><tbody id="vmTableBody"></tbody></table>
+</div>
+<div id="vmCount" style="font-size:11px;color:var(--muted);margin-top:8px;">0 VMs discovered</div>
 </div>
 
 <div class="card">
-<div class="card-title">Windows Targets</div>
-<div class="card-sub">One host per line. IP or hostname. Script attempts remote discovery over WinRM; falls back to a local run if unreachable.
+<div class="card-title">Windows Targets (manual additions) <span class="hint" data-tip="Only needed for hosts that aren't in the hypervisor scan above - e.g. physical boxes, DMZ VMs, or anything the hypervisor can't see. Leave blank if everything's in the HV.">i</span></div>
+<div class="card-sub">Hosts not in the hypervisor above. One per line. IP or hostname. Leave blank if HV scan covers everything.
 <br>Example: <code style="font-family:var(--mono);color:var(--info);">192.168.10.4</code> or <code style="font-family:var(--mono);color:var(--info);">QES-OFFICE-DC</code></div>
-<div class="field"><label>Targets</label>
-<textarea name="targets" placeholder="192.168.10.4&#10;192.168.10.5&#10;QES-OFFICE-MGMT"></textarea></div>
+<div class="field"><label>Manual targets <span class="hint" data-tip="One host per line. IP or hostname. The script will try remote WinRM first; if that fails, you'll see an error row in the Run tab.">i</span></label>
+<textarea name="targets" placeholder="Optional - only if a host isn't in the HV"></textarea></div>
 
-<div class="section-hdr">Admin credentials</div>
+<div class="section-hdr">Admin credentials <span class="hint" data-tip="Used to remotely sign in to every ticked VM + every manual target. Needs WinRM remoting permissions (domain admin works; local admin works for workgroup hosts).">i</span></div>
 <div class="card-sub" style="margin-bottom:10px;">Domain admin or local admin that can log into the target hosts. Held in memory only - never written to disk.</div>
 <div class="grid2">
-<div class="field"><label>Domain / Local admin</label>
+<div class="field"><label>Domain / Local admin <span class="hint" data-tip="Format: DOMAIN\\username for a domain admin, or .\\username for a local admin on workgroup hosts.">i</span></label>
 <input name="winrmUser" placeholder="DOMAIN\administrator or .\administrator"></div>
-<div class="field"><label>Password</label>
+<div class="field"><label>Password <span class="hint" data-tip="Password for the admin account. Held in memory only for this session - no file, no registry, no persistence.">i</span></label>
 <input name="winrmPass" type="password" autocomplete="off"></div>
 </div>
 <div class="callout">
@@ -255,7 +301,12 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 </div>
 </div>
 
-<div class="footer">Magna5 Solutions Engineering - SDT GUI v__VERSION__</div>
+<div class="footer" style="line-height:1.8;">
+  <div style="font-weight:600;color:var(--muted);">Intellectual property of Magna5, Inc. &middot; All rights reserved.</div>
+  <div>Written by <strong style="color:var(--text);">Matthew Kelly</strong> &middot; Magna5 Solutions Engineering</div>
+  <div>Questions: <a href="mailto:matthew.kelly@magna5.com" style="color:var(--accent);">matthew.kelly@magna5.com</a></div>
+  <div style="margin-top:6px;color:var(--dim);">SDT GUI v__VERSION__</div>
+</div>
 </div>
 
 <script>
@@ -264,11 +315,111 @@ function setTab(t){
   document.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active', p.id==='tab-'+t));
 }
 
+// Holds the last hypervisor scan result so submit can pass checked VMs.
+window._discoveredVMs = [];
+
+function getHvFields(){
+  const form = document.getElementById('setupForm');
+  const fd = new FormData(form);
+  return {
+    hvType: fd.get('hvType') || 'none',
+    hvHost: (fd.get('hvHost')||'').trim(),
+    hvUser: (fd.get('hvUser')||'').trim(),
+    hvPass: fd.get('hvPass') || ''
+  };
+}
+
+async function scanHv(){
+  const btn = document.getElementById('scanHvBtn');
+  const status = document.getElementById('scanStatus');
+  const hv = getHvFields();
+  if (hv.hvType === 'none') { alert('Pick a hypervisor type first.'); return; }
+  if (!hv.hvHost || !hv.hvUser || !hv.hvPass) { alert('Hypervisor host, user, and password required.'); return; }
+
+  btn.disabled = true; btn.textContent = 'Scanning...';
+  status.style.color = 'var(--muted)';
+  status.textContent = 'Connecting to ' + hv.hvHost + '. This can take 30-60 seconds for a mid-size vCenter...';
+
+  try {
+    const resp = await fetch('/api/hv-scan', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(hv)
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) { throw new Error(data.error || 'scan failed'); }
+
+    window._discoveredVMs = (data.vms || []).map(v => ({...v, _checked: isWinVM(v)}));
+    document.getElementById('discoveredCard').style.display = '';
+    renderVmTable();
+    status.style.color = 'var(--ok)';
+    status.textContent = 'Scanned ' + window._discoveredVMs.length + ' VMs. Tick the ones to include in Windows discovery below.';
+  } catch(err) {
+    status.style.color = 'var(--crit)';
+    status.textContent = 'Scan failed: ' + err.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Scan Hypervisor';
+  }
+}
+
+function isWinVM(v){
+  const os = (v.GuestOS || v.guestOs || '').toLowerCase();
+  const nm = (v.Name || v.name || '').toLowerCase();
+  // Uncheck Linux, Photon, vCenter appliances, and anything with 'vcsa'/'vcenter' in the name
+  if (/linux|photon|ubuntu|debian|centos|redhat|bsd|coreos/.test(os)) return false;
+  if (/vcsa|vcenter|esxi\b/.test(nm)) return false;
+  return true;
+}
+
+function renderVmTable(){
+  const tbody = document.getElementById('vmTableBody');
+  const count = document.getElementById('vmCount');
+  const filter = (document.getElementById('vmFilter').value || '').toLowerCase();
+  const vms = window._discoveredVMs || [];
+  const filtered = vms.filter(v => {
+    if (!filter) return true;
+    const hay = [v.Name, v.name, v.IPs, v.ips, v.GuestOS, v.guestOs, v.PowerState, v.powerState].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(filter);
+  });
+  tbody.innerHTML = filtered.map((v, i) => {
+    const nm  = v.Name || v.name || '';
+    const ip  = v.IPs || v.ips || '';
+    const os  = v.GuestOS || v.guestOs || '';
+    const ps  = v.PowerState || v.powerState || '';
+    const idx = vms.indexOf(v);
+    const powCls = /on|POWERED_ON/i.test(ps) ? 'ok' : 'neutral';
+    return `<tr>
+      <td style="text-align:center;padding:6px 10px;"><input type="checkbox" data-vm-idx="${idx}" ${v._checked ? 'checked':''} onchange="window._discoveredVMs[${idx}]._checked=this.checked;updateVmCount();"></td>
+      <td style="padding:6px 10px;font-family:var(--mono);font-weight:600;">${escapeHtml(nm)}</td>
+      <td style="padding:6px 10px;font-family:var(--mono);font-size:11px;">${escapeHtml(ip)}</td>
+      <td style="padding:6px 10px;font-size:11.5px;color:var(--muted);">${escapeHtml(os)}</td>
+      <td style="padding:6px 10px;"><span class="pill ${powCls}"><span class="dot"></span>${escapeHtml(ps)}</span></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="5" style="color:var(--muted);padding:14px;text-align:center;">No matches.</td></tr>';
+  updateVmCount();
+}
+
+function updateVmCount(){
+  const vms = window._discoveredVMs || [];
+  const checked = vms.filter(v => v._checked).length;
+  document.getElementById('vmCount').textContent = checked + ' of ' + vms.length + ' selected';
+}
+
+function toggleAllVms(on){
+  (window._discoveredVMs || []).forEach(v => v._checked = !!on);
+  renderVmTable();
+}
+
 async function submitSetup(e){
   e.preventDefault();
   const form = document.getElementById('setupForm');
   const data = Object.fromEntries(new FormData(form).entries());
-  data.targets = (data.targets||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  // Start with manual targets
+  let targets = (data.targets||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  // Add checked VMs (prefer IP, fall back to hostname)
+  const checked = (window._discoveredVMs || []).filter(v => v._checked);
+  const vmTargets = checked.map(v => (v.IPs || v.ips || v.Name || v.name || '').toString().split(',')[0].trim()).filter(Boolean);
+  targets = Array.from(new Set([...targets, ...vmTargets]));
+  data.targets = targets;
 
   const btn = form.querySelector('button[type="submit"]');
   btn.disabled = true; btn.textContent = 'Starting...';
@@ -439,11 +590,37 @@ function Start-DiscoveryRun {
     $hvType = "$($Payload.hvType)"
     $hvHost = "$($Payload.hvHost)"
     if ($hvType -and $hvType -ne 'none' -and $hvHost) {
+        $alreadyScanned = $script:Session.HvStagingFile -and (Test-Path $script:Session.HvStagingFile)
         $hvRow = [ordered]@{
-            Name="$hvType`: $hvHost"; Address=$hvHost; State='pending'; Phase='queued'; Buddy=''; Started=$null; Finished=$null; Kind='hypervisor'; HvType=$hvType
+            Name="$hvType`: $hvHost"
+            Address=$hvHost
+            State='pending'
+            Phase=$(if ($alreadyScanned) { 'inventory already scanned' } else { 'queued' })
+            Buddy=''
+            Started=$null
+            Finished=$null
+            Kind='hypervisor'
+            HvType=$hvType
+            AlreadyScanned=$alreadyScanned
         }
         # Prepend
         $script:Session.Targets = @($hvRow) + @($script:Session.Targets)
+        # If we already scanned, move the staging file into the session dir NOW
+        if ($alreadyScanned) {
+            try {
+                $destName = Split-Path -Leaf $script:Session.HvStagingFile
+                $dest = Join-Path $sessionDir $destName
+                Move-Item -Path $script:Session.HvStagingFile -Destination $dest -Force
+                if ($script:Session.HvStagingDir -and (Test-Path $script:Session.HvStagingDir)) {
+                    Remove-Item $script:Session.HvStagingDir -Recurse -Force -EA SilentlyContinue
+                }
+                $script:Session.HvStagingFile = ''
+                $script:Session.HvStagingDir = ''
+                Add-Log "Hypervisor inventory moved into session from prior scan: $destName"
+            } catch {
+                Add-Log "Failed to move staged HV inventory: $($_.Exception.Message)"
+            }
+        }
     }
 
     # Kick off the worker scriptblock in a runspace so the HTTP listener stays responsive.
@@ -487,7 +664,15 @@ function Start-DiscoveryRun {
 
             try {
                 if ($t.Kind -eq 'hypervisor') {
-                    # Hypervisor discovery via collect_vsphere_perf.py
+                    # If already scanned during Setup, we already moved the file - mark done and skip
+                    if ($t.AlreadyScanned) {
+                        $t.State = 'done'
+                        $t.Phase = 'reused scan from setup'
+                        $t.Finished = (Get-Date).ToString('HH:mm:ss')
+                        $Session.Targets[$i] = $t
+                        continue
+                    }
+                    # Otherwise do a fresh hypervisor discovery via collect_vsphere_perf.py
                     $hvScript = Join-Path $ScriptDir 'collect_vsphere_perf.py'
                     if (-not (Test-Path $hvScript)) { throw "vSphere collector not found at $hvScript" }
                     $t.Phase = 'connecting to vCenter/ESXi'
@@ -667,6 +852,63 @@ try {
                         Targets    = @($script:Session.Targets)
                         LogTail    = @($script:Session.LogTail)
                         ReportPath = $script:Session.ReportPath
+                    }
+                    break
+                }
+                '^POST /api/hv-scan$' {
+                    $body = Read-RequestBody -Request $req
+                    $hv = $null
+                    try { $hv = $body | ConvertFrom-Json -ErrorAction Stop } catch {
+                        Send-Json -Response $resp -Data @{ ok=$false; error="JSON parse failed" } -StatusCode 400
+                        break
+                    }
+                    if (-not $hv.hvHost -or -not $hv.hvUser -or -not $hv.hvPass) {
+                        Send-Json -Response $resp -Data @{ ok=$false; error="hvHost, hvUser, hvPass required" } -StatusCode 400
+                        break
+                    }
+                    # Scan into a temp staging dir so we don't commit to a session folder yet
+                    $stageDir = Join-Path $env:TEMP ("sdt-hvscan-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+                    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+                    try {
+                        $hvScript = Join-Path $script:ScriptDir 'collect_vsphere_perf.py'
+                        if (-not (Test-Path $hvScript)) { throw "collect_vsphere_perf.py not found" }
+                        $pyExe = Join-Path $script:ScriptDir 'python\python.exe'
+                        if (-not (Test-Path $pyExe)) {
+                            $getPy = Join-Path $script:ScriptDir 'Get-PortablePython.ps1'
+                            if (Test-Path $getPy) { try { & $getPy 2>&1 | Out-Null } catch {} }
+                        }
+                        if (-not (Test-Path $pyExe)) { $pyExe = 'python' }
+                        $pyArgs = @(
+                            $hvScript,
+                            '--vcenter', "$($hv.hvHost)",
+                            '--user',    "$($hv.hvUser)",
+                            '--pass',    "$($hv.hvPass)",
+                            '--output',  "$stageDir"
+                        )
+                        $out = & $pyExe $pyArgs 2>&1 | Out-String
+                        $outFile = Get-ChildItem $stageDir -Filter 'vsphere-perf-*.json' -EA 0 | Select-Object -First 1
+                        if (-not $outFile) {
+                            Send-Json -Response $resp -Data @{ ok=$false; error="Collector produced no output. Check credentials / reachability."; log=$out } -StatusCode 500
+                            break
+                        }
+                        $raw = [System.IO.File]::ReadAllText($outFile.FullName, [System.Text.Encoding]::UTF8)
+                        $doc = $raw | ConvertFrom-Json
+                        # Remember staging so /api/start can move it into the final session dir
+                        $script:Session.HvStagingFile = $outFile.FullName
+                        $script:Session.HvStagingDir  = $stageDir
+                        # Shape VMs for UI
+                        $vms = @()
+                        foreach ($v in $doc.VMs) {
+                            $vms += @{
+                                Name       = $v.Name
+                                IPs        = $v.IPs
+                                GuestOS    = $v.GuestOS
+                                PowerState = $v.PowerState
+                            }
+                        }
+                        Send-Json -Response $resp -Data @{ ok=$true; vms=$vms; count=$vms.Count; stagingFile=$outFile.FullName }
+                    } catch {
+                        Send-Json -Response $resp -Data @{ ok=$false; error=$_.Exception.Message } -StatusCode 500
                     }
                     break
                 }
