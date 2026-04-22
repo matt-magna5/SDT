@@ -464,8 +464,17 @@ function Start-DiscoveryRun {
             $cred = New-Object System.Management.Automation.PSCredential($winrmUser, $sec)
         }
 
-        # Pick Python (portable if present, fall back to system)
+        # Pick Python. Prefer portable Python the SDT ships; auto-fetch if missing
+        # (only when a hypervisor target is present, since that's the only thing
+        # that needs Python right now).
         $pyExe = Join-Path $ScriptDir 'python\python.exe'
+        $needPy = $Session.Targets | Where-Object { $_.Kind -eq 'hypervisor' } | Select-Object -First 1
+        if ($needPy -and -not (Test-Path $pyExe)) {
+            $getPy = Join-Path $ScriptDir 'Get-PortablePython.ps1'
+            if (Test-Path $getPy) {
+                try { & $getPy 2>&1 | Out-Null } catch { }
+            }
+        }
         if (-not (Test-Path $pyExe)) { $pyExe = 'python' }
 
         for ($i = 0; $i -lt $Session.Targets.Count; $i++) {
@@ -481,10 +490,16 @@ function Start-DiscoveryRun {
                     # Hypervisor discovery via collect_vsphere_perf.py
                     $hvScript = Join-Path $ScriptDir 'collect_vsphere_perf.py'
                     if (-not (Test-Path $hvScript)) { throw "vSphere collector not found at $hvScript" }
-                    $hvOut = Join-Path $Session.SessionDir ("{0}-inventory-{1}.json" -f $t.Address, (Get-Date -f 'yyyy-MM-dd'))
                     $t.Phase = 'connecting to vCenter/ESXi'
                     $Session.Targets[$i] = $t
-                    $pyArgs = @($hvScript, '--host', $t.Address, '--user', "$($Payload.hvUser)", '--password', "$($Payload.hvPass)", '--out', $hvOut)
+                    # Correct CLI: --vcenter / --user / --pass / --output (directory)
+                    $pyArgs = @(
+                        $hvScript,
+                        '--vcenter', "$($t.Address)",
+                        '--user',    "$($Payload.hvUser)",
+                        '--pass',    "$($Payload.hvPass)",
+                        '--output',  "$($Session.SessionDir)"
+                    )
                     & $pyExe $pyArgs 2>&1 | ForEach-Object {
                         $line = "$_"
                         if ($line -match '^\s*\[(\w+)\]') {
@@ -493,10 +508,12 @@ function Start-DiscoveryRun {
                             $Session.Targets[$i] = $t
                         }
                     }
-                    if (Test-Path $hvOut) {
-                        $t.State='done'; $t.Phase='inventory saved'
+                    # Look for any *-inventory-*.json written into the session dir
+                    $written = Get-ChildItem $Session.SessionDir -Filter '*inventory*.json' -EA 0 | Select-Object -First 1
+                    if ($written) {
+                        $t.State='done'; $t.Phase=("inventory saved: {0}" -f $written.Name)
                     } else {
-                        $t.State='error'; $t.Phase='inventory not written'
+                        $t.State='error'; $t.Phase='inventory not written (check hypervisor creds / reachability)'
                     }
                 } else {
                     # Per-server Windows discovery
