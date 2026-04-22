@@ -531,9 +531,51 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
 
 $listener = Start-HttpListener
 
-# Open browser
+# Open browser - prefer Edge, then Chrome, fall back to default.
+# Use --app mode for a clean window without browser chrome.
+function Find-ModernBrowser {
+    $candidates = @(
+        # Edge (Chromium) - standard install locations
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
+        # Chrome - standard install locations
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe",
+        "$env:LocalAppData\Google\Chrome\Application\chrome.exe"
+    )
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path $p)) { return $p }
+    }
+    # Registry fallback for App Paths
+    foreach ($reg in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe'
+    )) {
+        try {
+            $v = (Get-ItemProperty -Path $reg -Name '(Default)' -EA Stop).'(Default)'
+            if ($v -and (Test-Path $v)) { return $v }
+        } catch { }
+    }
+    return $null
+}
+
 if (-not $NoOpenBrowser) {
-    try { Start-Process $script:BaseUrl | Out-Null } catch { }
+    $browser = Find-ModernBrowser
+    try {
+        if ($browser) {
+            Write-Host "  Launching: $browser" -ForegroundColor DarkGray
+            # --app mode strips tab bar/URL bar for a native-feel window
+            Start-Process -FilePath $browser -ArgumentList "--app=$script:BaseUrl" | Out-Null
+        } else {
+            Write-Host "  No Edge/Chrome found; using system default browser." -ForegroundColor DarkYellow
+            Start-Process $script:BaseUrl | Out-Null
+        }
+    } catch {
+        # Last-resort fallback
+        try { Start-Process $script:BaseUrl | Out-Null } catch { }
+    }
 }
 
 # Request loop
