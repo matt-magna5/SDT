@@ -20,8 +20,7 @@
 [CmdletBinding()]
 param(
     [string] $Version = 'latest',   # 'latest' or a tag like 'v3.11'
-    [switch] $Quiet,
-    [switch] $NoShortcut
+    [switch] $Quiet
 )
 
 $ErrorActionPreference = 'Stop'
@@ -133,26 +132,6 @@ if (-not $already) {
     Say "(Open a NEW terminal to pick up the PATH change.)" DarkYellow
 } else {
     Say "PATH already contains $BinDir" DarkGray
-}
-
-# ----- Start Menu shortcut ---------------------------------------------------
-if (-not $NoShortcut) {
-    try {
-        $startMenu = [Environment]::GetFolderPath('StartMenu')
-        $shortcut  = Join-Path $startMenu 'Programs\Magna5 SDT.lnk'
-        New-Item -ItemType Directory -Force -Path (Split-Path $shortcut -Parent) | Out-Null
-        $wsh = New-Object -ComObject WScript.Shell
-        $s = $wsh.CreateShortcut($shortcut)
-        $s.TargetPath = 'powershell.exe'
-        $s.Arguments  = "-NoProfile -ExecutionPolicy Bypass -File `"$ShimPS`""
-        $s.WorkingDirectory = $AppDir
-        $s.IconLocation = 'powershell.exe,0'
-        $s.Description = "Launch Magna5 SDT discovery GUI"
-        $s.Save()
-        Say "Start Menu shortcut: Magna5 SDT" DarkGreen
-    } catch {
-        Say "Shortcut creation skipped: $($_.Exception.Message)" Yellow
-    }
 }
 
 Say ""
