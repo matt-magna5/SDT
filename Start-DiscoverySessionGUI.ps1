@@ -194,14 +194,17 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 
 <div class="card">
 <div class="card-title">Windows Targets</div>
-<div class="card-sub">One host per line. IP or hostname. Script will try WinRM remoting; fall back to manual local run if unreachable.
+<div class="card-sub">One host per line. IP or hostname. Script attempts remote discovery over WinRM; falls back to a local run if unreachable.
 <br>Example: <code style="font-family:var(--mono);color:var(--info);">192.168.10.4</code> or <code style="font-family:var(--mono);color:var(--info);">QES-OFFICE-DC</code></div>
 <div class="field"><label>Targets</label>
 <textarea name="targets" placeholder="192.168.10.4&#10;192.168.10.5&#10;QES-OFFICE-MGMT"></textarea></div>
+
+<div class="section-hdr">Admin credentials</div>
+<div class="card-sub" style="margin-bottom:10px;">Domain admin or local admin that can log into the target hosts. Held in memory only - never written to disk.</div>
 <div class="grid2">
-<div class="field"><label>WinRM user</label>
-<input name="winrmUser" placeholder="DOMAIN\administrator"></div>
-<div class="field"><label>WinRM password</label>
+<div class="field"><label>Domain / Local admin</label>
+<input name="winrmUser" placeholder="DOMAIN\administrator or .\administrator"></div>
+<div class="field"><label>Password</label>
 <input name="winrmPass" type="password" autocomplete="off"></div>
 </div>
 <div class="callout">
@@ -429,8 +432,18 @@ function Start-DiscoveryRun {
     # Initialize target rows
     foreach ($t in $Payload.targets) {
         $script:Session.Targets += [ordered]@{
-            Name=$t; Address=$t; State='pending'; Phase=''; Buddy=''; Started=$null; Finished=$null
+            Name=$t; Address=$t; State='pending'; Phase=''; Buddy=''; Started=$null; Finished=$null; Kind='server'
         }
+    }
+    # If hypervisor provided, add a synthetic "Hypervisor" row at the top.
+    $hvType = "$($Payload.hvType)"
+    $hvHost = "$($Payload.hvHost)"
+    if ($hvType -and $hvType -ne 'none' -and $hvHost) {
+        $hvRow = [ordered]@{
+            Name="$hvType`: $hvHost"; Address=$hvHost; State='pending'; Phase='queued'; Buddy=''; Started=$null; Finished=$null; Kind='hypervisor'; HvType=$hvType
+        }
+        # Prepend
+        $script:Session.Targets = @($hvRow) + @($script:Session.Targets)
     }
 
     # Kick off the worker scriptblock in a runspace so the HTTP listener stays responsive.
@@ -451,6 +464,10 @@ function Start-DiscoveryRun {
             $cred = New-Object System.Management.Automation.PSCredential($winrmUser, $sec)
         }
 
+        # Pick Python (portable if present, fall back to system)
+        $pyExe = Join-Path $ScriptDir 'python\python.exe'
+        if (-not (Test-Path $pyExe)) { $pyExe = 'python' }
+
         for ($i = 0; $i -lt $Session.Targets.Count; $i++) {
             $t = $Session.Targets[$i]
             $t.State   = 'running'
@@ -460,20 +477,42 @@ function Start-DiscoveryRun {
             $Session.Targets[$i] = $t
 
             try {
-                $args = @{ ComputerName = $t.Address; OutputPath = $Session.SessionDir }
-                if ($cred) { $args.Credential = $cred }
-                # Run the script; its output + errors land in the job's log.
-                & $invoke @args *>&1 | ForEach-Object {
-                    $line = "$_"
-                    # Cheap phase extractor: look for "[Phase] ..." pattern.
-                    if ($line -match '^\s*\[(\w+)\]') {
-                        $t.Phase = $matches[1]
-                        $t.Buddy = $BuddyFrames[(Get-Random -Maximum $BuddyFrames.Count)]
-                        $Session.Targets[$i] = $t
+                if ($t.Kind -eq 'hypervisor') {
+                    # Hypervisor discovery via collect_vsphere_perf.py
+                    $hvScript = Join-Path $ScriptDir 'collect_vsphere_perf.py'
+                    if (-not (Test-Path $hvScript)) { throw "vSphere collector not found at $hvScript" }
+                    $hvOut = Join-Path $Session.SessionDir ("{0}-inventory-{1}.json" -f $t.Address, (Get-Date -f 'yyyy-MM-dd'))
+                    $t.Phase = 'connecting to vCenter/ESXi'
+                    $Session.Targets[$i] = $t
+                    $pyArgs = @($hvScript, '--host', $t.Address, '--user', "$($Payload.hvUser)", '--password', "$($Payload.hvPass)", '--out', $hvOut)
+                    & $pyExe $pyArgs 2>&1 | ForEach-Object {
+                        $line = "$_"
+                        if ($line -match '^\s*\[(\w+)\]') {
+                            $t.Phase = $matches[1]
+                            $t.Buddy = $BuddyFrames[(Get-Random -Maximum $BuddyFrames.Count)]
+                            $Session.Targets[$i] = $t
+                        }
                     }
+                    if (Test-Path $hvOut) {
+                        $t.State='done'; $t.Phase='inventory saved'
+                    } else {
+                        $t.State='error'; $t.Phase='inventory not written'
+                    }
+                } else {
+                    # Per-server Windows discovery
+                    $invokeArgs = @{ ComputerName = $t.Address; OutputPath = $Session.SessionDir }
+                    if ($cred) { $invokeArgs.Credential = $cred }
+                    & $invoke @invokeArgs *>&1 | ForEach-Object {
+                        $line = "$_"
+                        if ($line -match '^\s*\[(\w+)\]') {
+                            $t.Phase = $matches[1]
+                            $t.Buddy = $BuddyFrames[(Get-Random -Maximum $BuddyFrames.Count)]
+                            $Session.Targets[$i] = $t
+                        }
+                    }
+                    $t.State    = 'done'
+                    $t.Phase    = 'complete'
                 }
-                $t.State    = 'done'
-                $t.Phase    = 'complete'
                 $t.Finished = (Get-Date).ToString('HH:mm:ss')
             } catch {
                 $t.State    = 'error'
@@ -528,6 +567,20 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
         Import-Module ThreadJob -EA Stop
     }
 }
+
+# Auto-minimize the host PowerShell window so the GUI takes focus.
+try {
+    Add-Type -Name _SdtWin -Namespace _Sdt -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool ShowWindow(System.IntPtr h, int s);
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern System.IntPtr GetConsoleWindow();
+'@ -ErrorAction Stop
+    $h = [_Sdt._SdtWin]::GetConsoleWindow()
+    if ($h -ne [System.IntPtr]::Zero) {
+        [void][_Sdt._SdtWin]::ShowWindow($h, 6)  # SW_MINIMIZE
+    }
+} catch { }
 
 $listener = Start-HttpListener
 
@@ -606,13 +659,38 @@ try {
                         break
                     }
                     $body = Read-RequestBody -Request $req
-                    $payload = $body | ConvertFrom-Json
-                    if (-not $payload.targets -or $payload.targets.Count -eq 0) {
-                        Send-Json -Response $resp -Data @{ error = 'No targets provided.' } -StatusCode 400
+                    $payload = $null
+                    try { $payload = $body | ConvertFrom-Json -ErrorAction Stop } catch {
+                        Send-Json -Response $resp -Data @{ error = "JSON parse failed: $($_.Exception.Message)"; bodyLen = $body.Length } -StatusCode 400
                         break
                     }
+                    # Normalize targets: PS ConvertFrom-Json may return $null, string,
+                    # or Object[]. Force into an array of non-empty strings.
+                    $raw = $null
+                    if ($payload) {
+                        try { $raw = $payload.targets } catch { $raw = $null }
+                    }
+                    $targets = @()
+                    if ($raw -is [string] -and $raw.Trim()) {
+                        $targets = @($raw -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                    } elseif ($raw) {
+                        $targets = @(@($raw) | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+                    }
+                    # Blank targets OK if a hypervisor is set - we'll discover VMs from it.
+                    $hvType = ''
+                    try { $hvType = "$($payload.hvType)" } catch { $hvType = '' }
+                    $hvHost = ''
+                    try { $hvHost = "$($payload.hvHost)" } catch { $hvHost = '' }
+                    if ($targets.Count -eq 0 -and ($hvType -eq '' -or $hvType -eq 'none' -or -not $hvHost)) {
+                        Send-Json -Response $resp -Data @{
+                            error = 'No targets and no hypervisor. Provide at least one target host OR hypervisor details.'
+                        } -StatusCode 400
+                        break
+                    }
+                    # Replace parsed targets back into payload for worker
+                    $payload | Add-Member -NotePropertyName targets -NotePropertyValue $targets -Force
                     $null = Start-DiscoveryRun -Payload $payload
-                    Send-Json -Response $resp -Data @{ ok = $true; sessionDir = $script:Session.SessionDir }
+                    Send-Json -Response $resp -Data @{ ok = $true; sessionDir = $script:Session.SessionDir; targetCount = $targets.Count }
                     break
                 }
                 '^GET /$|^GET /index\.html$' {
