@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.1.2'
+$script:Version   = '4.1.3'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -547,6 +547,14 @@ async function submitSetup(e){
   targets = Array.from(new Set([...targets, ...vmTargets]));
   data.targets = targets;
 
+  // Up-front sanity checks so Run Discovery never appears to silently do nothing
+  if (!data.client || !data.client.trim()) { alert('Client name is required.'); return; }
+  if (!data.outputDir || !data.outputDir.trim()) { alert('Output folder is required.'); return; }
+  const hvConfigured = data.hvType && data.hvType !== 'none' && data.hvHost;
+  if (targets.length === 0 && !hvConfigured) {
+    alert('No targets. Enter manual targets, tick VMs from a hypervisor scan, or configure a hypervisor.'); return;
+  }
+
   const btn = form.querySelector('button[type="submit"]');
   btn.disabled = true; btn.textContent = 'Starting...';
 
@@ -556,7 +564,8 @@ async function submitSetup(e){
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify(data)
     });
-    if (!resp.ok) { throw new Error(await resp.text()); }
+    const respText = await resp.text();
+    if (!resp.ok) { throw new Error(respText || ('HTTP ' + resp.status)); }
     setTab('run');
     document.getElementById('tb-setup').disabled = true;
     startPolling();
@@ -1444,72 +1453,105 @@ try {
                     } elseif ($u -match '^([^\\]+)\\(.+)$') {
                         $dom = $matches[1]; $justUser = $matches[2]
                     } elseif ($u -like '*@*') {
-                        $dom = ($u -split '@',2)[1]; $justUser = $u
+                        $dom = ''; $justUser = $u   # UPN: LogonUser wants domain="", user=UPN
                     } else {
                         Send-Json -Response $resp -Data @{ ok=$false; error='Username needs a domain: DOMAIN\user or user@domain.local' }; break
                     }
 
-                    # Build a ranked list of DC lookup strategies. The collector box is
-                    # almost never joined to the client domain, so we try several paths.
-                    $candidates = New-Object System.Collections.ArrayList
-                    [void]$candidates.Add(@{ name = $dom;               how = 'domain-name' })
-                    # If bare NetBIOS (no dot), try common suffixes
-                    if ($dom -notmatch '\.') {
-                        foreach ($sfx in @('local','lan','internal','corp','ad','net')) {
-                            [void]$candidates.Add(@{ name = "$dom.$sfx"; how = "guess .$sfx" })
+                    # --- Primary: Win32 LogonUser (advapi32.dll) --------------
+                    # Works anywhere the box can talk to a DC for that domain -
+                    # on the DC itself, on any domain-joined member, or across a
+                    # trust. No ADWS, no DC discovery dance, no LDAP bind quirks.
+                    $usedAPI = 'LogonUser'
+                    try {
+                        if (-not ('Win32.NativeCreds' -as [type])) {
+                            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace Win32 {
+    public static class NativeCreds {
+        [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+        public static extern bool LogonUserW(string user, string domain, string password,
+            int logonType, int logonProvider, out IntPtr token);
+        [DllImport("kernel32.dll", SetLastError=true)]
+        public static extern bool CloseHandle(IntPtr h);
+    }
+}
+'@ -ErrorAction Stop
                         }
-                    }
-                    # DNS SRV lookup for _ldap._tcp.<fqdn>.  We can only do this if
-                    # we already have an FQDN guess, so this loop runs inside each
-                    # candidate attempt below.
-
-                    Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction SilentlyContinue
-                    $attempts = @()
-                    $succeeded = $false
-                    $softFail  = $false
-                    $softMsg   = ''
-                    $finalMsg  = ''
-
-                    foreach ($cand in $candidates) {
-                        $tryName = $cand.name
-                        $how     = $cand.how
-                        # Try direct ValidateCredentials against the domain name
-                        try {
-                            $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
-                                [System.DirectoryServices.AccountManagement.ContextType]::Domain, $tryName)
-                            $valid = $ctx.ValidateCredentials($justUser, $p)
-                            $ctx.Dispose()
-                            if ($valid) {
-                                $succeeded = $true
-                                $finalMsg = "Valid on $tryName ($how)"
-                                break
-                            } else {
-                                # Contacted a DC but creds rejected - that's a REAL failure
-                                $finalMsg = "Rejected by $tryName (wrong password, expired, or locked)"
-                                $attempts += @{ name=$tryName; how=$how; result='rejected' }
-                                break
-                            }
-                        } catch {
-                            $em = $_.Exception.Message
-                            $attempts += @{ name=$tryName; how=$how; result="unreach: $em" }
-                            # Keep trying next candidate
-                            continue
+                        $token = [IntPtr]::Zero
+                        # LOGON32_LOGON_NETWORK=3, LOGON32_PROVIDER_DEFAULT=0
+                        $ok = [Win32.NativeCreds]::LogonUserW($justUser, $dom, $p, 3, 0, [ref]$token)
+                        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        if ($ok) {
+                            [void][Win32.NativeCreds]::CloseHandle($token)
+                            Send-Json -Response $resp -Data @{ ok=$true; message=("Valid on domain {0} (via {1})" -f ($(if($dom){$dom}else{'UPN'})), $usedAPI) }
+                            break
                         }
+                        # Map common errors to friendly messages
+                        $hard = $true; $soft = $false
+                        $why = switch ($err) {
+                            1326 { 'Wrong password (LOGON_FAILURE)' }
+                            1327 { 'Account restriction (may need password change, login hours, etc.)' }
+                            1328 { 'Login not permitted at this time (login hours restriction)' }
+                            1329 { 'Account cannot log on from this workstation' }
+                            1330 { 'Password expired' }
+                            1331 { 'Account disabled' }
+                            1909 { 'Account locked out' }
+                            1789 { $hard=$false; $soft=$true; 'Cannot reach a DC for domain from this box' }
+                            1355 { $hard=$false; $soft=$true; 'Specified domain does not exist / no DC reachable' }
+                            1317 { 'Unknown user name' }
+                            default { "LogonUser error $err" }
+                        }
+                        if ($soft) {
+                            Send-Json -Response $resp -Data @{ ok=$false; soft=$true; error="$why - will be tested during scan"; winErr=$err }
+                        } else {
+                            Send-Json -Response $resp -Data @{ ok=$false; error=$why; winErr=$err }
+                        }
+                        break
+                    } catch {
+                        # LogonUser itself threw - fall through to LDAP as backup
                     }
 
-                    if ($succeeded) {
-                        Send-Json -Response $resp -Data @{ ok=$true; message=$finalMsg; attempts=$attempts }
-                    } elseif ($finalMsg -match '^Rejected') {
-                        # We got to a DC but the password was wrong - that IS a hard fail
-                        Send-Json -Response $resp -Data @{ ok=$false; error=$finalMsg; attempts=$attempts }
-                    } else {
-                        # No DC reachable from this collector - soft warning, not an error.
-                        # WinRM against the actual targets will tell us if creds work.
+                    # --- Backup 2: AccountManagement LDAP bind -----------------
+                    $lookup = if ($dom) { $dom } else { ($u -split '@',2)[1] }
+                    try {
+                        Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
+                        $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
+                            [System.DirectoryServices.AccountManagement.ContextType]::Domain, $lookup)
+                        $valid = $ctx.ValidateCredentials($u, $p)
+                        $ctx.Dispose()
+                        if ($valid) {
+                            Send-Json -Response $resp -Data @{ ok=$true; message="Valid on $lookup (via LDAP PrincipalContext)" }
+                            break
+                        } else {
+                            Send-Json -Response $resp -Data @{ ok=$false; error="Rejected by $lookup (wrong password, expired, or locked)" }
+                            break
+                        }
+                    } catch {
+                        # fall through to DirectoryEntry
+                    }
+
+                    # --- Backup 3: Direct LDAP bind via DirectoryEntry ---------
+                    try {
+                        $domForDn = $lookup
+                        if ($domForDn -notmatch '\.') { $domForDn = "$domForDn.local" }
+                        $dn = "DC=" + ($domForDn -split '\.' -join ',DC=')
+                        $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$dn", $u, $p)
+                        $null = $de.NativeObject   # triggers the bind
+                        $de.Close()
+                        Send-Json -Response $resp -Data @{ ok=$true; message="Valid on $lookup (via DirectoryEntry LDAP bind)" }
+                        break
+                    } catch {
+                        $em = $_.Exception.Message
+                        if ($em -match '(?i)invalid credentials|logon failure|8009030C|525|52e') {
+                            Send-Json -Response $resp -Data @{ ok=$false; error="Rejected by $lookup (wrong password)" }
+                            break
+                        }
+                        # Otherwise treat as unreachable -> soft
                         Send-Json -Response $resp -Data @{
-                            ok=$false
-                            soft=$true
-                            error="Cannot reach a DC for '$dom' from this collector (not domain-joined, or DNS not pointing at client's DC). Credentials will be tested against each server during the actual scan."
-                            attempts=$attempts
+                            ok=$false; soft=$true
+                            error="Cannot reach any DC for '$lookup' from this box (tried LogonUser, PrincipalContext, DirectoryEntry). Creds will be tested during the actual scan."
                         }
                     }
                     break
