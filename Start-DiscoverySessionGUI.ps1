@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.1.4'
+$script:Version   = '4.1.5'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -1204,17 +1204,108 @@ function Start-DiscoveryRun {
             } | ConvertTo-Json -Depth 6
             [System.IO.File]::WriteAllText($mf, $manifest, [System.Text.Encoding]::UTF8)
             $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] manifest: $($serversList.Count) server JSON(s), inventory=$invFile") | Out-Null
-            # Run + capture everything
-            $logContent = & $py $gen $mf 2>&1 | Out-String
-            [System.IO.File]::WriteAllText($reportLog, $logContent, [System.Text.Encoding]::UTF8)
-            # Find the resulting HTML
-            $html = Get-ChildItem $Session.SessionDir -Filter '*DiscoveryReport*.html' -EA 0 | Select-Object -First 1
+
+            # ============================================================
+            # Bulletproof report generation. 3 attempts, verify HTML after
+            # each. If one approach fails, try the next before giving up.
+            # ============================================================
+            function Find-ReportHtml([string]$dir) {
+                Get-ChildItem $dir -Filter '*DiscoveryReport*.html' -EA 0 |
+                    Where-Object { $_.Length -gt 1024 } |
+                    Select-Object -First 1
+            }
+
+            $combinedLog = New-Object System.Text.StringBuilder
+            $Session.ReportPath = ''
+
+            # ---- Attempt 1: portable python + manifest path as-is ----
+            [void]$combinedLog.AppendLine("===== ATTEMPT 1: portable python + manifest =====")
+            try {
+                $out1 = & $py $gen $mf 2>&1 | Out-String
+                [void]$combinedLog.AppendLine($out1)
+            } catch {
+                [void]$combinedLog.AppendLine("EXCEPTION: $($_.Exception.Message)")
+            }
+            $html = Find-ReportHtml $Session.SessionDir
             if ($html) {
                 $Session.ReportPath = $html.FullName
-            } else {
-                # Leave a breadcrumb in the session log so the UI shows the issue
-                $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py produced no HTML - see gen_report.log in session dir") | Out-Null
+                [void]$combinedLog.AppendLine("ATTEMPT 1 OK - HTML: $($html.Name)")
+                $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Report generated (attempt 1): $($html.Name)") | Out-Null
             }
+
+            # ---- Attempt 2: self-heal manifest from session dir JSONs ----
+            if (-not $Session.ReportPath) {
+                [void]$combinedLog.AppendLine("")
+                [void]$combinedLog.AppendLine("===== ATTEMPT 2: self-heal manifest + rerun =====")
+                $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] No HTML yet - rebuilding manifest from session JSONs...") | Out-Null
+                try {
+                    $autoServers = @(Get-ChildItem $Session.SessionDir -Filter '*-discovery-*.json' -EA 0 |
+                        Where-Object { $_.Length -gt 100 } |
+                        ForEach-Object { @{ file = $_.Name } })
+                    $autoInv = ''
+                    $invf = Get-ChildItem $Session.SessionDir -Filter '*inventory*.json' -EA 0 | Where-Object { $_.Length -gt 100 } | Select-Object -First 1
+                    if ($invf) { $autoInv = $invf.Name }
+                    $manifest2 = @{
+                        client      = $Payload.client
+                        client_full = $Payload.client
+                        date        = (Get-Date).ToString('yyyy-MM-dd')
+                        session_dir = '.'
+                        output_dir  = '.'
+                        inventory_file = $autoInv
+                        logo_file   = ''
+                        servers     = $autoServers
+                    } | ConvertTo-Json -Depth 6
+                    [System.IO.File]::WriteAllText($mf, $manifest2, [System.Text.Encoding]::UTF8)
+                    [void]$combinedLog.AppendLine("Rebuilt manifest: $($autoServers.Count) server(s), inventory='$autoInv'")
+                    $out2 = & $py $gen $mf 2>&1 | Out-String
+                    [void]$combinedLog.AppendLine($out2)
+                } catch {
+                    [void]$combinedLog.AppendLine("EXCEPTION: $($_.Exception.Message)")
+                }
+                $html = Find-ReportHtml $Session.SessionDir
+                if ($html) {
+                    $Session.ReportPath = $html.FullName
+                    [void]$combinedLog.AppendLine("ATTEMPT 2 OK - HTML: $($html.Name)")
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Report generated after manifest self-heal: $($html.Name)") | Out-Null
+                }
+            }
+
+            # ---- Attempt 3: run from session dir cwd, try system python fallback ----
+            if (-not $Session.ReportPath) {
+                [void]$combinedLog.AppendLine("")
+                [void]$combinedLog.AppendLine("===== ATTEMPT 3: system python + cwd=session dir =====")
+                $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Still no HTML - trying system python with cwd=session dir...") | Out-Null
+                $altPy = 'python'
+                try {
+                    $pyCmd = Get-Command python -EA SilentlyContinue
+                    if ($pyCmd) { $altPy = $pyCmd.Source }
+                    [void]$combinedLog.AppendLine("Using python at: $altPy")
+                    $prevCwd = Get-Location
+                    try {
+                        Set-Location $Session.SessionDir
+                        $out3 = & $altPy $gen 'manifest.json' 2>&1 | Out-String
+                        [void]$combinedLog.AppendLine($out3)
+                    } finally {
+                        Set-Location $prevCwd
+                    }
+                } catch {
+                    [void]$combinedLog.AppendLine("EXCEPTION: $($_.Exception.Message)")
+                }
+                $html = Find-ReportHtml $Session.SessionDir
+                if ($html) {
+                    $Session.ReportPath = $html.FullName
+                    [void]$combinedLog.AppendLine("ATTEMPT 3 OK - HTML: $($html.Name)")
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Report generated via fallback: $($html.Name)") | Out-Null
+                }
+            }
+
+            # Final outcome
+            if (-not $Session.ReportPath) {
+                [void]$combinedLog.AppendLine("")
+                [void]$combinedLog.AppendLine("===== ALL 3 ATTEMPTS FAILED =====")
+                $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py failed after 3 attempts - see gen_report.log") | Out-Null
+            }
+            [System.IO.File]::WriteAllText($reportLog, $combinedLog.ToString(), [System.Text.Encoding]::UTF8)
         } catch {
             $errMsg = $_.Exception.Message
             [System.IO.File]::WriteAllText($reportLog, "Exception invoking gen_report.py: $errMsg", [System.Text.Encoding]::UTF8)
