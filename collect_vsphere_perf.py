@@ -702,11 +702,30 @@ def run(vcenter, username, password, days=90, output_dir='.'):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='vSphere full SOAP collector — Nutanix Collector replacement')
+    parser = argparse.ArgumentParser(description='vSphere full SOAP collector - Nutanix Collector replacement')
     parser.add_argument('--vcenter', required=True)
     parser.add_argument('--user',    required=True)
-    parser.add_argument('--pass',    required=True, dest='password')
+    parser.add_argument('--pass',    dest='password', default=None,
+                        help='Password (or set SDT_HV_PASS env var to avoid CLI escaping issues)')
+    parser.add_argument('--pass-env', dest='pass_env', default=None,
+                        help='Name of env var holding the password (safer than --pass for special chars)')
     parser.add_argument('--days',    type=int, default=120)
     parser.add_argument('--output',  default='.')
     args = parser.parse_args()
-    run(args.vcenter, args.user, args.password, args.days, args.output)
+
+    # Resolve password: explicit env var name > default SDT_HV_PASS env var > --pass arg
+    password = None
+    if args.pass_env:
+        password = os.environ.get(args.pass_env)
+        if password is None:
+            print(f"[error] env var {args.pass_env} is not set", file=sys.stderr)
+            sys.exit(2)
+    elif os.environ.get('SDT_HV_PASS'):
+        password = os.environ['SDT_HV_PASS']
+    elif args.password is not None:
+        password = args.password
+    else:
+        print("[error] no password provided (use --pass, --pass-env, or set SDT_HV_PASS)", file=sys.stderr)
+        sys.exit(2)
+
+    run(args.vcenter, args.user, password, args.days, args.output)

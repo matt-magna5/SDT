@@ -54,6 +54,88 @@ function Add-Log([string]$msg) {
     }
 }
 
+# Runs collect_vsphere_perf.py with auto-retry across username formats.
+# Returns hashtable: @{ ok=$true/$false; user=<succeeded-format>; log=<combined-log>; file=<json-path>; error=<short>; }
+function Invoke-VsphereCollect {
+    param(
+        [string] $PyExe,
+        [string] $ScriptPath,
+        [string] $VCenterHost,
+        [string] $UserRaw,
+        [string] $PassRaw,
+        [string] $OutputDir
+    )
+
+    # Build username variants to try in order
+    $variants = [System.Collections.ArrayList]@()
+    [void]$variants.Add($UserRaw)
+
+    if ($UserRaw -notmatch '[\\@]') {
+        [void]$variants.Add("$UserRaw@vsphere.local")
+        [void]$variants.Add("VSPHERE.LOCAL\$UserRaw")
+    }
+    if ($UserRaw -match '@') {
+        $parts = $UserRaw -split '@', 2
+        [void]$variants.Add("$($parts[1].ToUpper())\$($parts[0])")
+    }
+    if ($UserRaw -match '\\') {
+        $parts = $UserRaw -split '\\', 2
+        [void]$variants.Add("$($parts[1])@$($parts[0].ToLower())")
+    }
+    $uniqueVariants = @($variants | Select-Object -Unique)
+
+    $env:SDT_HV_PASS = $PassRaw
+    $combined = ''
+    $succeeded = $null
+    $successFile = $null
+    $nonAuthFail = $false
+    try {
+        foreach ($u in $uniqueVariants) {
+            # Track files in output dir BEFORE running so we know which one is new
+            $beforeSet = @()
+            try { $beforeSet = (Get-ChildItem $OutputDir -Filter '*inventory*.json' -EA 0 | ForEach-Object { $_.FullName }) } catch { }
+
+            $pyArgs = @(
+                $ScriptPath,
+                '--vcenter',  $VCenterHost,
+                '--user',     $u,
+                '--pass-env', 'SDT_HV_PASS',
+                '--output',   $OutputDir
+            )
+            $out = & $PyExe $pyArgs 2>&1 | Out-String
+            $combined += "`n=== attempt with --user '$u' ===`n$out`n"
+
+            # Find any NEW inventory file written during this attempt
+            $afterSet = @()
+            try { $afterSet = (Get-ChildItem $OutputDir -Filter '*inventory*.json' -EA 0 | ForEach-Object { $_.FullName }) } catch { }
+            $new = $afterSet | Where-Object { $_ -notin $beforeSet } | Select-Object -First 1
+            if (-not $new) {
+                # Also accept the newest vsphere-perf-*.json if present
+                $new = Get-ChildItem $OutputDir -Filter 'vsphere-perf-*.json' -EA 0 | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | ForEach-Object { $_.FullName }
+            }
+            if ($new -and (Test-Path $new) -and (Get-Item $new).Length -gt 1000) {
+                $succeeded = $u
+                $successFile = $new
+                break
+            }
+
+            # If the error isn't auth-related, stop - retrying won't help
+            if ($out -notmatch '(?i)(not\s+authenticated|InvalidLogin|Login failed|Incorrect user|password|credentials|SAML|401|403|unauthorized)') {
+                $nonAuthFail = $true
+                break
+            }
+        }
+    } finally {
+        $env:SDT_HV_PASS = $null
+    }
+
+    if ($succeeded) {
+        return @{ ok=$true; user=$succeeded; log=$combined; file=$successFile }
+    }
+    $errMsg = if ($nonAuthFail) { 'non-auth failure - check connectivity / SSL / script output' } else { "auth failed for all $($uniqueVariants.Count) username format(s) tried" }
+    return @{ ok=$false; log=$combined; error=$errMsg; triedUsers=$uniqueVariants }
+}
+
 # -----------------------------------------------------------------------------
 # HTML UI - self-contained single page, served as a here-string
 # -----------------------------------------------------------------------------
@@ -728,21 +810,16 @@ function Start-DiscoveryRun {
                     if (-not (Test-Path $hvScript)) { throw "vSphere collector not found at $hvScript" }
                     $t.Phase = 'connecting to vCenter/ESXi'
                     $Session.Targets[$i] = $t
-                    # Correct CLI: --vcenter / --user / --pass / --output (directory)
-                    $pyArgs = @(
-                        $hvScript,
-                        '--vcenter', "$($t.Address)",
-                        '--user',    "$($Payload.hvUser)",
-                        '--pass',    "$($Payload.hvPass)",
-                        '--output',  "$($Session.SessionDir)"
-                    )
-                    & $pyExe $pyArgs 2>&1 | ForEach-Object {
-                        $line = "$_"
-                        if ($line -match '^\s*\[(\w+)\]') {
-                            $t.Phase = $matches[1]
-                            $t.Buddy = $BuddyFrames[(Get-Random -Maximum $BuddyFrames.Count)]
-                            $Session.Targets[$i] = $t
-                        }
+                    # Auto-retry with username format variants
+                    $hvResult = Invoke-VsphereCollect -PyExe $pyExe -ScriptPath $hvScript `
+                        -VCenterHost $t.Address -UserRaw $Payload.hvUser -PassRaw $Payload.hvPass -OutputDir $Session.SessionDir
+                    if ($hvResult.ok -and $hvResult.user -ne $Payload.hvUser) {
+                        $t.Phase = "auth OK as $($hvResult.user)"
+                        $Session.Targets[$i] = $t
+                    } elseif (-not $hvResult.ok) {
+                        $t.State='error'
+                        $t.Phase = $hvResult.error
+                        $Session.Targets[$i] = $t
                     }
                     # Look for any *-inventory-*.json written into the session dir
                     $written = Get-ChildItem $Session.SessionDir -Filter '*inventory*.json' -EA 0 | Select-Object -First 1
@@ -929,18 +1006,21 @@ try {
                             if (Test-Path $getPy) { try { & $getPy 2>&1 | Out-Null } catch {} }
                         }
                         if (-not (Test-Path $pyExe)) { $pyExe = 'python' }
-                        $pyArgs = @(
-                            $hvScript,
-                            '--vcenter', "$($hv.hvHost)",
-                            '--user',    "$($hv.hvUser)",
-                            '--pass',    "$($hv.hvPass)",
-                            '--output',  "$stageDir"
-                        )
-                        $out = & $pyExe $pyArgs 2>&1 | Out-String
-                        $outFile = Get-ChildItem $stageDir -Filter 'vsphere-perf-*.json' -EA 0 | Select-Object -First 1
-                        if (-not $outFile) {
-                            Send-Json -Response $resp -Data @{ ok=$false; error="Collector produced no output. Check credentials / reachability."; log=$out } -StatusCode 500
+                        # Invoke collector with auto-retry across username formats
+                        $collectResult = Invoke-VsphereCollect -PyExe $pyExe -ScriptPath $hvScript `
+                            -VCenterHost $hv.hvHost -UserRaw $hv.hvUser -PassRaw $hv.hvPass -OutputDir $stageDir
+
+                        if (-not $collectResult.ok) {
+                            $errMsg = "Collector failed: $($collectResult.error)"
+                            if ($collectResult.triedUsers) {
+                                $errMsg += ". Tried usernames: $($collectResult.triedUsers -join ', ')"
+                            }
+                            Send-Json -Response $resp -Data @{ ok=$false; error=$errMsg; log=$collectResult.log } -StatusCode 500
                             break
+                        }
+                        $outFile = Get-Item $collectResult.file
+                        if ($collectResult.user -ne $hv.hvUser) {
+                            Add-Log ("Hypervisor auth succeeded with adjusted username: {0}" -f $collectResult.user)
                         }
                         $raw = [System.IO.File]::ReadAllText($outFile.FullName, [System.Text.Encoding]::UTF8)
                         $doc = $raw | ConvertFrom-Json
