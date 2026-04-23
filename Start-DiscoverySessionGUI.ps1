@@ -141,6 +141,12 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 .footer{text-align:center;padding:30px 0 10px;color:var(--dim);font-size:11px;}
 .callout{background:rgba(245,158,11,0.08);border-left:3px solid var(--warn);padding:10px 14px;
   border-radius:6px;font-size:12px;color:#fcd34d;margin:12px 0;}
+.pw-wrap{position:relative;}
+.pw-wrap input{padding-right:40px;}
+.pw-toggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:transparent;border:none;
+  color:var(--muted);cursor:pointer;padding:4px 6px;border-radius:4px;display:flex;align-items:center;justify-content:center;}
+.pw-toggle:hover{color:var(--text);background:var(--elevated-2);}
+.pw-toggle svg{width:18px;height:18px;}
 .hint{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
   background:var(--elevated-2);color:var(--muted);font-size:10px;font-weight:700;margin-left:8px;cursor:help;
   border:1px solid var(--border-2);vertical-align:middle;user-select:none;position:relative;}
@@ -209,7 +215,13 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 </div>
 <div class="grid2">
 <div class="field"><label>Password <span class="hint" data-tip="Password for the hypervisor account. Held in memory only for this session.">i</span></label>
-<input name="hvPass" type="password" autocomplete="off"></div>
+<div class="pw-wrap">
+<input name="hvPass" type="password" autocomplete="off">
+<button type="button" class="pw-toggle" onclick="togglePw(this)" title="Show/hide password" aria-label="Toggle password visibility">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+</button>
+</div>
+</div>
 <div class="field" style="display:flex;align-items:flex-end;">
 <button type="button" class="btn btn-secondary" id="scanHvBtn" onclick="scanHv()">Scan Hypervisor</button>
 </div>
@@ -251,7 +263,13 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 <div class="field"><label>Domain / Local admin <span class="hint" data-tip="Format: DOMAIN\\username for a domain admin, or .\\username for a local admin on workgroup hosts.">i</span></label>
 <input name="winrmUser" placeholder="DOMAIN\administrator or .\administrator"></div>
 <div class="field"><label>Password <span class="hint" data-tip="Password for the admin account. Held in memory only for this session - no file, no registry, no persistence.">i</span></label>
-<input name="winrmPass" type="password" autocomplete="off"></div>
+<div class="pw-wrap">
+<input name="winrmPass" type="password" autocomplete="off">
+<button type="button" class="pw-toggle" onclick="togglePw(this)" title="Show/hide password" aria-label="Toggle password visibility">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+</button>
+</div>
+</div>
 </div>
 <div class="callout">
 <strong>Coming soon:</strong> subnet auto-discovery (scan button). For now, list targets manually or use AD/DNS export.
@@ -338,7 +356,7 @@ async function scanHv(){
 
   btn.disabled = true; btn.textContent = 'Scanning...';
   status.style.color = 'var(--muted)';
-  status.textContent = 'Connecting to ' + hv.hvHost + '. This can take 30-60 seconds for a mid-size vCenter...';
+  status.innerHTML = 'Connecting to ' + escapeHtml(hv.hvHost) + '. This can take 30-60 seconds for a mid-size vCenter...';
 
   try {
     const resp = await fetch('/api/hv-scan', {
@@ -346,7 +364,19 @@ async function scanHv(){
       body: JSON.stringify(hv)
     });
     const data = await resp.json();
-    if (!resp.ok || !data.ok) { throw new Error(data.error || 'scan failed'); }
+    if (!resp.ok || !data.ok) {
+      const err = data.error || 'scan failed';
+      // Also surface the collector log tail if present so user can self-diagnose
+      if (data.log) {
+        status.style.color = 'var(--crit)';
+        status.innerHTML = '<strong>Scan failed:</strong> ' + escapeHtml(err) +
+          '<details style="margin-top:10px;"><summary style="cursor:pointer;color:var(--muted);">Show Python/collector output</summary>' +
+          '<pre style="background:#07101f;color:#c7d1df;padding:10px;border-radius:6px;font-family:var(--mono);font-size:11px;max-height:300px;overflow:auto;white-space:pre-wrap;">' +
+          escapeHtml(data.log) + '</pre></details>';
+        return;
+      }
+      throw new Error(err);
+    }
 
     window._discoveredVMs = (data.vms || []).map(v => ({...v, _checked: isWinVM(v)}));
     document.getElementById('discoveredCard').style.display = '';
@@ -505,6 +535,12 @@ function renderReport(s){
 
 function escapeHtml(s){
   return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function togglePw(btn){
+  const input = btn.parentElement.querySelector('input');
+  if (!input) return;
+  input.type = (input.type === 'password') ? 'text' : 'password';
 }
 </script>
 </body></html>
