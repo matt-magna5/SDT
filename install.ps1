@@ -123,13 +123,47 @@ if (-not (Test-Path $pyExe)) {
     }
 }
 if (Test-Path $pyExe) {
-    # Install required packages for the hypervisor scan (idempotent)
-    Say "Ensuring Python deps (pyVmomi, requests)..." DarkCyan
-    try {
-        $pipOut = & $pyExe -m pip install --quiet --disable-pip-version-check pyVmomi requests urllib3 2>&1 | Out-String
-        Say "Python deps ready." DarkGreen
-    } catch {
-        Say "pip install failed (non-fatal): $($_.Exception.Message)" Yellow
+    # ----- Ensure pip is bootstrapped in the embeddable Python --------------
+    $pipOk = $false
+    try { & $pyExe -m pip --version 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $pipOk = $true } } catch { }
+    if (-not $pipOk) {
+        Say "Bootstrapping pip in embeddable Python..." DarkCyan
+        # Find the python<ver>._pth file and enable 'import site' so pip works
+        $pthFile = Get-ChildItem $PyDir -Filter 'python*._pth' -EA 0 | Select-Object -First 1
+        if ($pthFile) {
+            $pthContent = Get-Content $pthFile.FullName -Raw
+            if ($pthContent -match '(?m)^\s*#\s*import\s+site\s*$') {
+                ($pthContent -replace '(?m)^\s*#\s*import\s+site\s*$', 'import site') | Set-Content $pthFile.FullName -Encoding ASCII
+                Say "Enabled 'import site' in $($pthFile.Name)" DarkGray
+            }
+        }
+        # Download get-pip.py and run it
+        $getPipPy = Join-Path $PyDir 'get-pip.py'
+        try {
+            Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $getPipPy -UseBasicParsing -TimeoutSec 60
+            & $pyExe $getPipPy --quiet --disable-pip-version-check 2>&1 | Out-Null
+            Remove-Item $getPipPy -EA 0
+            try { & $pyExe -m pip --version 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $pipOk = $true } } catch { }
+            if ($pipOk) { Say "pip bootstrapped." DarkGreen } else { Say "pip bootstrap didn't complete." Yellow }
+        } catch {
+            Say "get-pip.py download/run failed: $($_.Exception.Message)" Yellow
+        }
+    }
+    if ($pipOk) {
+        Say "Installing Python deps (pyVmomi, requests, urllib3)..." DarkCyan
+        try {
+            $pipOut = & $pyExe -m pip install --quiet --disable-pip-version-check pyVmomi requests urllib3 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0) {
+                Say "Python deps ready." DarkGreen
+            } else {
+                Say "pip install returned $LASTEXITCODE. Output:" Yellow
+                Say $pipOut Yellow
+            }
+        } catch {
+            Say "pip install failed: $($_.Exception.Message)" Yellow
+        }
+    } else {
+        Say "pip not available - hypervisor scan will fail until 'sdt update' succeeds or deps installed manually." Yellow
     }
 } else {
     Say "Portable Python not available - hypervisor scan will need system Python on PATH." Yellow
