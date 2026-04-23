@@ -136,30 +136,67 @@ def retrieve_all(sess, host, pc_ref, root_folder, obj_type, paths):
 # ── Step 1: Login  ───────────────────────────────────────────────────────────
 
 def login(sess, host, user, pw):
-    """Returns (pc_ref, perf_ref, root_folder, lic_mgr_ref)."""
-    root = soap_req(sess, host,
-        '<vim25:RetrieveServiceContent>'
-        '<vim25:_this type="ServiceInstance">ServiceInstance</vim25:_this>'
-        '</vim25:RetrieveServiceContent>')
-    rv = root.find(f'.//{{{NS}}}returnval') or root.find('.//returnval')
+    """Returns (pc_ref, perf_ref, root_folder, lic_mgr_ref).
 
-    def _ref(name):
-        e = rv.find(f'{{{NS}}}{name}') or rv.find(name) if rv is not None else None
-        return e.text if e is not None else None
+    Uses pyVmomi's SmartConnect to do the auth handshake, then extracts the
+    authenticated SOAP session cookie and splices it into our custom `sess`
+    so the rest of this script (which talks raw SOAP for perf collection
+    performance) reuses the authenticated session.
 
-    sm   = _ref('sessionManager')
-    pc   = _ref('propertyCollector')
-    perf = _ref('perfManager')
-    rf   = _ref('rootFolder')
-    lic  = _ref('licenseManager')
+    pyVmomi handles: SAML/SSO, identity federation, vCenter 7/8 enhanced
+    linked mode, XML escaping, certificate trust, session renewal — all the
+    modern-vCenter complexity that hand-rolled SOAP Login can't.
+    """
+    # Lazy imports so the script still runs for users who install pyVmomi later
+    try:
+        from pyVim.connect import SmartConnect, Disconnect
+        import ssl as _ssl
+    except ImportError as e:
+        raise RuntimeError(f"pyVmomi not installed: {e}. Run: python -m pip install pyVmomi") from e
 
-    soap_req(sess, host,
-        f'<vim25:Login>'
-        f'<vim25:_this type="SessionManager">{sm}</vim25:_this>'
-        f'<vim25:userName>{user}</vim25:userName>'
-        f'<vim25:password>{pw}</vim25:password>'
-        f'</vim25:Login>')
-    return pc, perf, rf, lic
+    # Build an insecure SSL context — mirrors our requests.verify=False elsewhere
+    _ctx = _ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl.CERT_NONE
+
+    # Parse host:port
+    _host = host
+    _port = 443
+    if ':' in host:
+        _host, _p = host.rsplit(':', 1)
+        try: _port = int(_p)
+        except: pass
+
+    print(f"      pyVmomi SmartConnect to {_host}:{_port} as {user} ...")
+    try:
+        si = SmartConnect(host=_host, port=_port, user=user, pwd=pw,
+                          sslContext=_ctx, disableSslCertValidation=True)
+    except Exception as e:
+        # Surface the underlying cause clearly - vim.fault.InvalidLogin, etc.
+        err_name = type(e).__name__
+        raise RuntimeError(f"vCenter login failed ({err_name}): {e}") from e
+
+    # Extract authenticated vmware_soap_session cookie from pyVmomi's stub
+    try:
+        cookie_hdr = si._stub.cookie or ''
+    except Exception:
+        cookie_hdr = ''
+    m = re.search(r'vmware_soap_session="?([^";]+)"?', cookie_hdr)
+    if m:
+        sess.cookies.set('vmware_soap_session', m.group(1))
+    else:
+        # Fallback: save the entire cookie header directly
+        sess.headers['Cookie'] = cookie_hdr
+
+    # Pull the Managed Object References we need for the rest of the script
+    content = si.RetrieveContent()
+    pc_ref   = content.propertyCollector._moId if content.propertyCollector else None
+    perf_ref = content.perfManager._moId       if content.perfManager       else None
+    rf_ref   = content.rootFolder._moId        if content.rootFolder        else None
+    lic_ref  = content.licenseManager._moId    if content.licenseManager    else None
+
+    # Don't Disconnect - we want to keep the session alive for subsequent SOAP calls
+    return pc_ref, perf_ref, rf_ref, lic_ref
 
 # ── Step 2: VM inventory ──────────────────────────────────────────────────────
 
