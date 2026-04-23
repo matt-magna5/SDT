@@ -171,14 +171,30 @@ if (-not (Test-Path $pyExe)) {
             try {
                 Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $getPipPy -UseBasicParsing -TimeoutSec 60 -EA Stop
                 Say "Downloaded get-pip.py ($([int]((Get-Item $getPipPy).Length/1024)) KB)" DarkGray
-                $getPipLog = & $pyExe $getPipPy --disable-pip-version-check 2>&1 | Out-String
-                Remove-Item $getPipPy -EA 0
-                if (Test-PyPipVersion $pyExe) {
-                    Say "[OK] pip bootstrapped via get-pip.py." DarkGreen
+                Say "Running get-pip.py (up to 90s; hang = python.exe blocked from pypi.org)..." DarkCyan
+                # Run as a Start-Process job so we can enforce a timeout and kill if stuck
+                $logFile = Join-Path $env:TEMP "sdt-getpip-$([guid]::NewGuid().ToString('N').Substring(0,6)).log"
+                $proc = Start-Process -FilePath $pyExe -ArgumentList @($getPipPy, '--disable-pip-version-check', '--verbose') -NoNewWindow -PassThru -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err"
+                $finished = $proc.WaitForExit(90000)  # 90 second timeout
+                if (-not $finished) {
+                    try { $proc.Kill() } catch { }
+                    Say "[X] get-pip.py timed out after 90s - python.exe blocked from reaching pypi.org" Red
+                    Say "   ThreatLocker / firewall likely dropping outbound HTTPS from python.exe" DarkYellow
+                    Say "   Whitelist python.exe to reach: files.pythonhosted.org, pypi.org, bootstrap.pypa.io" DarkYellow
+                    Say "   Path: $pyExe" DarkGray
                 } else {
-                    Say "[X] get-pip.py ran but pip still not working:" Red
-                    Say $getPipLog Yellow
+                    $getPipLog = ''
+                    if (Test-Path $logFile) { $getPipLog = Get-Content $logFile -Raw -EA 0 }
+                    if (Test-Path "$logFile.err") { $getPipLog += "`n--- STDERR ---`n" + (Get-Content "$logFile.err" -Raw -EA 0) }
+                    Remove-Item $logFile, "$logFile.err" -EA 0
+                    if (Test-PyPipVersion $pyExe) {
+                        Say "[OK] pip bootstrapped via get-pip.py." DarkGreen
+                    } else {
+                        Say "[X] get-pip.py ran but pip still not working:" Red
+                        Say $getPipLog Yellow
+                    }
                 }
+                Remove-Item $getPipPy -EA 0
             } catch {
                 Say "[X] get-pip.py download failed: $($_.Exception.Message)" Red
                 Say "  Likely cause: ThreatLocker or network proxy blocking python.exe / bootstrap.pypa.io" DarkYellow
@@ -186,13 +202,23 @@ if (-not (Test-Path $pyExe)) {
         }
     }
 
-    # Step 3: pip install the required packages (with verbose fallback)
+    # Step 3: pip install the required packages (with verbose fallback + timeout)
     if (Test-PyPipVersion $pyExe) {
         Say "Installing Python deps (pyVmomi, requests, urllib3)..." DarkCyan
-        $pipLog = & $pyExe -m pip install --disable-pip-version-check pyVmomi requests urllib3 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0) {
-            Say ("[X] pip install returned exit {0}:" -f $LASTEXITCODE) Red
-            Say $pipLog Yellow
+        $pipLog = Join-Path $env:TEMP "sdt-pipinst-$([guid]::NewGuid().ToString('N').Substring(0,6)).log"
+        $proc = Start-Process -FilePath $pyExe -ArgumentList @('-m','pip','install','--disable-pip-version-check','pyVmomi','requests','urllib3') -NoNewWindow -PassThru -RedirectStandardOutput $pipLog -RedirectStandardError "$pipLog.err"
+        $finished = $proc.WaitForExit(120000)  # 2-minute timeout
+        $pipOut = ''
+        if (Test-Path $pipLog) { $pipOut = Get-Content $pipLog -Raw -EA 0 }
+        if (Test-Path "$pipLog.err") { $pipOut += "`n--- STDERR ---`n" + (Get-Content "$pipLog.err" -Raw -EA 0) }
+        Remove-Item $pipLog, "$pipLog.err" -EA 0
+        if (-not $finished) {
+            try { $proc.Kill() } catch { }
+            Say "[X] pip install timed out after 120s - python.exe blocked from reaching pypi.org" Red
+            Say "   Whitelist python.exe outbound in ThreatLocker to: files.pythonhosted.org, pypi.org" DarkYellow
+        } elseif ($proc.ExitCode -ne 0) {
+            Say ("[X] pip install returned exit {0}:" -f $proc.ExitCode) Red
+            Say $pipOut Yellow
             Say "Likely cause: ThreatLocker or proxy blocking python.exe from reaching pypi.org" DarkYellow
         } else {
             # Step 4: VERIFY imports actually work - the only test that matters
