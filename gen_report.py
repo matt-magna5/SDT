@@ -154,7 +154,7 @@ for _fname in sorted(os.listdir(SESSION_DIR)):
         pass
 
 servers = []
-for s in CFG['servers']:
+for s in CFG.get('servers', []):
     if s.get('os_type') == 'linux':
         # Linux entry — may have SSH JSON or be a placeholder
         data = jload(os.path.join(SESSION_DIR, s['file'])) if s.get('file') else {}

@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.1.3'
+$script:Version   = '4.1.4'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -1180,16 +1180,30 @@ function Start-DiscoveryRun {
         $reportLog = Join-Path $Session.SessionDir 'gen_report.log'
         try {
             $mf = Join-Path $Session.SessionDir 'manifest.json'
+            # gen_report.py needs a `servers` list of {file:'<discovery json name>'}
+            # plus an optional inventory_file pointing at one HV inventory.
+            $serversList = @()
+            foreach ($t in $Session.Targets) {
+                if ($t.Kind -eq 'hypervisor') { continue }
+                if ($t.JsonPath -and (Test-Path $t.JsonPath)) {
+                    $serversList += @{ file = (Split-Path -Leaf $t.JsonPath) }
+                }
+            }
+            $invFile = ''
+            $firstInv = Get-ChildItem $Session.SessionDir -Filter '*inventory*.json' -EA 0 | Select-Object -First 1
+            if ($firstInv) { $invFile = $firstInv.Name }
             $manifest = @{
                 client      = $Payload.client
                 client_full = $Payload.client
                 date        = (Get-Date).ToString('yyyy-MM-dd')
                 session_dir = '.'
                 output_dir  = '.'
-                inventory_file = ''
+                inventory_file = $invFile
                 logo_file   = ''
+                servers     = $serversList
             } | ConvertTo-Json -Depth 6
             [System.IO.File]::WriteAllText($mf, $manifest, [System.Text.Encoding]::UTF8)
+            $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] manifest: $($serversList.Count) server JSON(s), inventory=$invFile") | Out-Null
             # Run + capture everything
             $logContent = & $py $gen $mf 2>&1 | Out-String
             [System.IO.File]::WriteAllText($reportLog, $logContent, [System.Text.Encoding]::UTF8)
