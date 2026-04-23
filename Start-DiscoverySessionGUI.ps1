@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.1.1'
+$script:Version   = '4.1.2'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -750,6 +750,10 @@ async function testCreds(){
     if (data.ok) {
       st.style.color = 'var(--ok)';
       st.textContent = 'OK - ' + (data.message || 'credentials valid');
+    } else if (data.soft) {
+      // Soft warning: we couldnt reach a DC from this collector. Not an error.
+      st.style.color = 'var(--warn)';
+      st.textContent = 'Warning: ' + (data.error || 'could not validate from this collector - will test during scan');
     } else {
       st.style.color = 'var(--crit)';
       st.textContent = data.error || 'validation failed';
@@ -1436,7 +1440,7 @@ try {
                     }
                     $dom = $null; $justUser = $null
                     if ($u -match '^\.\\(.+)$') {
-                        Send-Json -Response $resp -Data @{ ok=$false; error='Local account (.\user) cannot be validated without a target. Will be tested during discovery.' }; break
+                        Send-Json -Response $resp -Data @{ ok=$false; soft=$true; error='Local account (.\user) - will be tested during discovery.' }; break
                     } elseif ($u -match '^([^\\]+)\\(.+)$') {
                         $dom = $matches[1]; $justUser = $matches[2]
                     } elseif ($u -like '*@*') {
@@ -1444,23 +1448,68 @@ try {
                     } else {
                         Send-Json -Response $resp -Data @{ ok=$false; error='Username needs a domain: DOMAIN\user or user@domain.local' }; break
                     }
-                    try {
-                        Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
-                        $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
-                            [System.DirectoryServices.AccountManagement.ContextType]::Domain, $dom)
-                        $valid = $ctx.ValidateCredentials($justUser, $p)
-                        $ctx.Dispose()
-                        if ($valid) {
-                            Send-Json -Response $resp -Data @{ ok=$true; message="Valid on domain $dom" }
-                        } else {
-                            Send-Json -Response $resp -Data @{ ok=$false; error="Rejected by $dom (wrong password, expired, or locked)" }
+
+                    # Build a ranked list of DC lookup strategies. The collector box is
+                    # almost never joined to the client domain, so we try several paths.
+                    $candidates = New-Object System.Collections.ArrayList
+                    [void]$candidates.Add(@{ name = $dom;               how = 'domain-name' })
+                    # If bare NetBIOS (no dot), try common suffixes
+                    if ($dom -notmatch '\.') {
+                        foreach ($sfx in @('local','lan','internal','corp','ad','net')) {
+                            [void]$candidates.Add(@{ name = "$dom.$sfx"; how = "guess .$sfx" })
                         }
-                    } catch {
-                        $msg = $_.Exception.Message
-                        if ($msg -match '(?i)server.+not.+found|could not contact|server is not operational') {
-                            Send-Json -Response $resp -Data @{ ok=$false; error="Cannot reach domain '$dom' - DC unreachable from this host (VPN, DNS, or workgroup machine?)" }
-                        } else {
-                            Send-Json -Response $resp -Data @{ ok=$false; error="Validation error: $msg" }
+                    }
+                    # DNS SRV lookup for _ldap._tcp.<fqdn>.  We can only do this if
+                    # we already have an FQDN guess, so this loop runs inside each
+                    # candidate attempt below.
+
+                    Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction SilentlyContinue
+                    $attempts = @()
+                    $succeeded = $false
+                    $softFail  = $false
+                    $softMsg   = ''
+                    $finalMsg  = ''
+
+                    foreach ($cand in $candidates) {
+                        $tryName = $cand.name
+                        $how     = $cand.how
+                        # Try direct ValidateCredentials against the domain name
+                        try {
+                            $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
+                                [System.DirectoryServices.AccountManagement.ContextType]::Domain, $tryName)
+                            $valid = $ctx.ValidateCredentials($justUser, $p)
+                            $ctx.Dispose()
+                            if ($valid) {
+                                $succeeded = $true
+                                $finalMsg = "Valid on $tryName ($how)"
+                                break
+                            } else {
+                                # Contacted a DC but creds rejected - that's a REAL failure
+                                $finalMsg = "Rejected by $tryName (wrong password, expired, or locked)"
+                                $attempts += @{ name=$tryName; how=$how; result='rejected' }
+                                break
+                            }
+                        } catch {
+                            $em = $_.Exception.Message
+                            $attempts += @{ name=$tryName; how=$how; result="unreach: $em" }
+                            # Keep trying next candidate
+                            continue
+                        }
+                    }
+
+                    if ($succeeded) {
+                        Send-Json -Response $resp -Data @{ ok=$true; message=$finalMsg; attempts=$attempts }
+                    } elseif ($finalMsg -match '^Rejected') {
+                        # We got to a DC but the password was wrong - that IS a hard fail
+                        Send-Json -Response $resp -Data @{ ok=$false; error=$finalMsg; attempts=$attempts }
+                    } else {
+                        # No DC reachable from this collector - soft warning, not an error.
+                        # WinRM against the actual targets will tell us if creds work.
+                        Send-Json -Response $resp -Data @{
+                            ok=$false
+                            soft=$true
+                            error="Cannot reach a DC for '$dom' from this collector (not domain-joined, or DNS not pointing at client's DC). Credentials will be tested against each server during the actual scan."
+                            attempts=$attempts
                         }
                     }
                     break
