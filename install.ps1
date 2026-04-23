@@ -133,17 +133,34 @@ if (-not (Test-Path $pyExe)) {
 } else {
     Say "Python found: $pyExe" DarkGray
 
-    # --- Helper: test if a python module imports cleanly ---
+    # === BELT-AND-SUSPENDERS: Python dep setup can never terminate the install ===
+    # Multiple layers:
+    #   1. Force local $ErrorActionPreference=Continue so native stderr under
+    #      $global ='Stop' cannot halt us.
+    #   2. All helper calls wrapped in try/catch.
+    #   3. Skip ensurepip entirely (embeddable Python never has it).
+    #   4. get-pip.py attempted twice (bootstrap.pypa.io then pypa/get-pip GitHub mirror).
+    #   5. Final state reported but NEVER throws - install always finishes.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+
+    # --- Helpers: silent, non-throwing python probes ---
     function Test-PyImport([string]$py, [string]$module) {
         try {
-            $out = & $py -c "import $module" 2>&1 | Out-String
-            return ($LASTEXITCODE -eq 0)
+            $tmp = [IO.Path]::GetTempFileName()
+            $p = Start-Process -FilePath $py -ArgumentList @('-c', "import $module") -NoNewWindow -PassThru -Wait -RedirectStandardOutput $tmp -RedirectStandardError "$tmp.err" -EA SilentlyContinue
+            Remove-Item $tmp, "$tmp.err" -EA 0
+            return ($p -and $p.ExitCode -eq 0)
         } catch { return $false }
     }
     function Test-PyPipVersion([string]$py) {
         try {
-            $out = & $py -m pip --version 2>&1 | Out-String
-            return ($LASTEXITCODE -eq 0 -and $out -match 'pip \d')
+            $tmp = [IO.Path]::GetTempFileName()
+            $p = Start-Process -FilePath $py -ArgumentList @('-m','pip','--version') -NoNewWindow -PassThru -Wait -RedirectStandardOutput $tmp -RedirectStandardError "$tmp.err" -EA SilentlyContinue
+            $out = if (Test-Path $tmp) { Get-Content $tmp -Raw -EA 0 } else { '' }
+            Remove-Item $tmp, "$tmp.err" -EA 0
+            return ($p -and $p.ExitCode -eq 0 -and $out -match 'pip \d')
         } catch { return $false }
     }
 
@@ -161,44 +178,66 @@ if (-not (Test-Path $pyExe)) {
         Say "No python*._pth found in $PyDir - skipping site-packages enable" DarkYellow
     }
 
-    # Step 2: ensure pip is installed. Try ensurepip first (some distros have it),
-    # fall back to downloading get-pip.py from bootstrap.pypa.io.
+    # Step 2: bootstrap pip via get-pip.py. We SKIP ensurepip entirely -
+    # embeddable Python never has it, and under $ErrorActionPreference='Stop'
+    # its "No module named ensurepip" stderr becomes a NativeCommandError
+    # that killed older installs.
     if (Test-PyPipVersion $pyExe) {
         Say "pip already present." DarkGreen
     } else {
-        Say "Bootstrapping pip (method 1: ensurepip)..." DarkCyan
-        # Run via Start-Process so native stderr never becomes a PS
-        # NativeCommandError under $ErrorActionPreference='Stop'
-        # (embeddable Python has no ensurepip, which used to kill the whole install).
-        $epLog = Join-Path $env:TEMP "sdt-ensurepip-$([guid]::NewGuid().ToString('N').Substring(0,6)).log"
-        try {
-            $epProc = Start-Process -FilePath $pyExe -ArgumentList @('-m','ensurepip','--default-pip','--upgrade') -NoNewWindow -PassThru -Wait -RedirectStandardOutput $epLog -RedirectStandardError "$epLog.err" -EA SilentlyContinue
-        } catch { }
-        Remove-Item $epLog, "$epLog.err" -EA 0
-        if (Test-PyPipVersion $pyExe) {
-            Say "[OK] pip bootstrapped via ensurepip." DarkGreen
-        } else {
-            Say "ensurepip unavailable (embeddable Python) - falling back to get-pip.py" DarkGray
-            $getPipPy = Join-Path $PyDir 'get-pip.py'
+        Say "Bootstrapping pip via get-pip.py..." DarkCyan
+        $getPipPy = Join-Path $PyDir 'get-pip.py'
+        $havePip  = $false
+        # Source 1 (preferred): bundled get-pip.py shipped with the SDT repo -
+        # zero network dependency, works behind any proxy / ThreatLocker.
+        $bundled = Join-Path $AppDir 'get-pip.py'
+        if (Test-Path $bundled) {
             try {
-                Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $getPipPy -UseBasicParsing -TimeoutSec 60 -EA Stop
-                Say "Downloaded get-pip.py ($([int]((Get-Item $getPipPy).Length/1024)) KB)" DarkGray
-                Say "Running get-pip.py (up to 90s; hang = python.exe blocked from pypi.org)..." DarkCyan
-                # Run as a Start-Process job so we can enforce a timeout and kill if stuck
-                $logFile = Join-Path $env:TEMP "sdt-getpip-$([guid]::NewGuid().ToString('N').Substring(0,6)).log"
-                $proc = Start-Process -FilePath $pyExe -ArgumentList @($getPipPy, '--disable-pip-version-check', '--verbose') -NoNewWindow -PassThru -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err"
-                $finished = $proc.WaitForExit(90000)  # 90 second timeout
-                if (-not $finished) {
+                Copy-Item -Path $bundled -Destination $getPipPy -Force
+                $havePip = $true
+                Say "Using bundled get-pip.py ($([int]((Get-Item $getPipPy).Length/1024)) KB)" DarkGray
+            } catch {
+                Say "Bundled get-pip.py copy failed: $($_.Exception.Message)" DarkYellow
+            }
+        }
+        # Source 2+: network mirrors (only if bundled missing or copy failed)
+        if (-not $havePip) {
+            $mirrors = @(
+                'https://bootstrap.pypa.io/get-pip.py',
+                'https://raw.githubusercontent.com/pypa/get-pip/main/public/get-pip.py',
+                'https://github.com/matt-magna5/SDT/raw/main/get-pip.py'
+            )
+            foreach ($url in $mirrors) {
+                try {
+                    Invoke-WebRequest -Uri $url -OutFile $getPipPy -UseBasicParsing -TimeoutSec 60 -EA Stop
+                    if ((Test-Path $getPipPy) -and (Get-Item $getPipPy).Length -gt 100000) {
+                        $havePip = $true
+                        Say "Downloaded get-pip.py from $url ($([int]((Get-Item $getPipPy).Length/1024)) KB)" DarkGray
+                        break
+                    }
+                } catch {
+                    Say "Mirror failed ($url): $($_.Exception.Message)" DarkYellow
+                }
+            }
+        }
+        if (-not $havePip) {
+            Say "[X] Could not obtain get-pip.py (bundled + $(($mirrors|Measure).Count) mirror(s) all failed)." Red
+            Say "    Network/proxy/ThreatLocker blocking outbound HTTPS?" DarkYellow
+        } else {
+            Say "Running get-pip.py (up to 90s; hang = python.exe blocked from pypi.org)..." DarkCyan
+            $logFile = Join-Path $env:TEMP "sdt-getpip-$([guid]::NewGuid().ToString('N').Substring(0,6)).log"
+            try {
+                $proc = Start-Process -FilePath $pyExe -ArgumentList @($getPipPy, '--disable-pip-version-check') -NoNewWindow -PassThru -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" -EA SilentlyContinue
+                $finished = if ($proc) { $proc.WaitForExit(90000) } else { $false }
+                if (-not $finished -and $proc) {
                     try { $proc.Kill() } catch { }
-                    Say "[X] get-pip.py timed out after 90s - python.exe blocked from reaching pypi.org" Red
-                    Say "   ThreatLocker / firewall likely dropping outbound HTTPS from python.exe" DarkYellow
-                    Say "   Whitelist python.exe to reach: files.pythonhosted.org, pypi.org, bootstrap.pypa.io" DarkYellow
+                    Say "[X] get-pip.py timed out after 90s - python.exe blocked from pypi.org" Red
+                    Say "   Whitelist python.exe outbound to: files.pythonhosted.org, pypi.org, bootstrap.pypa.io" DarkYellow
                     Say "   Path: $pyExe" DarkGray
                 } else {
                     $getPipLog = ''
                     if (Test-Path $logFile) { $getPipLog = Get-Content $logFile -Raw -EA 0 }
                     if (Test-Path "$logFile.err") { $getPipLog += "`n--- STDERR ---`n" + (Get-Content "$logFile.err" -Raw -EA 0) }
-                    Remove-Item $logFile, "$logFile.err" -EA 0
                     if (Test-PyPipVersion $pyExe) {
                         Say "[OK] pip bootstrapped via get-pip.py." DarkGreen
                     } else {
@@ -206,11 +245,12 @@ if (-not (Test-Path $pyExe)) {
                         Say $getPipLog Yellow
                     }
                 }
-                Remove-Item $getPipPy -EA 0
             } catch {
-                Say "[X] get-pip.py download failed: $($_.Exception.Message)" Red
-                Say "  Likely cause: ThreatLocker or network proxy blocking python.exe / bootstrap.pypa.io" DarkYellow
+                Say "[X] get-pip.py execution failed: $($_.Exception.Message)" Red
+            } finally {
+                Remove-Item $logFile, "$logFile.err" -EA 0
             }
+            Remove-Item $getPipPy -EA 0
         }
     }
 
@@ -246,9 +286,38 @@ if (-not (Test-Path $pyExe)) {
             }
         }
     } else {
-        Say "[X] pip not available. Manual fix needed:" Red
-        Say "    & '$pyExe' -m ensurepip --default-pip" DarkYellow
+        Say "[X] pip not available - skipping deps install. Manual fix:" Red
+        Say "    & '$pyExe' '<repo>\get-pip.py'" DarkYellow
         Say "    & '$pyExe' -m pip install pyVmomi requests urllib3" DarkYellow
+    }
+
+    # === FINAL PRE-FLIGHT: verify everything actually works ===
+    # This runs no matter what path we took above. Gives the user one clean
+    # summary at the end so they know the install is usable.
+    Say "" DarkGray
+    Say "--- Python dep pre-flight ---" DarkCyan
+    $checks = @{
+        'python.exe'   = (Test-Path $pyExe)
+        'pip module'   = (Test-PyPipVersion $pyExe)
+        'import requests' = (Test-PyImport $pyExe 'requests')
+        'import pyVmomi'  = (Test-PyImport $pyExe 'pyVmomi')
+        'import urllib3'  = (Test-PyImport $pyExe 'urllib3')
+    }
+    $allOk = $true
+    foreach ($k in 'python.exe','pip module','import requests','import pyVmomi','import urllib3') {
+        $v = $checks[$k]
+        if ($v) { Say ("  [OK]  {0}" -f $k) DarkGreen }
+        else    { Say ("  [X]   {0}" -f $k) Red; $allOk = $false }
+    }
+    if ($allOk) {
+        Say "[OK] All Python deps verified - hypervisor scan will work." Green
+    } else {
+        Say "[X] Some deps missing - hypervisor scan may fail. See errors above." Yellow
+        Say "   Re-run the install one-liner to retry. If it keeps failing, ThreatLocker is likely blocking python.exe outbound." DarkYellow
+    }
+
+    } finally {
+        $ErrorActionPreference = $prevEAP
     }
 }
 
