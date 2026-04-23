@@ -39,11 +39,21 @@
 param(
     [string]       $ComputerName = $env:COMPUTERNAME,
     [string]       $OutputPath   = $PSScriptRoot,
-    [PSCredential] $Credential
+    [PSCredential] $Credential,
+    [switch]       $NonInteractive
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '3.12'
+# When invoked from the GUI (inside a ThreadJob), there's no interactive
+# host - any Read-Host / Get-Credential call throws "host does not support
+# user interaction" and kills the scan before it even starts. Detect both
+# the explicit flag and the lack of a real user interactive session.
+if ($NonInteractive -or -not [Environment]::UserInteractive) {
+    $script:IsNonInteractive = $true
+} else {
+    $script:IsNonInteractive = $false
+}
+$script:ScriptVersion  = '3.13'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -250,14 +260,18 @@ if ($script:IsRemote) {
         Write-BuddyOK "WinRM reachable on $ComputerName"
     } catch {
         Write-BuddyErr "RemotePreflight" "WinRM not reachable: $_"
-        Write-Host ""
-        Write-Host "  Run these on the TARGET server to enable WinRM:" -ForegroundColor Yellow
-        Write-Host "    winrm quickconfig -y" -ForegroundColor DarkGray
-        Write-Host "    Enable-PSRemoting -Force" -ForegroundColor DarkGray
-        Write-Host "    # If workgroup (not domain-joined):" -ForegroundColor DarkGray
-        Write-Host "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '*' -Force" -ForegroundColor DarkGray
-        Write-Host ""
-        $ans = Read-Host "  Press Enter to try anyway, or Ctrl+C to abort"
+        if ($script:IsNonInteractive) {
+            Write-Host "  (non-interactive mode) proceeding anyway - actual connect will tell us" -ForegroundColor DarkGray
+        } else {
+            Write-Host ""
+            Write-Host "  Run these on the TARGET server to enable WinRM:" -ForegroundColor Yellow
+            Write-Host "    winrm quickconfig -y" -ForegroundColor DarkGray
+            Write-Host "    Enable-PSRemoting -Force" -ForegroundColor DarkGray
+            Write-Host "    # If workgroup (not domain-joined):" -ForegroundColor DarkGray
+            Write-Host "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '*' -Force" -ForegroundColor DarkGray
+            Write-Host ""
+            $ans = Read-Host "  Press Enter to try anyway, or Ctrl+C to abort"
+        }
     }
 
     # -- CREDENTIAL PROMPT + VALIDATION LOOP ------------------------------------
@@ -271,6 +285,10 @@ if ($script:IsRemote) {
         }
 
         if (-not $Credential) {
+            if ($script:IsNonInteractive) {
+                Write-BuddyErr "RemotePreflight" "No credentials passed and non-interactive mode - GUI should have supplied -Credential. Skipping."
+                exit 1
+            }
             Write-Host ""
             Write-Host "  Credentials needed for $ComputerName" -ForegroundColor Yellow
             Write-Host "  (format: DOMAIN\user  or  .\localadmin)" -ForegroundColor DarkGray
@@ -319,6 +337,10 @@ if ($script:IsRemote) {
                     Write-Host ("  (x_x)  Still failing after TrustedHosts fix: $errMsg2") -ForegroundColor Red
                     Write-Host "  This may be an actual credential error now." -ForegroundColor DarkGray
                     Write-Host ""
+                    if ($script:IsNonInteractive) {
+                        Write-BuddyErr "RemotePreflight" "WinRM auth failed after TrustedHosts fix: $errMsg2 (non-interactive - not retrying)"
+                        exit 1
+                    }
                     Write-Host "    [R] Retry with different credentials" -ForegroundColor DarkGray
                     Write-Host "    [Q] Quit" -ForegroundColor DarkGray
                     $ans2 = Read-Host "  Choice (R/Q)"
@@ -333,6 +355,10 @@ if ($script:IsRemote) {
                 Write-Host ""
                 Write-Host ("  (x_x)  ACCESS DENIED - wrong username or password.") -ForegroundColor Red
                 Write-Host ("         User: $($Credential.UserName)") -ForegroundColor DarkRed
+                if ($script:IsNonInteractive) {
+                    Write-BuddyErr "RemotePreflight" "Access denied for $($Credential.UserName) on $ComputerName (non-interactive - not retrying)"
+                    exit 1
+                }
                 Write-Host ""
                 Write-Host "    [R] Retry with different credentials" -ForegroundColor DarkGray
                 Write-Host "    [Q] Quit" -ForegroundColor DarkGray
@@ -346,6 +372,10 @@ if ($script:IsRemote) {
             Write-Host ""
             Write-Host ("  (x_x)  Connection test failed:") -ForegroundColor Red
             Write-Host ("         $errMsg") -ForegroundColor DarkRed
+            if ($script:IsNonInteractive) {
+                Write-BuddyErr "RemotePreflight" "Connection test failed on $ComputerName: $errMsg (non-interactive - aborting this target)"
+                exit 1
+            }
             Write-Host ""
             Write-Host "  What would you like to do?" -ForegroundColor Yellow
             Write-Host "    [R] Retry with different credentials" -ForegroundColor DarkGray
@@ -1833,6 +1863,11 @@ if ($script:IsRemote) {
         Write-Host ""
         Write-Host ("  (x_x)  Remote collection FAILED on $ComputerName") -ForegroundColor Red
         Write-Host ("         $remoteErr") -ForegroundColor DarkRed
+        if ($script:IsNonInteractive) {
+            if ($job) { Remove-Job -Job $job -Force -EA SilentlyContinue }
+            Write-BuddyErr "RemoteCollect" "$ComputerName collection failed (non-interactive - moving on)"
+            exit 1
+        }
         Write-Host ""
         Write-Host "  What would you like to do?" -ForegroundColor Yellow
         Write-Host "    [R] Retry this server" -ForegroundColor DarkGray
@@ -2115,8 +2150,10 @@ if (-not (Test-Path $outputFile)) {
     Write-Host "  Try:" -ForegroundColor Yellow
     Write-Host "    - Verify OutputPath exists: Test-Path '$OutputPath'" -ForegroundColor DarkGray
     Write-Host "    - Re-run with explicit path: -OutputPath C:\Temp" -ForegroundColor DarkGray
-    $open = Read-Host "  Open output folder in Explorer? (Y/N)"
-    if ($open -match '^[Yy]') { Start-Process explorer.exe $OutputPath }
+    if (-not $script:IsNonInteractive) {
+        $open = Read-Host "  Open output folder in Explorer? (Y/N)"
+        if ($open -match '^[Yy]') { Start-Process explorer.exe $OutputPath }
+    }
     exit 1
 }
 

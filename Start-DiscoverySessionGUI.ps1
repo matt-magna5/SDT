@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.1.7'
+$script:Version   = '4.1.8'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -1026,10 +1026,38 @@ function Start-DiscoveryRun {
                 }
 
                 # ---- Actual WinRM discovery ---------------------------
-                $invokeArgs = @{ ComputerName = $t.Address; OutputPath = $Session.SessionDir }
-                if ($cred) { $invokeArgs.Credential = $cred }
-                $preJson = @(Get-ChildItem $Session.SessionDir -Filter '*-discovery-*.json' -EA 0 | Select-Object -ExpandProperty FullName)
-                & $invoke @invokeArgs *>&1 | ForEach-Object {
+                # Build a ranked list of target addresses to try. First the
+                # user-provided one, then FQDN variants (derived from the
+                # hypervisor host suffix when the target is short-NetBIOS),
+                # then the resolved IP. First one that produces a JSON wins.
+                $tryAddrs = New-Object System.Collections.ArrayList
+                [void]$tryAddrs.Add($t.Address)
+                $hvHost = "$($Payload.hvHost)"
+                if ($t.Address -notmatch '\.' -and $hvHost -match '\.') {
+                    $hvSuffix = $hvHost -replace '^[^\.]+\.',''
+                    if ($hvSuffix) {
+                        $fqdnGuess = "$($t.Address).$hvSuffix"
+                        if ($tryAddrs -notcontains $fqdnGuess) { [void]$tryAddrs.Add($fqdnGuess) }
+                    }
+                }
+                # Try IP as last resort
+                try {
+                    $ips = [System.Net.Dns]::GetHostAddresses($t.Address) 2>$null
+                    $ipStr = ($ips | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1).IPAddressToString
+                    if ($ipStr -and ($tryAddrs -notcontains $ipStr)) { [void]$tryAddrs.Add($ipStr) }
+                } catch {}
+
+                $addrShort = ($t.Address -split '\.',2)[0]
+                $ownJson = $null
+                foreach ($addr in $tryAddrs) {
+                    [void]$lines.Add("[attempt] ComputerName=$addr")
+                    $invokeArgs = @{
+                        ComputerName   = $addr
+                        OutputPath     = $Session.SessionDir
+                        NonInteractive = $true
+                    }
+                    if ($cred) { $invokeArgs.Credential = $cred }
+                    & $invoke @invokeArgs *>&1 | ForEach-Object {
                     $line = "$_"
                     [void]$lines.Add($line)
                     $stripped = $line.Trim()
@@ -1046,11 +1074,18 @@ function Start-DiscoveryRun {
                         $Session.Targets[$i] = $t
                     }
                 }
+                    # End of per-attempt ForEach-Object pipeline
+                    # (closing brace for the ForEach-Object script block is here:)
+                    }
+                    # Check for this target's own JSON after this attempt
+                    $probe = @(Get-ChildItem $Session.SessionDir -Filter "$addrShort-discovery-*.json" -EA 0 |
+                        Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+                    if ($probe) { $ownJson = $probe; break }
+                    [void]$lines.Add("[attempt] no JSON yet - trying next address")
+                }
                 try { [System.IO.File]::WriteAllText($perLog, ($lines -join "`r`n"), [System.Text.Encoding]::UTF8) } catch {}
-                $postJson = @(Get-ChildItem $Session.SessionDir -Filter '*-discovery-*.json' -EA 0 | Select-Object -ExpandProperty FullName)
-                $newJson  = $postJson | Where-Object { $preJson -notcontains $_ }
-                if ($newJson) {
-                    $jsonFile = $newJson | Select-Object -First 1
+                if ($ownJson) {
+                    $jsonFile = $ownJson[0].FullName
                     $t.JsonPath = $jsonFile
                     $t.State    = 'done'
                     $t.Phase    = "json: $(Split-Path -Leaf $jsonFile)"
@@ -1453,15 +1488,35 @@ try {
         try {
             switch -Regex ("$method $path") {
                 '^GET /api/status$' {
-                    Send-Json -Response $resp -Data @{
-                        Status     = $script:Session.Status
-                        Client     = $script:Session.Client
-                        SessionDir = $script:Session.SessionDir
-                        Targets    = @($script:Session.Targets)
-                        LogTail    = @($script:Session.LogTail)
-                        ReportPath = $script:Session.ReportPath
-                        ReportZipPath = $script:Session.ReportZipPath
-                        MissingTargets = @($script:Session.MissingTargets)
+                    # Wrapped so a single malformed field (e.g. XML in a Phase
+                    # string) can never 500 the status poll and break the UI.
+                    try {
+                        $safeTargets = @()
+                        foreach ($t in $script:Session.Targets) {
+                            $copy = [ordered]@{}
+                            foreach ($k in $t.Keys) {
+                                $v = $t[$k]
+                                if ($v -is [string] -and $v.Length -gt 500) { $v = $v.Substring(0,497) + '...' }
+                                $copy[$k] = $v
+                            }
+                            $safeTargets += $copy
+                        }
+                        Send-Json -Response $resp -Data @{
+                            Status         = $script:Session.Status
+                            Client         = $script:Session.Client
+                            SessionDir     = $script:Session.SessionDir
+                            Targets        = $safeTargets
+                            LogTail        = @($script:Session.LogTail)
+                            ReportPath     = $script:Session.ReportPath
+                            ReportZipPath  = $script:Session.ReportZipPath
+                            MissingTargets = @($script:Session.MissingTargets)
+                        }
+                    } catch {
+                        # Minimal fallback so polling never breaks
+                        Send-Json -Response $resp -Data @{
+                            Status = $script:Session.Status
+                            error  = "status serialize failed: $($_.Exception.Message)"
+                        }
                     }
                     break
                 }
