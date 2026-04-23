@@ -710,14 +710,21 @@ def run(vcenter, username, password, days=90, output_dir='.'):
         cluster['CapacityMiB'] = round(sum(d['CapacityMiB'] for d in datastores), 1)
         cluster['ConsumedMiB'] = round(sum(d['ConsumedMiB'] for d in datastores), 1)
 
-    # Assemble output
+    # Assemble output. Schema + filename match what gen_report.py picks up
+    # as a vSphereInventory (filename contains 'inventory' + top-level _type).
     date_str = datetime.now().strftime('%Y-%m-%d')
+    # Sanitize host for filename
+    host_safe = re.sub(r'[^A-Za-z0-9_.-]', '_', vcenter)
     out = {
-        "_type":        "vSpherePerf",
-        "_source":      f"collect_vsphere_perf.py — direct SOAP — {days} days",
+        "_type":        "vSphereInventory",
+        "_source":      f"collect_vsphere_perf.py via pyVmomi + SOAP - {days} days",
+        "Server":       vcenter,
+        "Version":      host_info.get('Hypervisor', '') if isinstance(host_info, dict) else '',
+        "APIVersion":   host_info.get('Hypervisor', '') if isinstance(host_info, dict) else '',
         "CollectedAt":  datetime.now().isoformat(),
         "DurationDays": days,
         "Host":         host_info,
+        "ESXHosts":     [host_info] if host_info else [],
         "Cluster":      cluster,
         "VMs":          vm_results,
         "Datastores":   datastores,
@@ -725,7 +732,7 @@ def run(vcenter, username, password, days=90, output_dir='.'):
     }
 
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"vsphere-perf-{date_str}.json")
+    out_path = os.path.join(output_dir, f"{host_safe}-inventory-{date_str}.json")
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(out, f, indent=2, default=str)
 
