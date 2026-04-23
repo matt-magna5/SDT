@@ -122,51 +122,96 @@ if (-not (Test-Path $pyExe)) {
         try { Push-Location $AppDir; & $getPy | Out-Null } catch { Say "Portable Python fetch failed: $($_.Exception.Message)" Yellow } finally { Pop-Location }
     }
 }
-if (Test-Path $pyExe) {
-    # ----- Ensure pip is bootstrapped in the embeddable Python --------------
-    $pipOk = $false
-    try { & $pyExe -m pip --version 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $pipOk = $true } } catch { }
-    if (-not $pipOk) {
-        Say "Bootstrapping pip in embeddable Python..." DarkCyan
-        # Find the python<ver>._pth file and enable 'import site' so pip works
-        $pthFile = Get-ChildItem $PyDir -Filter 'python*._pth' -EA 0 | Select-Object -First 1
-        if ($pthFile) {
-            $pthContent = Get-Content $pthFile.FullName -Raw
-            if ($pthContent -match '(?m)^\s*#\s*import\s+site\s*$') {
-                ($pthContent -replace '(?m)^\s*#\s*import\s+site\s*$', 'import site') | Set-Content $pthFile.FullName -Encoding ASCII
-                Say "Enabled 'import site' in $($pthFile.Name)" DarkGray
-            }
-        }
-        # Download get-pip.py and run it
-        $getPipPy = Join-Path $PyDir 'get-pip.py'
+if (-not (Test-Path $pyExe)) {
+    Say "[X] Portable Python missing. Hypervisor scan will fail." Red
+    Say "  Expected: $pyExe" DarkGray
+} else {
+    Say "Python found: $pyExe" DarkGray
+
+    # --- Helper: test if a python module imports cleanly ---
+    function Test-PyImport([string]$py, [string]$module) {
         try {
-            Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $getPipPy -UseBasicParsing -TimeoutSec 60
-            & $pyExe $getPipPy --quiet --disable-pip-version-check 2>&1 | Out-Null
-            Remove-Item $getPipPy -EA 0
-            try { & $pyExe -m pip --version 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $pipOk = $true } } catch { }
-            if ($pipOk) { Say "pip bootstrapped." DarkGreen } else { Say "pip bootstrap didn't complete." Yellow }
-        } catch {
-            Say "get-pip.py download/run failed: $($_.Exception.Message)" Yellow
-        }
+            $out = & $py -c "import $module" 2>&1 | Out-String
+            return ($LASTEXITCODE -eq 0)
+        } catch { return $false }
     }
-    if ($pipOk) {
-        Say "Installing Python deps (pyVmomi, requests, urllib3)..." DarkCyan
+    function Test-PyPipVersion([string]$py) {
         try {
-            $pipOut = & $pyExe -m pip install --quiet --disable-pip-version-check pyVmomi requests urllib3 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0) {
-                Say "Python deps ready." DarkGreen
-            } else {
-                Say "pip install returned $LASTEXITCODE. Output:" Yellow
-                Say $pipOut Yellow
-            }
-        } catch {
-            Say "pip install failed: $($_.Exception.Message)" Yellow
+            $out = & $py -m pip --version 2>&1 | Out-String
+            return ($LASTEXITCODE -eq 0 -and $out -match 'pip \d')
+        } catch { return $false }
+    }
+
+    # Step 1: ensure 'import site' in ._pth (embeddable Python disables it by default)
+    $pthFile = Get-ChildItem $PyDir -Filter 'python*._pth' -EA 0 | Select-Object -First 1
+    if ($pthFile) {
+        $pthContent = Get-Content $pthFile.FullName -Raw
+        if ($pthContent -match '(?m)^\s*#\s*import\s+site\s*$') {
+            ($pthContent -replace '(?m)^\s*#\s*import\s+site\s*$', 'import site') | Set-Content $pthFile.FullName -Encoding ASCII
+            Say "Enabled 'import site' in $($pthFile.Name)" DarkGray
+        } else {
+            Say "'import site' already enabled in $($pthFile.Name)" DarkGray
         }
     } else {
-        Say "pip not available - hypervisor scan will fail until 'sdt update' succeeds or deps installed manually." Yellow
+        Say "No python*._pth found in $PyDir - skipping site-packages enable" DarkYellow
     }
-} else {
-    Say "Portable Python not available - hypervisor scan will need system Python on PATH." Yellow
+
+    # Step 2: ensure pip is installed. Try ensurepip first (some distros have it),
+    # fall back to downloading get-pip.py from bootstrap.pypa.io.
+    if (Test-PyPipVersion $pyExe) {
+        Say "pip already present." DarkGreen
+    } else {
+        Say "Bootstrapping pip (method 1: ensurepip)..." DarkCyan
+        & $pyExe -m ensurepip --default-pip --upgrade 2>&1 | Out-Null
+        if (Test-PyPipVersion $pyExe) {
+            Say "[OK] pip bootstrapped via ensurepip." DarkGreen
+        } else {
+            Say "ensurepip unavailable - falling back to get-pip.py" DarkGray
+            $getPipPy = Join-Path $PyDir 'get-pip.py'
+            try {
+                Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $getPipPy -UseBasicParsing -TimeoutSec 60 -EA Stop
+                Say "Downloaded get-pip.py ($([int]((Get-Item $getPipPy).Length/1024)) KB)" DarkGray
+                $getPipLog = & $pyExe $getPipPy --disable-pip-version-check 2>&1 | Out-String
+                Remove-Item $getPipPy -EA 0
+                if (Test-PyPipVersion $pyExe) {
+                    Say "[OK] pip bootstrapped via get-pip.py." DarkGreen
+                } else {
+                    Say "[X] get-pip.py ran but pip still not working:" Red
+                    Say $getPipLog Yellow
+                }
+            } catch {
+                Say "[X] get-pip.py download failed: $($_.Exception.Message)" Red
+                Say "  Likely cause: ThreatLocker or network proxy blocking python.exe / bootstrap.pypa.io" DarkYellow
+            }
+        }
+    }
+
+    # Step 3: pip install the required packages (with verbose fallback)
+    if (Test-PyPipVersion $pyExe) {
+        Say "Installing Python deps (pyVmomi, requests, urllib3)..." DarkCyan
+        $pipLog = & $pyExe -m pip install --disable-pip-version-check pyVmomi requests urllib3 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            Say ("[X] pip install returned exit {0}:" -f $LASTEXITCODE) Red
+            Say $pipLog Yellow
+            Say "Likely cause: ThreatLocker or proxy blocking python.exe from reaching pypi.org" DarkYellow
+        } else {
+            # Step 4: VERIFY imports actually work - the only test that matters
+            $okRequests = Test-PyImport $pyExe 'requests'
+            $okPyvmomi  = Test-PyImport $pyExe 'pyVmomi'
+            $okUrllib3  = Test-PyImport $pyExe 'urllib3'
+            if ($okRequests -and $okPyvmomi -and $okUrllib3) {
+                Say "[OK] Python deps verified (requests, pyVmomi, urllib3 all importable)." Green
+            } else {
+                Say "[X] Deps installed but verify failed:" Red
+                Say ("  requests={0}  pyVmomi={1}  urllib3={2}" -f $okRequests, $okPyvmomi, $okUrllib3) Yellow
+                Say "  pip install log above should show what went wrong" DarkYellow
+            }
+        }
+    } else {
+        Say "[X] pip not available. Manual fix needed:" Red
+        Say "    & '$pyExe' -m ensurepip --default-pip" DarkYellow
+        Say "    & '$pyExe' -m pip install pyVmomi requests urllib3" DarkYellow
+    }
 }
 
 # ----- Write sdt.ps1 shim ----------------------------------------------------
