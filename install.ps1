@@ -152,28 +152,41 @@ param(
 `$ErrorActionPreference = 'Continue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-# ---- Optional update check (skipped for 'version'/'uninstall'/when opted out) ----
+# ---- Loud auto-update - always prints status on every launch ----
 function Invoke-SdtAutoUpdate {
-    if (`$env:SDT_NO_AUTOUPDATE -eq '1') { return }
     `$local = if (Test-Path `$VerFile) { (Get-Content `$VerFile -Raw -EA 0).Trim() } else { '' }
+    if (`$env:SDT_NO_AUTOUPDATE -eq '1') {
+        Write-Host ("  [sdt] update check skipped (SDT_NO_AUTOUPDATE=1, local v{0})" -f `$local) -ForegroundColor DarkGray
+        return
+    }
+    Write-Host ("  [sdt] checking GitHub for newer release (local v{0})..." -f `$local) -ForegroundColor DarkCyan
+    `$latest = `$null
     try {
         `$ProgressPreference = 'SilentlyContinue'
-        `$rel = Invoke-WebRequest 'https://api.github.com/repos/matt-magna5/SDT/releases?per_page=20' -UseBasicParsing -TimeoutSec 5 -EA Stop
+        `$rel = Invoke-WebRequest 'https://api.github.com/repos/matt-magna5/SDT/releases?per_page=20' -UseBasicParsing -TimeoutSec 6 -EA Stop
         `$releases = `$rel.Content | ConvertFrom-Json
         `$guiTag = `$releases | Where-Object { `$_.tag_name -match '^v4' -or `$_.tag_name -match 'alpha|beta|rc' } | Select-Object -First 1
         `$latest = if (`$guiTag) { `$guiTag.tag_name } else { `$releases[0].tag_name }
-        if (-not `$latest -or `$latest -eq `$local) { return }
-        Write-Host "  [sdt] v`$latest available (local `$local) - updating..." -ForegroundColor Yellow
-        # Re-run install.ps1 remotely to refresh files in place
+    } catch {
+        Write-Host ("  [sdt] update check failed: {0} - running local v{1}" -f `$_.Exception.Message, `$local) -ForegroundColor DarkYellow
+        return
+    }
+    if (-not `$latest) {
+        Write-Host "  [sdt] couldn't determine latest release - running local" -ForegroundColor DarkYellow
+        return
+    }
+    if (`$latest -eq `$local) {
+        Write-Host ("  [sdt] up to date (v{0})" -f `$local) -ForegroundColor DarkGreen
+        return
+    }
+    Write-Host ("  [sdt] v{0} available (local v{1}) - updating..." -f `$latest, `$local) -ForegroundColor Yellow
+    try {
         `$inst = Invoke-WebRequest 'https://raw.githubusercontent.com/matt-magna5/SDT/main/install.ps1' -UseBasicParsing -TimeoutSec 30
         `$sb = [ScriptBlock]::Create(`$inst.Content)
         & `$sb -Version `$latest -Quiet -NoLaunch | Out-Null
-        Write-Host "  [sdt] updated to `$latest" -ForegroundColor Green
+        Write-Host ("  [sdt] updated to v{0}" -f `$latest) -ForegroundColor Green
     } catch {
-        # Silent unless user really wants to see: `$env:SDT_DEBUG_UPDATE = '1'
-        if (`$env:SDT_DEBUG_UPDATE -eq '1') {
-            Write-Host "  [sdt] update check failed: `$(`$_.Exception.Message)" -ForegroundColor DarkYellow
-        }
+        Write-Host ("  [sdt] update failed: {0} - running local v{1}" -f `$_.Exception.Message, `$local) -ForegroundColor Red
     }
 }
 
