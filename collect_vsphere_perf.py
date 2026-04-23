@@ -104,19 +104,22 @@ def retrieve_all(sess, host, pc_ref, root_folder, obj_type, paths):
     Returns list of dicts: {'_moid': ..., '_elem_<prop>': xml_element, prop: text_or_None, ...}
     """
     ps = ''.join(f'<vim25:pathSet>{p}</vim25:pathSet>' for p in paths)
+    # PropertyFilterSpec fields are propSet (collection of PropertySpec) and
+    # objectSet (collection of ObjectSpec). ESXi 7 was lenient with the
+    # singular '*Spec' tags but vCenter 7/8 enforces the schema strictly.
     body = f'''<vim25:RetrievePropertiesEx>
       <vim25:_this type="PropertyCollector">{pc_ref}</vim25:_this>
       <vim25:specSet>
-        <vim25:propSpec>
+        <vim25:propSet>
           <vim25:type>{obj_type}</vim25:type>
           <vim25:all>false</vim25:all>
           {ps}
-        </vim25:propSpec>
-        <vim25:objectSpec>
+        </vim25:propSet>
+        <vim25:objectSet>
           <vim25:obj type="Folder">{root_folder}</vim25:obj>
           <vim25:skip>false</vim25:skip>
           {_TRAV}
-        </vim25:objectSpec>
+        </vim25:objectSet>
       </vim25:specSet>
       <vim25:options><vim25:maxObjects>0</vim25:maxObjects></vim25:options>
     </vim25:RetrievePropertiesEx>'''
@@ -396,14 +399,14 @@ def get_licenses(sess, host, pc_ref, lic_ref):
     body = f'''<vim25:RetrievePropertiesEx>
       <vim25:_this type="PropertyCollector">{pc_ref}</vim25:_this>
       <vim25:specSet>
-        <vim25:propSpec>
+        <vim25:propSet>
           <vim25:type>LicenseManager</vim25:type>
           <vim25:all>false</vim25:all>
           <vim25:pathSet>licenses</vim25:pathSet>
-        </vim25:propSpec>
-        <vim25:objectSpec>
+        </vim25:propSet>
+        <vim25:objectSet>
           <vim25:obj type="LicenseManager">{lic_ref}</vim25:obj>
-        </vim25:objectSpec>
+        </vim25:objectSet>
       </vim25:specSet>
       <vim25:options/>
     </vim25:RetrievePropertiesEx>'''
