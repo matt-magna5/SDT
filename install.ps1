@@ -167,11 +167,18 @@ if (-not (Test-Path $pyExe)) {
         Say "pip already present." DarkGreen
     } else {
         Say "Bootstrapping pip (method 1: ensurepip)..." DarkCyan
-        & $pyExe -m ensurepip --default-pip --upgrade 2>&1 | Out-Null
+        # Run via Start-Process so native stderr never becomes a PS
+        # NativeCommandError under $ErrorActionPreference='Stop'
+        # (embeddable Python has no ensurepip, which used to kill the whole install).
+        $epLog = Join-Path $env:TEMP "sdt-ensurepip-$([guid]::NewGuid().ToString('N').Substring(0,6)).log"
+        try {
+            $epProc = Start-Process -FilePath $pyExe -ArgumentList @('-m','ensurepip','--default-pip','--upgrade') -NoNewWindow -PassThru -Wait -RedirectStandardOutput $epLog -RedirectStandardError "$epLog.err" -EA SilentlyContinue
+        } catch { }
+        Remove-Item $epLog, "$epLog.err" -EA 0
         if (Test-PyPipVersion $pyExe) {
             Say "[OK] pip bootstrapped via ensurepip." DarkGreen
         } else {
-            Say "ensurepip unavailable - falling back to get-pip.py" DarkGray
+            Say "ensurepip unavailable (embeddable Python) - falling back to get-pip.py" DarkGray
             $getPipPy = Join-Path $PyDir 'get-pip.py'
             try {
                 Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $getPipPy -UseBasicParsing -TimeoutSec 60 -EA Stop
