@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.1.6'
+$script:Version   = '4.1.7'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -958,6 +958,8 @@ function Start-DiscoveryRun {
 
             try {
                 # ---- Preflight reachability check ---------------------
+                # 5s per probe - 1.5s was too aggressive across VPN + NetBIOS
+                # name resolution. DNS alone can chew 3s.
                 $t.Phase = 'preflight...'
                 $Session.Targets[$i] = $t
                 $pingOk  = $false; $winrmOk = $false; $sshOk = $false
@@ -965,40 +967,62 @@ function Start-DiscoveryRun {
                 try {
                     $tcp = New-Object System.Net.Sockets.TcpClient
                     $ia  = $tcp.BeginConnect($t.Address, 5985, $null, $null)
-                    if ($ia.AsyncWaitHandle.WaitOne(1500)) { $winrmOk = $tcp.Connected; $tcp.EndConnect($ia) }
+                    if ($ia.AsyncWaitHandle.WaitOne(5000)) { $winrmOk = $tcp.Connected; $tcp.EndConnect($ia) }
                     $tcp.Close()
                 } catch {}
                 if (-not $winrmOk) {
                     try {
                         $tcp = New-Object System.Net.Sockets.TcpClient
                         $ia  = $tcp.BeginConnect($t.Address, 5986, $null, $null)
-                        if ($ia.AsyncWaitHandle.WaitOne(1500)) { $winrmOk = $tcp.Connected; $tcp.EndConnect($ia) }
+                        if ($ia.AsyncWaitHandle.WaitOne(5000)) { $winrmOk = $tcp.Connected; $tcp.EndConnect($ia) }
                         $tcp.Close()
+                    } catch {}
+                }
+                # Second-chance check: Test-WSMan uses its own discovery/auth
+                # stack and sometimes succeeds where raw TCP connects fail
+                # (e.g. HTTPS-only with a custom listener cert).
+                if (-not $winrmOk) {
+                    try {
+                        $null = Test-WSMan -ComputerName $t.Address -ErrorAction Stop
+                        $winrmOk = $true
                     } catch {}
                 }
                 try {
                     $tcp = New-Object System.Net.Sockets.TcpClient
                     $ia  = $tcp.BeginConnect($t.Address, 22, $null, $null)
-                    if ($ia.AsyncWaitHandle.WaitOne(1500)) { $sshOk = $tcp.Connected; $tcp.EndConnect($ia) }
+                    if ($ia.AsyncWaitHandle.WaitOne(5000)) { $sshOk = $tcp.Connected; $tcp.EndConnect($ia) }
                     $tcp.Close()
                 } catch {}
                 [void]$lines.Add("[preflight] ping=$pingOk winrm=$winrmOk ssh=$sshOk")
 
-                if (-not $winrmOk) {
-                    if (-not $pingOk -and -not $sshOk) {
-                        $t.State='error'; $t.Phase='unreachable (powered off / wrong IP / firewalled)'
-                    } elseif ($sshOk -and -not $winrmOk) {
-                        $t.State='error'; $t.Phase='looks like Linux (SSH only) - use Linux workflow'
-                    } elseif ($pingOk -and -not $winrmOk -and -not $sshOk) {
-                        $t.State='error'; $t.Phase='up but WinRM/SSH both closed (Enable-PSRemoting or firewall?)'
-                    } else {
-                        $t.State='error'; $t.Phase='not Windows or WinRM not enabled'
-                    }
+                # Only skip the scan in ONE case: truly unreachable (no ping,
+                # no WinRM, no SSH). Every other combination - including
+                # "up but WinRM probe failed" - gets attempted anyway,
+                # because probes can false-negative (firewall drops SYN
+                # silently, name resolution slow, etc.) and the actual
+                # WinRM call will give us the real error.
+                if (-not $pingOk -and -not $winrmOk -and -not $sshOk) {
+                    $t.State='error'; $t.Phase='unreachable (no ping, no WinRM, no SSH)'
                     $t.Finished = (Get-Date).ToString('HH:mm:ss')
                     $Session.Targets[$i] = $t
                     try { [System.IO.File]::WriteAllText($perLog, ($lines -join "`r`n"), [System.Text.Encoding]::UTF8) } catch {}
-                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): SKIPPED - $($t.Phase)") | Out-Null
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): SKIPPED - fully unreachable") | Out-Null
                     return
+                }
+                if ($sshOk -and -not $winrmOk -and -not $pingOk) {
+                    # SSH-only, no ICMP, no WinRM - very likely Linux appliance
+                    $t.State='error'; $t.Phase='Linux/SSH-only appliance - skip for WinRM run'
+                    $t.Finished = (Get-Date).ToString('HH:mm:ss')
+                    $Session.Targets[$i] = $t
+                    try { [System.IO.File]::WriteAllText($perLog, ($lines -join "`r`n"), [System.Text.Encoding]::UTF8) } catch {}
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): SKIPPED - SSH-only (Linux)") | Out-Null
+                    return
+                }
+                # Preflight couldn't confirm WinRM but the box isnt dead.
+                # Press on and let Invoke-ServerDiscovery tell us for real.
+                if (-not $winrmOk) {
+                    [void]$lines.Add("[preflight] WinRM probe inconclusive - attempting scan anyway")
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): preflight inconclusive - attempting scan") | Out-Null
                 }
 
                 # ---- Actual WinRM discovery ---------------------------
