@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.0.9'
+$script:Version   = '4.1.0'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -283,6 +283,12 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 <input name="client" required placeholder="Acme Corporation"></div>
 <div class="field"><label>Output folder <span class="hint" data-tip="Discovery JSONs + HTML report land here. Default is fine; a per-client subfolder is created automatically.">i</span></label>
 <input name="outputDir" value="C:\Temp\sdt\sessions" required></div>
+</div>
+<div class="grid2" style="margin-top:10px;">
+<div class="field"><label>Parallel scans <span class="hint" data-tip="How many servers to scan at once. 4 is a good default. Go higher (6-8) on powerful boxes, lower if you see WinRM errors from load. Each scan takes ~3-5 minutes on busy servers.">i</span></label>
+<select name="parallel"><option value="1">1 (sequential - old behavior)</option><option value="2">2</option><option value="4" selected>4 (recommended)</option><option value="6">6</option><option value="8">8</option></select></div>
+<div class="field"></div>
+</div>
 </div>
 </div>
 
@@ -921,8 +927,120 @@ function Start-DiscoveryRun {
         }
         if (-not (Test-Path $pyExe)) { $pyExe = 'python' }
 
+        # Scriptblock that does one server's work end-to-end. Runs in a child
+        # ThreadJob so we can fan out across multiple servers at once.
+        $serverWorker = {
+            param($Session, $Payload, $ScriptDir, $BuddyFrames, $i, $cred, $invoke)
+            $t = $Session.Targets[$i]
+            $t.State   = 'running'
+            $t.Started = (Get-Date).ToString('HH:mm:ss')
+            $t.Buddy   = $BuddyFrames[(Get-Random -Maximum $BuddyFrames.Count)]
+            $t.Phase   = 'connecting...'
+            $Session.Targets[$i] = $t
+            $safeName = ($t.Address -replace '[^A-Za-z0-9_.-]+','_')
+            $perLog = Join-Path $Session.SessionDir ("server-{0}.log" -f $safeName)
+            $t.LogPath = $perLog
+            $Session.Targets[$i] = $t
+            $lines = New-Object System.Collections.ArrayList
+
+            try {
+                # ---- Preflight reachability check ---------------------
+                $t.Phase = 'preflight...'
+                $Session.Targets[$i] = $t
+                $pingOk  = $false; $winrmOk = $false; $sshOk = $false
+                try { $pingOk = Test-Connection -ComputerName $t.Address -Count 1 -Quiet -EA SilentlyContinue } catch {}
+                try {
+                    $tcp = New-Object System.Net.Sockets.TcpClient
+                    $ia  = $tcp.BeginConnect($t.Address, 5985, $null, $null)
+                    if ($ia.AsyncWaitHandle.WaitOne(1500)) { $winrmOk = $tcp.Connected; $tcp.EndConnect($ia) }
+                    $tcp.Close()
+                } catch {}
+                if (-not $winrmOk) {
+                    try {
+                        $tcp = New-Object System.Net.Sockets.TcpClient
+                        $ia  = $tcp.BeginConnect($t.Address, 5986, $null, $null)
+                        if ($ia.AsyncWaitHandle.WaitOne(1500)) { $winrmOk = $tcp.Connected; $tcp.EndConnect($ia) }
+                        $tcp.Close()
+                    } catch {}
+                }
+                try {
+                    $tcp = New-Object System.Net.Sockets.TcpClient
+                    $ia  = $tcp.BeginConnect($t.Address, 22, $null, $null)
+                    if ($ia.AsyncWaitHandle.WaitOne(1500)) { $sshOk = $tcp.Connected; $tcp.EndConnect($ia) }
+                    $tcp.Close()
+                } catch {}
+                [void]$lines.Add("[preflight] ping=$pingOk winrm=$winrmOk ssh=$sshOk")
+
+                if (-not $winrmOk) {
+                    if (-not $pingOk -and -not $sshOk) {
+                        $t.State='error'; $t.Phase='unreachable (powered off / wrong IP / firewalled)'
+                    } elseif ($sshOk -and -not $winrmOk) {
+                        $t.State='error'; $t.Phase='looks like Linux (SSH only) - use Linux workflow'
+                    } elseif ($pingOk -and -not $winrmOk -and -not $sshOk) {
+                        $t.State='error'; $t.Phase='up but WinRM/SSH both closed (Enable-PSRemoting or firewall?)'
+                    } else {
+                        $t.State='error'; $t.Phase='not Windows or WinRM not enabled'
+                    }
+                    $t.Finished = (Get-Date).ToString('HH:mm:ss')
+                    $Session.Targets[$i] = $t
+                    try { [System.IO.File]::WriteAllText($perLog, ($lines -join "`r`n"), [System.Text.Encoding]::UTF8) } catch {}
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): SKIPPED - $($t.Phase)") | Out-Null
+                    return
+                }
+
+                # ---- Actual WinRM discovery ---------------------------
+                $invokeArgs = @{ ComputerName = $t.Address; OutputPath = $Session.SessionDir }
+                if ($cred) { $invokeArgs.Credential = $cred }
+                $preJson = @(Get-ChildItem $Session.SessionDir -Filter '*-discovery-*.json' -EA 0 | Select-Object -ExpandProperty FullName)
+                & $invoke @invokeArgs *>&1 | ForEach-Object {
+                    $line = "$_"
+                    [void]$lines.Add($line)
+                    if ($line -match '^\s*\[(\w+)\]') {
+                        $t.Phase = $matches[1]
+                        $t.Buddy = $BuddyFrames[(Get-Random -Maximum $BuddyFrames.Count)]
+                        $Session.Targets[$i] = $t
+                    }
+                }
+                try { [System.IO.File]::WriteAllText($perLog, ($lines -join "`r`n"), [System.Text.Encoding]::UTF8) } catch {}
+                $postJson = @(Get-ChildItem $Session.SessionDir -Filter '*-discovery-*.json' -EA 0 | Select-Object -ExpandProperty FullName)
+                $newJson  = $postJson | Where-Object { $preJson -notcontains $_ }
+                if ($newJson) {
+                    $jsonFile = $newJson | Select-Object -First 1
+                    $t.JsonPath = $jsonFile
+                    $t.State    = 'done'
+                    $t.Phase    = "json: $(Split-Path -Leaf $jsonFile)"
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): JSON written - $(Split-Path -Leaf $jsonFile)") | Out-Null
+                } else {
+                    $tail = ($lines | Select-Object -Last 20) -join ' | '
+                    $reason = 'no discovery JSON written'
+                    if     ($tail -match '(?i)Access is denied')           { $reason = 'WinRM auth denied (check creds/domain)' }
+                    elseif ($tail -match '(?i)cannot find')                { $reason = 'host unreachable or name not resolvable' }
+                    elseif ($tail -match '(?i)WinRM|5985|5986')            { $reason = 'WinRM not reachable (port 5985/5986)' }
+                    elseif ($tail -match '(?i)timed? ?out')                { $reason = 'connection timed out' }
+                    elseif ($tail -match '(?i)ConvertTo-Json')             { $reason = 'data collected but JSON serialize failed - see per-server log' }
+                    $t.State    = 'error'
+                    $t.Phase    = $reason
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): NO JSON - $reason (see $(Split-Path -Leaf $perLog))") | Out-Null
+                }
+            } catch {
+                $t.State = 'error'
+                $t.Phase = $_.Exception.Message
+            }
+            $t.Finished = (Get-Date).ToString('HH:mm:ss')
+            $Session.Targets[$i] = $t
+        }
+
+        # ---- Run hypervisor targets sequentially (usually 0 or 1), then
+        # fan out server targets across $parallel ThreadJobs.
+        $parallel = 4
+        try { $parallel = [int]("$($Payload.parallel)") } catch {}
+        if ($parallel -lt 1) { $parallel = 1 }
+        if ($parallel -gt 16) { $parallel = 16 }
+        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Discovery starting - parallelism=$parallel") | Out-Null
+
         for ($i = 0; $i -lt $Session.Targets.Count; $i++) {
             $t = $Session.Targets[$i]
+            if ($t.Kind -ne 'hypervisor') { continue }
             $t.State   = 'running'
             $t.Started = (Get-Date).ToString('HH:mm:ss')
             $t.Buddy   = $BuddyFrames[(Get-Random -Maximum $BuddyFrames.Count)]
@@ -962,99 +1080,6 @@ function Start-DiscoveryRun {
                     } else {
                         $t.State='error'; $t.Phase='inventory not written (check hypervisor creds / reachability)'
                     }
-                } else {
-                    # Per-server Windows discovery
-                    $safeName = ($t.Address -replace '[^A-Za-z0-9_.-]+','_')
-                    $perLog = Join-Path $Session.SessionDir ("server-{0}.log" -f $safeName)
-                    $t.LogPath = $perLog
-                    $Session.Targets[$i] = $t
-                    $lines = New-Object System.Collections.ArrayList
-
-                    # ---- Preflight reachability check ---------------------
-                    # Tells us WHY a scan is going to fail (off / linux / firewalled)
-                    # before we spend a minute trying WinRM.
-                    $t.Phase = 'preflight...'
-                    $Session.Targets[$i] = $t
-                    $pingOk  = $false
-                    $winrmOk = $false
-                    $sshOk   = $false
-                    try { $pingOk = Test-Connection -ComputerName $t.Address -Count 1 -Quiet -EA SilentlyContinue } catch {}
-                    try {
-                        $tcp = New-Object System.Net.Sockets.TcpClient
-                        $ia  = $tcp.BeginConnect($t.Address, 5985, $null, $null)
-                        if ($ia.AsyncWaitHandle.WaitOne(1500)) { $winrmOk = $tcp.Connected; $tcp.EndConnect($ia) }
-                        $tcp.Close()
-                    } catch {}
-                    if (-not $winrmOk) {
-                        try {
-                            $tcp = New-Object System.Net.Sockets.TcpClient
-                            $ia  = $tcp.BeginConnect($t.Address, 5986, $null, $null)
-                            if ($ia.AsyncWaitHandle.WaitOne(1500)) { $winrmOk = $tcp.Connected; $tcp.EndConnect($ia) }
-                            $tcp.Close()
-                        } catch {}
-                    }
-                    try {
-                        $tcp = New-Object System.Net.Sockets.TcpClient
-                        $ia  = $tcp.BeginConnect($t.Address, 22, $null, $null)
-                        if ($ia.AsyncWaitHandle.WaitOne(1500)) { $sshOk = $tcp.Connected; $tcp.EndConnect($ia) }
-                        $tcp.Close()
-                    } catch {}
-                    [void]$lines.Add("[preflight] ping=$pingOk winrm=$winrmOk ssh=$sshOk")
-
-                    if (-not $winrmOk) {
-                        if (-not $pingOk -and -not $sshOk) {
-                            $t.State='error'; $t.Phase='unreachable (powered off / wrong IP / firewalled)'
-                        } elseif ($sshOk -and -not $winrmOk) {
-                            $t.State='error'; $t.Phase='looks like Linux (SSH only) - use Linux workflow'
-                        } elseif ($pingOk -and -not $winrmOk -and -not $sshOk) {
-                            $t.State='error'; $t.Phase='up but WinRM/SSH both closed (Enable-PSRemoting or firewall?)'
-                        } else {
-                            $t.State='error'; $t.Phase='not Windows or WinRM not enabled'
-                        }
-                        $t.Finished = (Get-Date).ToString('HH:mm:ss')
-                        $Session.Targets[$i] = $t
-                        try { [System.IO.File]::WriteAllText($perLog, ($lines -join "`r`n"), [System.Text.Encoding]::UTF8) } catch {}
-                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): SKIPPED - $($t.Phase)") | Out-Null
-                        continue
-                    }
-
-                    # ---- Actual WinRM discovery ---------------------------
-                    $invokeArgs = @{ ComputerName = $t.Address; OutputPath = $Session.SessionDir }
-                    if ($cred) { $invokeArgs.Credential = $cred }
-                    # Snapshot existing discovery JSONs so we can detect what was newly created
-                    $preJson = @(Get-ChildItem $Session.SessionDir -Filter '*-discovery-*.json' -EA 0 | Select-Object -ExpandProperty FullName)
-                    & $invoke @invokeArgs *>&1 | ForEach-Object {
-                        $line = "$_"
-                        [void]$lines.Add($line)
-                        if ($line -match '^\s*\[(\w+)\]') {
-                            $t.Phase = $matches[1]
-                            $t.Buddy = $BuddyFrames[(Get-Random -Maximum $BuddyFrames.Count)]
-                            $Session.Targets[$i] = $t
-                        }
-                    }
-                    try { [System.IO.File]::WriteAllText($perLog, ($lines -join "`r`n"), [System.Text.Encoding]::UTF8) } catch {}
-                    # Verify: did Invoke-ServerDiscovery produce a new discovery JSON?
-                    $postJson = @(Get-ChildItem $Session.SessionDir -Filter '*-discovery-*.json' -EA 0 | Select-Object -ExpandProperty FullName)
-                    $newJson  = $postJson | Where-Object { $preJson -notcontains $_ }
-                    if ($newJson) {
-                        $jsonFile = $newJson | Select-Object -First 1
-                        $t.JsonPath = $jsonFile
-                        $t.State    = 'done'
-                        $t.Phase    = "json: $(Split-Path -Leaf $jsonFile)"
-                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): JSON written - $(Split-Path -Leaf $jsonFile)") | Out-Null
-                    } else {
-                        # Sniff the per-server log for a probable cause
-                        $tail = ($lines | Select-Object -Last 20) -join ' | '
-                        $reason = 'no discovery JSON written'
-                        if     ($tail -match '(?i)Access is denied')           { $reason = 'WinRM auth denied (check creds/domain)' }
-                        elseif ($tail -match '(?i)cannot find')                { $reason = 'host unreachable or name not resolvable' }
-                        elseif ($tail -match '(?i)WinRM|5985|5986')            { $reason = 'WinRM not reachable (port 5985/5986)' }
-                        elseif ($tail -match '(?i)timed? ?out')                { $reason = 'connection timed out' }
-                        elseif ($tail -match '(?i)ConvertTo-Json')             { $reason = 'data collected but JSON serialize failed - see per-server log' }
-                        $t.State    = 'error'
-                        $t.Phase    = $reason
-                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): NO JSON - $reason (see $(Split-Path -Leaf $perLog))") | Out-Null
-                    }
                 }
                 $t.Finished = (Get-Date).ToString('HH:mm:ss')
             } catch {
@@ -1063,6 +1088,34 @@ function Start-DiscoveryRun {
                 $t.Finished = (Get-Date).ToString('HH:mm:ss')
             }
             $Session.Targets[$i] = $t
+        }
+
+        # ---- Fan out server targets across $parallel ThreadJobs ----
+        $serverIndexes = @()
+        for ($i = 0; $i -lt $Session.Targets.Count; $i++) {
+            if ($Session.Targets[$i].Kind -ne 'hypervisor') { $serverIndexes += $i }
+        }
+        $jobs = [System.Collections.ArrayList]@()
+        foreach ($idx in $serverIndexes) {
+            # Throttle: wait until under the limit before launching another
+            while (($jobs | Where-Object { $_.State -eq 'Running' }).Count -ge $parallel) {
+                Start-Sleep -Milliseconds 400
+            }
+            $j = Start-ThreadJob -ScriptBlock $serverWorker `
+                -ArgumentList $Session, $Payload, $ScriptDir, $BuddyFrames, $idx, $cred, $invoke
+            [void]$jobs.Add($j)
+        }
+        # Wait for every server job to finish. 30-minute safety cap per job.
+        foreach ($j in $jobs) {
+            try {
+                Wait-Job -Job $j -Timeout 1800 | Out-Null
+                if ($j.State -eq 'Running') {
+                    Stop-Job -Job $j -EA SilentlyContinue
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Worker job $($j.Id) exceeded 30 min timeout - stopped") | Out-Null
+                }
+                Receive-Job -Job $j -EA SilentlyContinue | Out-Null
+            } catch {}
+            try { Remove-Job -Job $j -Force -EA SilentlyContinue } catch {}
         }
 
         # ---------------------------------------------------------------
