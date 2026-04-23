@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.1.5'
+$script:Version   = '4.1.6'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -273,7 +273,7 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 
 <!-- SETUP TAB -->
 <div id="tab-setup" class="tab-pane active">
-<form id="setupForm" onsubmit="submitSetup(event)">
+<form id="setupForm" novalidate onsubmit="submitSetup(event)">
 
 <div class="card">
 <div class="card-title">Session <span class="hint" data-tip="Client name appears in the final HTML report header. Output folder is where every JSON, log, and final report for this discovery run gets written.">i</span></div>
@@ -373,7 +373,7 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 </div>
 
 <div style="display:flex;justify-content:flex-end;gap:10px;">
-<button type="submit" class="btn">Run Discovery</button>
+<button type="submit" id="runBtn" class="btn" onclick="submitSetup(event)">Run Discovery</button>
 </div>
 </form>
 </div>
@@ -555,8 +555,8 @@ async function submitSetup(e){
     alert('No targets. Enter manual targets, tick VMs from a hypervisor scan, or configure a hypervisor.'); return;
   }
 
-  const btn = form.querySelector('button[type="submit"]');
-  btn.disabled = true; btn.textContent = 'Starting...';
+  const btn = document.getElementById('runBtn') || form.querySelector('button[type="submit"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting...'; }
 
   try {
     const resp = await fetch('/api/start', {
@@ -567,11 +567,11 @@ async function submitSetup(e){
     const respText = await resp.text();
     if (!resp.ok) { throw new Error(respText || ('HTTP ' + resp.status)); }
     setTab('run');
-    document.getElementById('tb-setup').disabled = true;
+    const tbs = document.getElementById('tb-setup'); if (tbs) tbs.disabled = true;
     startPolling();
   } catch(err) {
     alert('Failed to start: ' + err.message);
-    btn.disabled = false; btn.textContent = 'Run Discovery';
+    if (btn) { btn.disabled = false; btn.textContent = 'Run Discovery'; }
   }
 }
 
