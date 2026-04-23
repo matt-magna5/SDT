@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.1.0'
+$script:Version   = '4.1.1'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -50,8 +50,8 @@ $script:BuddyFrames = @('(^_^) ','(^_^)>','(o_o) ','(o_o)>','(-_-) ','(>_<) ','(
 function Add-Log([string]$msg) {
     $stamp = (Get-Date).ToString('HH:mm:ss')
     [void]$script:Session.LogTail.Add("[$stamp] $msg")
-    # Keep only last 500 lines
-    while ($script:Session.LogTail.Count -gt 500) {
+    # Keep only last 2000 lines (higher now that parallel scans stream live)
+    while ($script:Session.LogTail.Count -gt 2000) {
         $script:Session.LogTail.RemoveAt(0)
     }
 }
@@ -995,6 +995,14 @@ function Start-DiscoveryRun {
                 & $invoke @invokeArgs *>&1 | ForEach-Object {
                     $line = "$_"
                     [void]$lines.Add($line)
+                    $stripped = $line.Trim()
+                    # Stream every substantive line to the shared session log
+                    # so the UI can show what a slow phase is actually doing.
+                    # Filter out banner/separator/decor lines.
+                    if ($stripped -and $stripped -notmatch '^[=\-_]{4,}$' -and $stripped -notmatch '^\([\^xo_\.\*\->T]+\)$') {
+                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($t.Address)] $stripped") | Out-Null
+                        while ($Session.LogTail.Count -gt 2000) { try { $Session.LogTail.RemoveAt(0) } catch { break } }
+                    }
                     if ($line -match '^\s*\[(\w+)\]') {
                         $t.Phase = $matches[1]
                         $t.Buddy = $BuddyFrames[(Get-Random -Maximum $BuddyFrames.Count)]

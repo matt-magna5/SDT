@@ -43,7 +43,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ScriptVersion  = '3.11'
+$script:ScriptVersion  = '3.12'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
@@ -987,22 +987,34 @@ $CollectionBlock = {
             # Try Get-SmbShare (PS4+) first
             if ($PSMaj -ge 4) {
                 try {
-                    $shares = Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -notmatch '^\w\$$|^ADMIN\$$|^IPC\$$|^PRINT\$$' }
-                    $result.Shares = @($shares | ForEach-Object {
+                    $allShares = @(Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -notmatch '^\w\$$|^ADMIN\$$|^IPC\$$|^PRINT\$$' })
+                    Write-Host ("  [Shares] Found {0} non-admin share(s); collecting ACLs..." -f $allShares.Count) -ForegroundColor Gray
+                    $collected = New-Object System.Collections.ArrayList
+                    $idx = 0
+                    foreach ($s in $allShares) {
+                        $idx++
+                        # Emit per-share progress so the UI shows which share we are on
+                        # (Get-SmbShareAccess can hang for minutes on stale DFS or offline backends)
+                        Write-Host ("  [Shares] ({0}/{1}) {2} -> {3}" -f $idx, $allShares.Count, $s.Name, $s.Path) -ForegroundColor DarkGray
                         try {
-                            $acl = Get-SmbShareAccess -Name $_.Name -ErrorAction SilentlyContinue
-                            @{
-                                Name        = $_.Name
-                                Path        = $_.Path
-                                Description = $_.Description
+                            $acl = Get-SmbShareAccess -Name $s.Name -ErrorAction SilentlyContinue
+                            [void]$collected.Add(@{
+                                Name        = $s.Name
+                                Path        = $s.Path
+                                Description = $s.Description
                                 Permissions = @($acl | Select-Object AccountName, AccessControlType, AccessRight)
-                            }
-                        } catch { @{ Name=$_.Name; Path=$_.Path; Description=$_.Description } }
-                    })
+                            })
+                        } catch {
+                            Write-Host ("  [Shares] ({0}/{1}) {2} ACL failed: {3}" -f $idx, $allShares.Count, $s.Name, $_.Exception.Message) -ForegroundColor DarkYellow
+                            [void]$collected.Add(@{ Name=$s.Name; Path=$s.Path; Description=$s.Description })
+                        }
+                    }
+                    $result.Shares = @($collected)
                     try {
                         $sessions = Get-SmbSession -ErrorAction SilentlyContinue
                         $result.OpenSessions = if ($sessions) { @($sessions).Count } else { 0 }
                     } catch { }
+                    Write-Host ("  [Shares] Done - {0} share(s) collected" -f $result.Shares.Count) -ForegroundColor Gray
                     return $result
                 } catch { }
             }
