@@ -605,13 +605,53 @@ function renderStatus(s){
 
 function renderReport(s){
   const el = document.getElementById('reportContent');
+  const sessionDir = s.SessionDir || '';
+  const openFolderBtn = sessionDir
+    ? `<button class="btn btn-secondary" onclick="openSessionFolder()" style="margin-top:10px;margin-left:8px;">Open session folder</button>`
+    : '';
+  const viewLogBtn = sessionDir
+    ? `<button class="btn btn-secondary" onclick="viewGenLog()" style="margin-top:10px;margin-left:8px;">View gen_report log</button>`
+    : '';
+
   if (s.ReportPath) {
     el.innerHTML = `<p style="font-size:13px;">Report saved:</p>
       <p><code style="font-family:var(--mono);color:var(--info);font-size:12px;word-break:break-all;">${escapeHtml(s.ReportPath)}</code></p>
-      <p><a href="file:///${escapeHtml(s.ReportPath.replace(/\\/g,'/'))}" target="_blank" class="btn" style="display:inline-block;text-decoration:none;margin-top:10px;">Open report</a></p>`;
+      <p>
+        <a href="file:///${escapeHtml(s.ReportPath.replace(/\\/g,'/'))}" target="_blank" class="btn" style="display:inline-block;text-decoration:none;">Open report</a>
+        ${openFolderBtn}
+        ${viewLogBtn}
+      </p>
+      <div id="genLogBox"></div>`;
     document.getElementById('reportSub').textContent = 'Session complete. Click below to open the HTML report.';
   } else {
-    el.innerHTML = '<p style="color:var(--muted);">Report not generated - check log for errors.</p>';
+    el.innerHTML = `<p style="color:var(--warn);">Report not generated - check log for errors.</p>
+      <p style="color:var(--muted);font-size:12px;">Session dir: <code style="font-family:var(--mono);">${escapeHtml(sessionDir)}</code></p>
+      <p>${openFolderBtn}${viewLogBtn}</p>
+      <div id="genLogBox"></div>`;
+  }
+}
+
+async function openSessionFolder(){
+  try {
+    const resp = await fetch('/api/open-folder', { method: 'POST' });
+    if (!resp.ok) { alert('Failed to open folder: ' + await resp.text()); }
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function viewGenLog(){
+  const box = document.getElementById('genLogBox');
+  box.innerHTML = '<p style="color:var(--muted);font-size:12px;margin-top:14px;">Loading log...</p>';
+  try {
+    const resp = await fetch('/api/gen-log');
+    const data = await resp.json();
+    if (data.content) {
+      box.innerHTML = `<div style="margin-top:14px;"><div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px;">gen_report.log</div>
+        <pre style="background:#07101f;color:#c7d1df;padding:14px;border-radius:8px;font-family:var(--mono);font-size:11.5px;max-height:420px;overflow:auto;white-space:pre-wrap;">${escapeHtml(data.content)}</pre></div>`;
+    } else {
+      box.innerHTML = `<p style="color:var(--muted);font-size:12px;margin-top:10px;">No log file: ${escapeHtml(data.error || 'unknown')}</p>`;
+    }
+  } catch(e) {
+    box.innerHTML = `<p style="color:var(--crit);font-size:12px;margin-top:10px;">Error loading log: ${escapeHtml(e.message)}</p>`;
   }
 }
 
@@ -852,12 +892,13 @@ function Start-DiscoveryRun {
             $Session.Targets[$i] = $t
         }
 
-        # Attempt to generate the HTML report
+        # Attempt to generate the HTML report. Capture stdout+stderr to gen_report.log
+        # in the session dir so failures are diagnosable without restarting.
         $gen = Join-Path $ScriptDir 'gen_report.py'
         $py  = Join-Path $ScriptDir 'python\python.exe'
         if (-not (Test-Path $py)) { $py = 'python' }
+        $reportLog = Join-Path $Session.SessionDir 'gen_report.log'
         try {
-            # Build a minimal manifest - gen_report.py expects CFG with client/date/session_dir etc.
             $mf = Join-Path $Session.SessionDir 'manifest.json'
             $manifest = @{
                 client      = $Payload.client
@@ -869,11 +910,22 @@ function Start-DiscoveryRun {
                 logo_file   = ''
             } | ConvertTo-Json -Depth 6
             [System.IO.File]::WriteAllText($mf, $manifest, [System.Text.Encoding]::UTF8)
-            & $py $gen $mf 2>&1 | Out-Null
+            # Run + capture everything
+            $logContent = & $py $gen $mf 2>&1 | Out-String
+            [System.IO.File]::WriteAllText($reportLog, $logContent, [System.Text.Encoding]::UTF8)
             # Find the resulting HTML
             $html = Get-ChildItem $Session.SessionDir -Filter '*DiscoveryReport*.html' -EA 0 | Select-Object -First 1
-            if ($html) { $Session.ReportPath = $html.FullName }
-        } catch { }
+            if ($html) {
+                $Session.ReportPath = $html.FullName
+            } else {
+                # Leave a breadcrumb in the session log so the UI shows the issue
+                $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py produced no HTML - see gen_report.log in session dir") | Out-Null
+            }
+        } catch {
+            $errMsg = $_.Exception.Message
+            [System.IO.File]::WriteAllText($reportLog, "Exception invoking gen_report.py: $errMsg", [System.Text.Encoding]::UTF8)
+            $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py exception: $errMsg") | Out-Null
+        }
 
         $Session.Status     = 'complete'
         $Session.FinishedAt = Get-Date
@@ -1081,6 +1133,39 @@ try {
                     $payload | Add-Member -NotePropertyName targets -NotePropertyValue $targets -Force
                     $null = Start-DiscoveryRun -Payload $payload
                     Send-Json -Response $resp -Data @{ ok = $true; sessionDir = $script:Session.SessionDir; targetCount = $targets.Count }
+                    break
+                }
+                '^POST /api/open-folder$' {
+                    $dir = $script:Session.SessionDir
+                    if (-not $dir -or -not (Test-Path $dir)) {
+                        Send-Json -Response $resp -Data @{ error = "Session folder does not exist: $dir" } -StatusCode 404
+                        break
+                    }
+                    try {
+                        Start-Process explorer.exe $dir | Out-Null
+                        Send-Json -Response $resp -Data @{ ok = $true; path = $dir }
+                    } catch {
+                        Send-Json -Response $resp -Data @{ error = $_.Exception.Message } -StatusCode 500
+                    }
+                    break
+                }
+                '^GET /api/gen-log$' {
+                    $dir = $script:Session.SessionDir
+                    if (-not $dir) {
+                        Send-Json -Response $resp -Data @{ error = 'no session dir' } -StatusCode 404
+                        break
+                    }
+                    $log = Join-Path $dir 'gen_report.log'
+                    if (-not (Test-Path $log)) {
+                        Send-Json -Response $resp -Data @{ error = "gen_report.log not found in $dir" } -StatusCode 404
+                        break
+                    }
+                    try {
+                        $content = [System.IO.File]::ReadAllText($log, [System.Text.Encoding]::UTF8)
+                        Send-Json -Response $resp -Data @{ ok = $true; content = $content; path = $log }
+                    } catch {
+                        Send-Json -Response $resp -Data @{ error = $_.Exception.Message } -StatusCode 500
+                    }
                     break
                 }
                 '^GET /$|^GET /index\.html$' {
