@@ -136,6 +136,9 @@ def retrieve_all(sess, host, pc_ref, root_folder, obj_type, paths):
         results.append(rec)
     return results
 
+# Global pyVmomi ServiceInstance - set by login(), used by inventory helpers
+_SI = None
+
 # ── Step 1: Login  ───────────────────────────────────────────────────────────
 
 def login(sess, host, user, pw):
@@ -198,77 +201,112 @@ def login(sess, host, user, pw):
     rf_ref   = content.rootFolder._moId        if content.rootFolder        else None
     lic_ref  = content.licenseManager._moId    if content.licenseManager    else None
 
+    # Save ServiceInstance for inventory helpers to use pyVmomi directly
+    global _SI
+    _SI = si
+
     # Don't Disconnect - we want to keep the session alive for subsequent SOAP calls
     return pc_ref, perf_ref, rf_ref, lic_ref
+
+
+# ── pyVmomi inventory helpers - used by all get_* functions below ────────────
+
+def _pv_get_all(obj_type):
+    """Return list of pyVmomi managed objects of obj_type under rootFolder."""
+    if _SI is None:
+        raise RuntimeError("pyVmomi session missing - login() must run first")
+    from pyVmomi import vim
+    type_map = {
+        'VirtualMachine':         [vim.VirtualMachine],
+        'HostSystem':             [vim.HostSystem],
+        'Datastore':              [vim.Datastore],
+        'ClusterComputeResource': [vim.ClusterComputeResource],
+        'ComputeResource':        [vim.ComputeResource],
+        'Datacenter':             [vim.Datacenter],
+        'Network':                [vim.Network],
+    }
+    vtype = type_map.get(obj_type)
+    if vtype is None:
+        return []
+    content = _SI.RetrieveContent()
+    view = content.viewManager.CreateContainerView(content.rootFolder, vtype, True)
+    try:
+        return list(view.view)
+    finally:
+        view.Destroy()
+
+
+def _pv_attr(obj, path, default=None):
+    """Walk dotted attribute path on a pyVmomi object, returning default on any miss."""
+    try:
+        cur = obj
+        for part in path.split('.'):
+            cur = getattr(cur, part, None)
+            if cur is None:
+                return default
+        return cur
+    except Exception:
+        return default
 
 # ── Step 2: VM inventory ──────────────────────────────────────────────────────
 
 def get_vms(sess, host, pc_ref, root_folder):
-    """Return list of VM dicts with config + storage + partition data."""
-    rows = retrieve_all(sess, host, pc_ref, root_folder, 'VirtualMachine', [
-        'name',
-        'runtime.powerState',
-        'config.guestFullName',
-        'guest.guestFullName',
-        'config.hardware.numCPU',
-        'config.hardware.memoryMB',
-        'guest.toolsStatus',
-        'summary.config.vmPathName',        # "[DatastoreName] vm/vm.vmx"
-        'summary.storage.committed',         # bytes consumed on disk
-        'summary.storage.uncommitted',       # bytes provisioned but not used
-        'guest.disk',                        # partition detail (requires Tools running)
-    ])
-
+    """Return list of VM dicts with config + storage + partition data (pyVmomi-based)."""
     vms = []
-    for r in rows:
-        if not r.get('name'):
+    for vm in _pv_get_all('VirtualMachine'):
+        name = _pv_attr(vm, 'name')
+        if not name:
             continue
 
-        # Extract datastore from vmPathName: "[SAS01] QES-RDS-01/QES-RDS-01.vmx"
-        vmx = r.get('summary.config.vmPathName', '') or ''
+        # Extract datastore from vmPathName: "[DatastoreName] vm/vm.vmx"
+        vmx = _pv_attr(vm, 'summary.config.vmPathName', '') or ''
         ds_match = re.search(r'\[(.+?)\]', vmx)
         datastore = ds_match.group(1) if ds_match else ''
 
-        # Disk sizing (bytes)
-        committed   = int(r.get('summary.storage.committed')   or 0)
-        uncommitted = int(r.get('summary.storage.uncommitted') or 0)
-        cap_gb      = round((committed + uncommitted) / (1024**3), 1)
-        cons_gb     = round(committed / (1024**3), 1)
+        committed   = int(_pv_attr(vm, 'summary.storage.committed',   0) or 0)
+        uncommitted = int(_pv_attr(vm, 'summary.storage.uncommitted', 0) or 0)
+        cap_gb  = round((committed + uncommitted) / (1024**3), 1)
+        cons_gb = round(committed / (1024**3), 1)
 
-        # Guest disk partitions from guest.disk element
+        # Guest partitions - list of vim.vm.GuestInfo.DiskInfo
         partitions = []
-        gdisk_e = r.get('_e_guest.disk')
-        if gdisk_e is not None:
-            for gdi in list(gdisk_e.iter(f'{{{NS}}}GuestDiskInfo')) + list(gdisk_e.iter('GuestDiskInfo')):
-                disk_path  = gdi.findtext(f'{{{NS}}}diskPath')  or gdi.findtext('diskPath')  or ''
-                disk_cap   = int(gdi.findtext(f'{{{NS}}}capacity')  or gdi.findtext('capacity')  or 0)
-                disk_free  = int(gdi.findtext(f'{{{NS}}}freeSpace') or gdi.findtext('freeSpace') or 0)
-                disk_used  = disk_cap - disk_free
+        gdisks = _pv_attr(vm, 'guest.disk') or []
+        try:
+            for gdi in gdisks:
+                disk_cap  = int(getattr(gdi, 'capacity',  0) or 0)
+                disk_free = int(getattr(gdi, 'freeSpace', 0) or 0)
                 partitions.append({
-                    "Path":        disk_path,
+                    "Path":        getattr(gdi, 'diskPath', '') or '',
                     "CapacityMiB": round(disk_cap / (1024**2), 1),
-                    "ConsumedMiB": round(disk_used / (1024**2), 1),
+                    "ConsumedMiB": round((disk_cap - disk_free) / (1024**2), 1),
                 })
+        except Exception:
+            pass
 
-        ram_mb = int(r.get('config.hardware.memoryMB', 0) or 0)
-        guest_os = r.get('guest.guestFullName') or r.get('config.guestFullName') or ''
+        ram_mb   = int(_pv_attr(vm, 'config.hardware.memoryMB', 0) or 0)
+        vcpu     = int(_pv_attr(vm, 'config.hardware.numCPU', 0) or 0)
+        guest_os = (_pv_attr(vm, 'guest.guestFullName') or
+                    _pv_attr(vm, 'config.guestFullName') or '')
         is_linux = bool(guest_os and any(k in guest_os.lower() for k in
                    ['linux','ubuntu','centos','rhel','debian','photon','suse','oracle',
                     'rocky','alma','amazon','coreos','fedora']))
-        # Also detect Linux by partition paths (/ = Linux mount)
         if not is_linux and partitions:
             is_linux = any(p['Path'].startswith('/') for p in partitions)
 
+        # Cast enum-ish fields to strings
+        power_state = str(_pv_attr(vm, 'runtime.powerState', '') or '')
+        tool_status = str(_pv_attr(vm, 'guest.toolsStatus', '') or '')
+
         vms.append({
-            'Name':       r['name'],
-            'MOID':       r['_moid'],
-            'PowerState': r.get('runtime.powerState', ''),
+            'Name':       name,
+            'MOID':       vm._moId,
+            'PowerState': power_state,
             'GuestOS':    guest_os,
             'IsLinux':    is_linux,
-            'vCPUs':      int(r.get('config.hardware.numCPU', 0) or 0),
+            'vCPUs':      vcpu,
             'RAMmb':      ram_mb,
             'RAMgb':      round(ram_mb / 1024, 1),
-            'ToolStatus': r.get('guest.toolsStatus', ''),
+            'ToolStatus': tool_status,
             'Datastore':  datastore,
             'DiskCapGB':  cap_gb,
             'DiskConsumedGB': cons_gb,
@@ -279,50 +317,32 @@ def get_vms(sess, host, pc_ref, root_folder):
 # ── Step 3: Host info + host-level perf ──────────────────────────────────────
 
 def get_host_info(sess, host_addr, pc_ref, root_folder):
-    """Return host hardware dict including quickStats CPU/Mem usage."""
-    rows = retrieve_all(sess, host_addr, pc_ref, root_folder, 'HostSystem', [
-        'name',
-        'hardware.systemInfo.model',
-        'hardware.systemInfo.vendor',
-        'hardware.systemInfo.serialNumber',
-        'hardware.cpuInfo.numCpuCores',
-        'hardware.cpuInfo.hz',
-        'hardware.memorySize',
-        'config.product.fullName',
-        'summary.hardware.numNics',
-        'summary.hardware.cpuModel',
-        'summary.quickStats.overallCpuUsage',       # MHz currently used
-        'summary.quickStats.overallMemoryUsage',    # MB currently used
-        'summary.hardware.cpuMhz',                  # MHz per core
-        'summary.config.name',
-        'summary.managementServerIp',
-    ])
-    if not rows:
+    """Return FIRST host hardware dict (pyVmomi-based)."""
+    hosts = _pv_get_all('HostSystem')
+    if not hosts:
         return {}
-    r = rows[0]
-    total_mhz  = (int(r.get('hardware.cpuInfo.numCpuCores', 0) or 0) *
-                  int(r.get('summary.hardware.cpuMhz', 0) or 0))
-    used_mhz   = int(r.get('summary.quickStats.overallCpuUsage', 0) or 0)
-    total_mem_mb = int(r.get('hardware.memorySize', 0) or 0) // (1024**2)
-    used_mem_mb  = int(r.get('summary.quickStats.overallMemoryUsage', 0) or 0)
-
-    cpu_pct = round(used_mhz  / total_mhz   * 100, 2) if total_mhz  else 0
+    h = hosts[0]
+    cores   = int(_pv_attr(h, 'hardware.cpuInfo.numCpuCores', 0) or 0)
+    mhz_per = int(_pv_attr(h, 'summary.hardware.cpuMhz', 0) or 0)
+    total_mhz  = cores * mhz_per
+    used_mhz   = int(_pv_attr(h, 'summary.quickStats.overallCpuUsage', 0) or 0)
+    total_mem_mb = int(_pv_attr(h, 'hardware.memorySize', 0) or 0) // (1024**2)
+    used_mem_mb  = int(_pv_attr(h, 'summary.quickStats.overallMemoryUsage', 0) or 0)
+    cpu_pct = round(used_mhz / total_mhz * 100, 2) if total_mhz else 0
     mem_pct = round(used_mem_mb / total_mem_mb * 100, 2) if total_mem_mb else 0
-
     return {
-        "Name":        r.get('name') or r.get('summary.config.name', ''),
-        "Model":       r.get('hardware.systemInfo.model', ''),
-        "Vendor":      r.get('hardware.systemInfo.vendor', ''),
-        "ServiceTag":  r.get('hardware.systemInfo.serialNumber', ''),
-        "Cores":       int(r.get('hardware.cpuInfo.numCpuCores', 0) or 0),
-        "CPUModel":    r.get('summary.hardware.cpuModel', ''),
-        "CPUSpeedMHz": int(int(r.get('hardware.cpuInfo.hz', 0) or 0) / 1_000_000),
-        "RAMgb":       round(int(r.get('hardware.memorySize', 0) or 0) / (1024**3), 2),
-        "Hypervisor":  r.get('config.product.fullName', ''),
-        "NICs":        int(r.get('summary.hardware.numNics', 0) or 0),
+        "Name":        _pv_attr(h, 'name') or _pv_attr(h, 'summary.config.name', ''),
+        "Model":       _pv_attr(h, 'hardware.systemInfo.model', ''),
+        "Vendor":      _pv_attr(h, 'hardware.systemInfo.vendor', ''),
+        "ServiceTag":  _pv_attr(h, 'hardware.systemInfo.serialNumber', ''),
+        "Cores":       cores,
+        "CPUModel":    _pv_attr(h, 'summary.hardware.cpuModel', ''),
+        "CPUSpeedMHz": int(int(_pv_attr(h, 'hardware.cpuInfo.hz', 0) or 0) / 1_000_000),
+        "RAMgb":       round(int(_pv_attr(h, 'hardware.memorySize', 0) or 0) / (1024**3), 2),
+        "Hypervisor":  _pv_attr(h, 'config.product.fullName', ''),
+        "NICs":        int(_pv_attr(h, 'summary.hardware.numNics', 0) or 0),
         "CPUUsagePct": cpu_pct,
         "MemUsagePct": mem_pct,
-        # IOPS_95th filled later from host perf query
         "IOPS_95th":   0,
         "DiskKBps_95th": 0,
     }
@@ -330,28 +350,22 @@ def get_host_info(sess, host_addr, pc_ref, root_folder):
 # ── Step 4: Datastores ───────────────────────────────────────────────────────
 
 def get_datastores(sess, host, pc_ref, root_folder):
-    """Return list of datastore dicts."""
-    rows = retrieve_all(sess, host, pc_ref, root_folder, 'Datastore', [
-        'name',
-        'summary.type',
-        'summary.capacity',
-        'summary.freeSpace',
-        'summary.accessible',
-    ])
+    """Return list of datastore dicts (pyVmomi-based)."""
     ds_list = []
-    for r in rows:
-        if not r.get('name'):
+    for ds in _pv_get_all('Datastore'):
+        name = _pv_attr(ds, 'name')
+        if not name:
             continue
-        cap  = int(r.get('summary.capacity', 0)  or 0)
-        free = int(r.get('summary.freeSpace', 0) or 0)
+        cap  = int(_pv_attr(ds, 'summary.capacity',  0) or 0)
+        free = int(_pv_attr(ds, 'summary.freeSpace', 0) or 0)
         used = cap - free
         ds_list.append({
-            "Name":       r['name'],
-            "Type":       r.get('summary.type', 'VMFS'),
-            "CapacityGB": round(cap  / (1024**3), 1),
-            "FreeGB":     round(free / (1024**3), 1),
-            "ConsumedGB": round(used / (1024**3), 1),
-            "UsedPct":    round(used / cap * 100, 1) if cap else 0,
+            "Name":        name,
+            "Type":        str(_pv_attr(ds, 'summary.type', 'VMFS') or 'VMFS'),
+            "CapacityGB":  round(cap  / (1024**3), 1),
+            "FreeGB":      round(free / (1024**3), 1),
+            "ConsumedGB":  round(used / (1024**3), 1),
+            "UsedPct":     round(used / cap * 100, 1) if cap else 0,
             "CapacityMiB": round(cap  / (1024**2), 1),
             "ConsumedMiB": round(used / (1024**2), 1),
         })
@@ -360,84 +374,65 @@ def get_datastores(sess, host, pc_ref, root_folder):
 # ── Step 5: Cluster info ──────────────────────────────────────────────────────
 
 def get_cluster_info(sess, host, pc_ref, root_folder):
-    """Return cluster aggregate dict. Falls back to empty if standalone host."""
-    rows = retrieve_all(sess, host, pc_ref, root_folder, 'ClusterComputeResource', [
-        'name',
-        'summary.currentCpuUsage',      # MHz
-        'summary.totalCpu',             # MHz total
-        'summary.currentMemoryUsage',   # MB
-        'summary.totalMemory',          # bytes
-        'summary.numEffectiveHosts',
-        'summary.numHosts',
-    ])
-    if not rows:
+    """Return first-cluster aggregate dict (pyVmomi-based). Empty for standalone host."""
+    clusters = _pv_get_all('ClusterComputeResource')
+    if not clusters:
         return {}
-    r = rows[0]
-    total_mhz = int(r.get('summary.totalCpu', 0) or 0)
-    used_mhz  = int(r.get('summary.currentCpuUsage', 0) or 0)
-    total_mem_b = int(r.get('summary.totalMemory', 0) or 0)
-    used_mem_mb = int(r.get('summary.currentMemoryUsage', 0) or 0)
+    c = clusters[0]
+    total_mhz = int(_pv_attr(c, 'summary.totalCpu', 0) or 0)
+    used_mhz  = int(_pv_attr(c, 'summary.currentCpuUsage', 0) or 0)
+    total_mem_b  = int(_pv_attr(c, 'summary.totalMemory', 0) or 0)
+    used_mem_mb  = int(_pv_attr(c, 'summary.currentMemoryUsage', 0) or 0)
     total_mem_mb = total_mem_b // (1024**2)
-
     return {
-        "Name":        r.get('name', ''),
+        "Name":        _pv_attr(c, 'name', ''),
         "CPUUsagePct": round(used_mhz / total_mhz * 100, 2) if total_mhz else 0,
         "MemUsagePct": round(used_mem_mb / total_mem_mb * 100, 2) if total_mem_mb else 0,
-        "CapacityMiB": 0,   # filled from datastore sum
+        "CapacityMiB": 0,
         "ConsumedMiB": 0,
-        "IOPS_95th":   0,   # filled from perf
+        "IOPS_95th":   0,
         "DiskKBps_95th": 0,
-        "NumHosts":    int(r.get('summary.numHosts', 0) or 0),
+        "NumHosts":    int(_pv_attr(c, 'summary.numHosts', 0) or 0),
     }
 
 # ── Step 6: Licenses ──────────────────────────────────────────────────────────
 
 def get_licenses(sess, host, pc_ref, lic_ref):
-    """Return list of license dicts from LicenseManager."""
-    if not lic_ref:
+    """Return list of license dicts (pyVmomi-based)."""
+    if _SI is None:
         return []
-    body = f'''<vim25:RetrievePropertiesEx>
-      <vim25:_this type="PropertyCollector">{pc_ref}</vim25:_this>
-      <vim25:specSet>
-        <vim25:propSet>
-          <vim25:type>LicenseManager</vim25:type>
-          <vim25:all>false</vim25:all>
-          <vim25:pathSet>licenses</vim25:pathSet>
-        </vim25:propSet>
-        <vim25:objectSet>
-          <vim25:obj type="LicenseManager">{lic_ref}</vim25:obj>
-        </vim25:objectSet>
-      </vim25:specSet>
-      <vim25:options/>
-    </vim25:RetrievePropertiesEx>'''
     try:
-        root = soap_req(sess, host, body)
+        content = _SI.RetrieveContent()
+        lic_mgr = content.licenseManager
+        if lic_mgr is None:
+            return []
     except Exception as e:
-        print(f"  [warn] License query failed: {e}")
+        print(f"  [warn] License manager access failed: {e}")
         return []
 
     licenses = []
-    # licenses is ArrayOfLicenseManagerLicenseInfo
-    for lic_e in list(root.iter(f'{{{NS}}}LicenseManagerLicenseInfo')) + list(root.iter('LicenseManagerLicenseInfo')):
-        lic_key  = lic_e.findtext(f'{{{NS}}}licenseKey') or lic_e.findtext('licenseKey') or ''
-        name     = lic_e.findtext(f'{{{NS}}}name')       or lic_e.findtext('name')       or ''
-        total    = lic_e.findtext(f'{{{NS}}}total')      or lic_e.findtext('total')      or '0'
-        used     = lic_e.findtext(f'{{{NS}}}used')       or lic_e.findtext('used')       or '0'
-        # Expiry is in properties array as expirationHours or expirationDate
-        expiry = ''
-        for prop_e in list(lic_e.iter(f'{{{NS}}}properties')) + list(lic_e.iter('properties')):
-            k = prop_e.findtext(f'{{{NS}}}key') or prop_e.findtext('key') or ''
-            if 'expiration' in k.lower():
-                v_e = prop_e.find(f'{{{NS}}}value') or prop_e.find('value')
-                if v_e is not None:
-                    expiry = v_e.findtext(f'{{{NS}}}expirationDate') or v_e.findtext('expirationDate') or v_e.text or ''
-        licenses.append({
-            "Name":   name,
-            "Key":    lic_key[:8] + '...' if len(lic_key) > 8 else lic_key,
-            "Total":  total,
-            "Used":   int(used or 0),
-            "Expiry": str(expiry),
-        })
+    try:
+        for lic in (lic_mgr.licenses or []):
+            lic_key = getattr(lic, 'licenseKey', '') or ''
+            expiry = ''
+            try:
+                for prop in (getattr(lic, 'properties', []) or []):
+                    k = getattr(prop, 'key', '') or ''
+                    if 'expiration' in k.lower():
+                        val = getattr(prop, 'value', None)
+                        if val is not None:
+                            expiry = str(getattr(val, 'expirationDate', '') or val)
+            except Exception:
+                pass
+            licenses.append({
+                "Name":   getattr(lic, 'name', '') or '',
+                "Key":    lic_key[:8] + '...' if len(lic_key) > 8 else lic_key,
+                "Total":  str(getattr(lic, 'total', 0) or 0),
+                "Used":   int(getattr(lic, 'used', 0) or 0),
+                "Expiry": expiry,
+            })
+    except Exception as e:
+        print(f"  [warn] License enumeration failed: {e}")
     return licenses
 
 # ── Step 7: Performance counter IDs ──────────────────────────────────────────
