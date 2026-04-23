@@ -2080,10 +2080,12 @@ def build_private_cloud_tab():
             merged[name.upper()] = (name, cores, ram, total_disk, used_disk, 'WinRM', vm_type)
 
     # Fill gaps: hypervisor inventory (VMs not WinRM-discovered — ODNS, vCenter, etc.)
+    _excluded = {v.upper() for v in CFG.get('exclude_vms', [])}
     for inv in hv_inventories:
         for vm in (inv.get('VMs', []) or []):
             if not isinstance(vm, dict): continue
             nm = vm.get('Name', '')
+            if nm.upper() in _excluded: continue  # explicitly excluded from scope
             if nm.upper() in merged: continue  # already have better WinRM data
             cores = int(vm.get('vCPU', 0) or 0)
             ram   = round(float(vm.get('RAMgb', vm.get('RAMAllocatedGB', 0)) or 0), 1)

@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.0-alpha'
+$script:Version   = '4.0.8'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -39,6 +39,8 @@ $script:Session = [hashtable]::Synchronized(@{
     Targets    = @()                          # list of { Name; Address; State; Phase; Buddy; Started; Finished }
     LogTail    = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]@())
     ReportPath = ''
+    ReportZipPath = ''
+    MissingTargets = @()
     StartedAt  = $null
     FinishedAt = $null
 })
@@ -612,22 +614,67 @@ function renderReport(s){
   const viewLogBtn = sessionDir
     ? `<button class="btn btn-secondary" onclick="viewGenLog()" style="margin-top:10px;margin-left:8px;">View gen_report log</button>`
     : '';
+  const zipBtn = s.ReportZipPath
+    ? `<a href="/api/download-zip" class="btn" style="margin-top:10px;margin-left:8px;display:inline-block;text-decoration:none;">Download zip</a>`
+    : '';
+  const copyLogsBtn = `<button class="btn btn-secondary" onclick="copyLogs(this)" style="margin-top:10px;margin-left:8px;">Copy logs</button>`;
+
+  // Missing-JSON audit block (only if anything is missing)
+  let missingHtml = '';
+  if (Array.isArray(s.MissingTargets) && s.MissingTargets.length) {
+    const rows = s.MissingTargets.map(m =>
+      `<li><code>${escapeHtml(m.Address)}</code> <span style="color:var(--muted);">(${escapeHtml(m.Kind||'')})</span> - <span style="color:var(--warn);">${escapeHtml(m.Reason||'')}</span></li>`
+    ).join('');
+    missingHtml = `<div style="margin-top:14px;padding:10px 14px;background:#2a1b0f;border-left:3px solid var(--warn);border-radius:6px;">
+      <div style="font-size:11px;color:var(--warn);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px;">Missing JSON (${s.MissingTargets.length})</div>
+      <ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.55;">${rows}</ul>
+    </div>`;
+  }
 
   if (s.ReportPath) {
     el.innerHTML = `<p style="font-size:13px;">Report saved:</p>
       <p><code style="font-family:var(--mono);color:var(--info);font-size:12px;word-break:break-all;">${escapeHtml(s.ReportPath)}</code></p>
       <p>
         <a href="file:///${escapeHtml(s.ReportPath.replace(/\\/g,'/'))}" target="_blank" class="btn" style="display:inline-block;text-decoration:none;">Open report</a>
+        ${zipBtn}
         ${openFolderBtn}
         ${viewLogBtn}
+        ${copyLogsBtn}
       </p>
+      ${missingHtml}
       <div id="genLogBox"></div>`;
     document.getElementById('reportSub').textContent = 'Session complete. Click below to open the HTML report.';
   } else {
     el.innerHTML = `<p style="color:var(--warn);">Report not generated - check log for errors.</p>
       <p style="color:var(--muted);font-size:12px;">Session dir: <code style="font-family:var(--mono);">${escapeHtml(sessionDir)}</code></p>
-      <p>${openFolderBtn}${viewLogBtn}</p>
+      <p>${openFolderBtn}${viewLogBtn}${copyLogsBtn}</p>
+      ${missingHtml}
       <div id="genLogBox"></div>`;
+  }
+}
+
+async function copyLogs(btn){
+  const orig = btn.textContent;
+  btn.textContent = 'Copying...';
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/combined-logs');
+    const data = await resp.json();
+    const text = data.content || '';
+    try {
+      await navigator.clipboard.writeText(text);
+      btn.textContent = 'Copied!';
+    } catch(e) {
+      // Fallback for non-HTTPS/localhost contexts
+      const ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta);
+      btn.textContent = 'Copied!';
+    }
+    setTimeout(()=>{ btn.textContent = orig; btn.disabled = false; }, 1500);
+  } catch(e) {
+    btn.textContent = 'Failed';
+    setTimeout(()=>{ btn.textContent = orig; btn.disabled = false; }, 1500);
   }
 }
 
@@ -751,6 +798,8 @@ function Start-DiscoveryRun {
     $script:Session.Targets    = @()
     $script:Session.LogTail.Clear()
     $script:Session.ReportPath = ''
+    $script:Session.ReportZipPath = ''
+    $script:Session.MissingTargets = @()
     Add-Log "Session started. Output: $sessionDir"
 
     # Initialize target rows
@@ -870,18 +919,97 @@ function Start-DiscoveryRun {
                     }
                 } else {
                     # Per-server Windows discovery
+                    $safeName = ($t.Address -replace '[^A-Za-z0-9_.-]+','_')
+                    $perLog = Join-Path $Session.SessionDir ("server-{0}.log" -f $safeName)
+                    $t.LogPath = $perLog
+                    $Session.Targets[$i] = $t
+                    $lines = New-Object System.Collections.ArrayList
+
+                    # ---- Preflight reachability check ---------------------
+                    # Tells us WHY a scan is going to fail (off / linux / firewalled)
+                    # before we spend a minute trying WinRM.
+                    $t.Phase = 'preflight...'
+                    $Session.Targets[$i] = $t
+                    $pingOk  = $false
+                    $winrmOk = $false
+                    $sshOk   = $false
+                    try { $pingOk = Test-Connection -ComputerName $t.Address -Count 1 -Quiet -EA SilentlyContinue } catch {}
+                    try {
+                        $tcp = New-Object System.Net.Sockets.TcpClient
+                        $ia  = $tcp.BeginConnect($t.Address, 5985, $null, $null)
+                        if ($ia.AsyncWaitHandle.WaitOne(1500)) { $winrmOk = $tcp.Connected; $tcp.EndConnect($ia) }
+                        $tcp.Close()
+                    } catch {}
+                    if (-not $winrmOk) {
+                        try {
+                            $tcp = New-Object System.Net.Sockets.TcpClient
+                            $ia  = $tcp.BeginConnect($t.Address, 5986, $null, $null)
+                            if ($ia.AsyncWaitHandle.WaitOne(1500)) { $winrmOk = $tcp.Connected; $tcp.EndConnect($ia) }
+                            $tcp.Close()
+                        } catch {}
+                    }
+                    try {
+                        $tcp = New-Object System.Net.Sockets.TcpClient
+                        $ia  = $tcp.BeginConnect($t.Address, 22, $null, $null)
+                        if ($ia.AsyncWaitHandle.WaitOne(1500)) { $sshOk = $tcp.Connected; $tcp.EndConnect($ia) }
+                        $tcp.Close()
+                    } catch {}
+                    [void]$lines.Add("[preflight] ping=$pingOk winrm=$winrmOk ssh=$sshOk")
+
+                    if (-not $winrmOk) {
+                        if (-not $pingOk -and -not $sshOk) {
+                            $t.State='error'; $t.Phase='unreachable (powered off / wrong IP / firewalled)'
+                        } elseif ($sshOk -and -not $winrmOk) {
+                            $t.State='error'; $t.Phase='looks like Linux (SSH only) - use Linux workflow'
+                        } elseif ($pingOk -and -not $winrmOk -and -not $sshOk) {
+                            $t.State='error'; $t.Phase='up but WinRM/SSH both closed (Enable-PSRemoting or firewall?)'
+                        } else {
+                            $t.State='error'; $t.Phase='not Windows or WinRM not enabled'
+                        }
+                        $t.Finished = (Get-Date).ToString('HH:mm:ss')
+                        $Session.Targets[$i] = $t
+                        try { [System.IO.File]::WriteAllText($perLog, ($lines -join "`r`n"), [System.Text.Encoding]::UTF8) } catch {}
+                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): SKIPPED - $($t.Phase)") | Out-Null
+                        continue
+                    }
+
+                    # ---- Actual WinRM discovery ---------------------------
                     $invokeArgs = @{ ComputerName = $t.Address; OutputPath = $Session.SessionDir }
                     if ($cred) { $invokeArgs.Credential = $cred }
+                    # Snapshot existing discovery JSONs so we can detect what was newly created
+                    $preJson = @(Get-ChildItem $Session.SessionDir -Filter '*-discovery-*.json' -EA 0 | Select-Object -ExpandProperty FullName)
                     & $invoke @invokeArgs *>&1 | ForEach-Object {
                         $line = "$_"
+                        [void]$lines.Add($line)
                         if ($line -match '^\s*\[(\w+)\]') {
                             $t.Phase = $matches[1]
                             $t.Buddy = $BuddyFrames[(Get-Random -Maximum $BuddyFrames.Count)]
                             $Session.Targets[$i] = $t
                         }
                     }
-                    $t.State    = 'done'
-                    $t.Phase    = 'complete'
+                    try { [System.IO.File]::WriteAllText($perLog, ($lines -join "`r`n"), [System.Text.Encoding]::UTF8) } catch {}
+                    # Verify: did Invoke-ServerDiscovery produce a new discovery JSON?
+                    $postJson = @(Get-ChildItem $Session.SessionDir -Filter '*-discovery-*.json' -EA 0 | Select-Object -ExpandProperty FullName)
+                    $newJson  = $postJson | Where-Object { $preJson -notcontains $_ }
+                    if ($newJson) {
+                        $jsonFile = $newJson | Select-Object -First 1
+                        $t.JsonPath = $jsonFile
+                        $t.State    = 'done'
+                        $t.Phase    = "json: $(Split-Path -Leaf $jsonFile)"
+                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): JSON written - $(Split-Path -Leaf $jsonFile)") | Out-Null
+                    } else {
+                        # Sniff the per-server log for a probable cause
+                        $tail = ($lines | Select-Object -Last 20) -join ' | '
+                        $reason = 'no discovery JSON written'
+                        if     ($tail -match '(?i)Access is denied')           { $reason = 'WinRM auth denied (check creds/domain)' }
+                        elseif ($tail -match '(?i)cannot find')                { $reason = 'host unreachable or name not resolvable' }
+                        elseif ($tail -match '(?i)WinRM|5985|5986')            { $reason = 'WinRM not reachable (port 5985/5986)' }
+                        elseif ($tail -match '(?i)timed? ?out')                { $reason = 'connection timed out' }
+                        elseif ($tail -match '(?i)ConvertTo-Json')             { $reason = 'data collected but JSON serialize failed - see per-server log' }
+                        $t.State    = 'error'
+                        $t.Phase    = $reason
+                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): NO JSON - $reason (see $(Split-Path -Leaf $perLog))") | Out-Null
+                    }
                 }
                 $t.Finished = (Get-Date).ToString('HH:mm:ss')
             } catch {
@@ -890,6 +1018,39 @@ function Start-DiscoveryRun {
                 $t.Finished = (Get-Date).ToString('HH:mm:ss')
             }
             $Session.Targets[$i] = $t
+        }
+
+        # ---------------------------------------------------------------
+        # Post-session verification: confirm each target produced an
+        # expected JSON. Log a compact audit so the SE sees what landed
+        # and what didn't without having to dig through the folder.
+        # ---------------------------------------------------------------
+        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] --- Post-session JSON audit ---") | Out-Null
+        $missing = @()
+        for ($i = 0; $i -lt $Session.Targets.Count; $i++) {
+            $t = $Session.Targets[$i]
+            if ($t.Kind -eq 'hypervisor') {
+                $inv = Get-ChildItem $Session.SessionDir -Filter '*inventory*.json' -EA 0 | Select-Object -First 1
+                if ($inv) {
+                    $Session.LogTail.Add("   [OK] $($t.Address) (hypervisor) -> $($inv.Name)") | Out-Null
+                } else {
+                    $Session.LogTail.Add("   [MISS] $($t.Address) (hypervisor): $($t.Phase)") | Out-Null
+                    $missing += $t
+                }
+            } else {
+                if ($t.JsonPath -and (Test-Path $t.JsonPath)) {
+                    $Session.LogTail.Add("   [OK] $($t.Address) -> $(Split-Path -Leaf $t.JsonPath)") | Out-Null
+                } else {
+                    $Session.LogTail.Add("   [MISS] $($t.Address): $($t.Phase)") | Out-Null
+                    $missing += $t
+                }
+            }
+        }
+        if ($missing.Count -eq 0) {
+            $Session.LogTail.Add("   All $($Session.Targets.Count) target(s) produced JSON. Proceeding to report.") | Out-Null
+        } else {
+            $Session.LogTail.Add("   $($missing.Count) of $($Session.Targets.Count) target(s) missing JSON. Report will include only what was collected.") | Out-Null
+            $Session.MissingTargets = @($missing | ForEach-Object { @{ Address=$_.Address; Reason=$_.Phase; Kind=$_.Kind } })
         }
 
         # Attempt to generate the HTML report. Capture stdout+stderr to gen_report.log
@@ -925,6 +1086,25 @@ function Start-DiscoveryRun {
             $errMsg = $_.Exception.Message
             [System.IO.File]::WriteAllText($reportLog, "Exception invoking gen_report.py: $errMsg", [System.Text.Encoding]::UTF8)
             $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py exception: $errMsg") | Out-Null
+        }
+
+        # If the report generated successfully, bundle the whole session into
+        # a zip for easy handoff. Sits next to the session folder.
+        if ($Session.ReportPath) {
+            try {
+                $clientSlug = ($Payload.client -replace '[^A-Za-z0-9_-]+','_')
+                $stampNow = (Get-Date).ToString('yyyy-MM-dd-HHmm')
+                $zipName = "$clientSlug-sdt-$stampNow.zip"
+                $zipPath = Join-Path (Split-Path $Session.SessionDir -Parent) $zipName
+                # Compress everything in the session dir
+                Compress-Archive -Path (Join-Path $Session.SessionDir '*') -DestinationPath $zipPath -Force
+                if (Test-Path $zipPath) {
+                    $Session.ReportZipPath = $zipPath
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Session bundled: $zipPath") | Out-Null
+                }
+            } catch {
+                $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Zip bundle failed: $($_.Exception.Message)") | Out-Null
+            }
         }
 
         $Session.Status     = 'complete'
@@ -1032,6 +1212,8 @@ try {
                         Targets    = @($script:Session.Targets)
                         LogTail    = @($script:Session.LogTail)
                         ReportPath = $script:Session.ReportPath
+                        ReportZipPath = $script:Session.ReportZipPath
+                        MissingTargets = @($script:Session.MissingTargets)
                     }
                     break
                 }
@@ -1165,6 +1347,65 @@ try {
                         Send-Json -Response $resp -Data @{ ok = $true; content = $content; path = $log }
                     } catch {
                         Send-Json -Response $resp -Data @{ error = $_.Exception.Message } -StatusCode 500
+                    }
+                    break
+                }
+                '^GET /api/combined-logs$' {
+                    $dir = $script:Session.SessionDir
+                    $sb  = New-Object System.Text.StringBuilder
+                    [void]$sb.AppendLine("===== SDT Combined Logs =====")
+                    [void]$sb.AppendLine("Client      : $($script:Session.Client)")
+                    [void]$sb.AppendLine("SessionDir  : $dir")
+                    [void]$sb.AppendLine("Status      : $($script:Session.Status)")
+                    [void]$sb.AppendLine("ReportPath  : $($script:Session.ReportPath)")
+                    [void]$sb.AppendLine("ReportZip   : $($script:Session.ReportZipPath)")
+                    [void]$sb.AppendLine("Targets     :")
+                    foreach ($t in $script:Session.Targets) {
+                        $js = if ($t.JsonPath) { Split-Path -Leaf $t.JsonPath } else { '<none>' }
+                        [void]$sb.AppendLine(("   {0,-30} state={1,-7} phase={2} json={3}" -f $t.Address, $t.State, $t.Phase, $js))
+                    }
+                    if ($script:Session.MissingTargets -and $script:Session.MissingTargets.Count -gt 0) {
+                        [void]$sb.AppendLine("Missing JSONs:")
+                        foreach ($m in $script:Session.MissingTargets) {
+                            [void]$sb.AppendLine("   $($m.Address) ($($m.Kind)) - $($m.Reason)")
+                        }
+                    }
+                    [void]$sb.AppendLine("")
+                    [void]$sb.AppendLine("----- Session Log -----")
+                    foreach ($ln in $script:Session.LogTail) { [void]$sb.AppendLine($ln) }
+                    if ($dir -and (Test-Path $dir)) {
+                        $gen = Join-Path $dir 'gen_report.log'
+                        if (Test-Path $gen) {
+                            [void]$sb.AppendLine("")
+                            [void]$sb.AppendLine("----- gen_report.log -----")
+                            [void]$sb.AppendLine([System.IO.File]::ReadAllText($gen, [System.Text.Encoding]::UTF8))
+                        }
+                        Get-ChildItem $dir -Filter 'server-*.log' -EA 0 | Sort-Object Name | ForEach-Object {
+                            [void]$sb.AppendLine("")
+                            [void]$sb.AppendLine("----- $($_.Name) -----")
+                            try { [void]$sb.AppendLine([System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)) } catch {}
+                        }
+                    }
+                    Send-Json -Response $resp -Data @{ ok = $true; content = $sb.ToString() }
+                    break
+                }
+                '^GET /api/download-zip$' {
+                    $zip = $script:Session.ReportZipPath
+                    if (-not $zip -or -not (Test-Path $zip)) {
+                        Send-Response -Response $resp -Body 'Zip not available yet.' -StatusCode 404 -ContentType 'text/plain'
+                        break
+                    }
+                    try {
+                        $bytes = [System.IO.File]::ReadAllBytes($zip)
+                        $fname = [System.IO.Path]::GetFileName($zip)
+                        $resp.StatusCode = 200
+                        $resp.ContentType = 'application/zip'
+                        $resp.Headers.Add('Content-Disposition', "attachment; filename=""$fname""")
+                        $resp.ContentLength64 = $bytes.Length
+                        $resp.OutputStream.Write($bytes, 0, $bytes.Length)
+                        $resp.OutputStream.Close()
+                    } catch {
+                        try { Send-Response -Response $resp -Body "Zip stream error: $($_.Exception.Message)" -StatusCode 500 -ContentType 'text/plain' } catch {}
                     }
                     break
                 }
