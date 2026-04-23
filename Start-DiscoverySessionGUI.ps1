@@ -553,19 +553,34 @@ $script:HtmlUI = $script:HtmlUI -replace '__VERSION__', $script:Version
 # HTTP LISTENER
 # -----------------------------------------------------------------------------
 function Start-HttpListener {
-    $listener = New-Object System.Net.HttpListener
-    $prefix   = "http://localhost:$Port/"
-    $listener.Prefixes.Add($prefix)
-    try { $listener.Start() } catch {
-        Write-Host "  [error] Failed to bind $prefix - $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "  Try a different port with -Port <n>." -ForegroundColor DarkGray
-        throw
+    # Defensive: if caller botched the port, snap back to default 8080
+    if ($Port -le 0 -or $Port -gt 65535) {
+        Write-Host "  [warn] Invalid port $Port - falling back to 8080" -ForegroundColor DarkYellow
+        $script:Port = 8080
     }
-    Write-Host ""
-    Write-Host "  SDT GUI running at: $prefix" -ForegroundColor Green
-    Write-Host "  (Press Ctrl+C to stop)" -ForegroundColor DarkGray
-    Write-Host ""
-    return $listener
+    # Try requested port, then scan a few adjacent ports if it's busy
+    $triedPorts = @()
+    foreach ($p in @($Port, 8080, 8081, 8082, 8888, 9090)) {
+        if ($triedPorts -contains $p) { continue }
+        $triedPorts += $p
+        $listener = New-Object System.Net.HttpListener
+        $prefix   = "http://localhost:$p/"
+        $listener.Prefixes.Add($prefix)
+        try {
+            $listener.Start()
+            $script:Port    = $p
+            $script:BaseUrl = "http://localhost:$p"
+            Write-Host ""
+            Write-Host "  SDT GUI running at: $prefix" -ForegroundColor Green
+            Write-Host "  (Press Ctrl+C to stop)" -ForegroundColor DarkGray
+            Write-Host ""
+            return $listener
+        } catch {
+            try { $listener.Close() } catch { }
+            Write-Host "  [skip] port $p busy ($($_.Exception.Message.Split('.')[0]))" -ForegroundColor DarkGray
+        }
+    }
+    throw "Could not bind any of: $($triedPorts -join ', '). Free one up or use -Port <n>."
 }
 
 function Send-Response {

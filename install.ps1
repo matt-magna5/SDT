@@ -209,10 +209,26 @@ switch -Regex (`$Mode) {
 
 Invoke-SdtAutoUpdate
 
+# Normalize `$Rest so empty splat is safe on PS 5.1 + PS 7
+if (`$null -eq `$Rest) { `$Rest = @() }
+`$RestArr = @(`$Rest)
+
 switch -Regex (`$Mode) {
-    '^(cli|console|tui)$'   { & (Join-Path `$AppDir 'Start-DiscoverySession.ps1')    @Rest; return }
-    '^(invoke|local|bare)$' { & (Join-Path `$AppDir 'Invoke-ServerDiscovery.ps1')    @Rest; return }
-    default                 { & (Join-Path `$AppDir 'Start-DiscoverySessionGUI.ps1') @Rest; return }
+    '^(cli|console|tui)$'   {
+        if (`$RestArr.Count -gt 0) { & (Join-Path `$AppDir 'Start-DiscoverySession.ps1') @RestArr }
+        else { & (Join-Path `$AppDir 'Start-DiscoverySession.ps1') }
+        return
+    }
+    '^(invoke|local|bare)$' {
+        if (`$RestArr.Count -gt 0) { & (Join-Path `$AppDir 'Invoke-ServerDiscovery.ps1') @RestArr }
+        else { & (Join-Path `$AppDir 'Invoke-ServerDiscovery.ps1') }
+        return
+    }
+    default {
+        if (`$RestArr.Count -gt 0) { & (Join-Path `$AppDir 'Start-DiscoverySessionGUI.ps1') @RestArr }
+        else { & (Join-Path `$AppDir 'Start-DiscoverySessionGUI.ps1') }
+        return
+    }
 }
 "@
 Set-Content -Path $ShimPS -Value $shimBody -Encoding UTF8
