@@ -29,7 +29,8 @@
 param(
     [string] $Version = 'latest',
     [switch] $Quiet,
-    [switch] $NoLaunch
+    [switch] $NoLaunch,
+    [switch] $Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,9 +83,13 @@ if ($Version -eq 'latest') {
 
 # ----- Read existing version -------------------------------------------------
 $existing = if (Test-Path $VerFile) { (Get-Content $VerFile -Raw -EA 0).Trim() } else { '' }
-if ($existing -eq $Version) {
+if ($existing -eq $Version -and -not $Force) {
     Say "Already at $Version - nothing to download." DarkGreen
+    Say "(Use -Force to re-download the tag even if the version string matches.)" DarkGray
 } else {
+    if ($Force -and $existing -eq $Version) {
+        Say "Force re-download requested - downloading $Version fresh..." DarkYellow
+    }
     # ----- Download + extract ------------------------------------------------
     $url    = "https://github.com/matt-magna5/SDT/archive/refs/tags/$Version.zip"
     $zipTmp = Join-Path $env:TEMP "sdt-install-$Version.zip"
@@ -308,7 +313,7 @@ switch -Regex (`$Mode) {
         try {
             `$inst = Invoke-WebRequest 'https://raw.githubusercontent.com/matt-magna5/SDT/main/install.ps1' -UseBasicParsing -TimeoutSec 30
             `$sb = [ScriptBlock]::Create(`$inst.Content)
-            & `$sb -NoLaunch
+            & `$sb -NoLaunch -Force
         } catch { Write-Host "Update failed: `$(`$_.Exception.Message)" -ForegroundColor Red }
         return
     }
