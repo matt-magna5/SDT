@@ -121,7 +121,7 @@ def retrieve_all(sess, host, pc_ref, root_folder, obj_type, paths):
           {_TRAV}
         </vim25:objectSet>
       </vim25:specSet>
-      <vim25:options><vim25:maxObjects>0</vim25:maxObjects></vim25:options>
+      <vim25:options/>
     </vim25:RetrievePropertiesEx>'''
     root = soap_req(sess, host, body)
     results = []
