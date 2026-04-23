@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.0.8'
+$script:Version   = '4.0.9'
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -287,6 +287,27 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 </div>
 
 <div class="card">
+<div class="card-title">Admin credentials <span class="hint" data-tip="Used to remotely sign in to every ticked VM + every manual target. Needs WinRM remoting permissions (domain admin works; local admin works for workgroup hosts).">i</span></div>
+<div class="card-sub">Domain admin or local admin that can log into the Windows targets. Held in memory only - never written to disk.</div>
+<div class="grid2">
+<div class="field"><label>Domain / Local admin <span class="hint" data-tip="Format: DOMAIN\\username for a domain admin, user@domain.local for UPN, or .\\username for a local admin on workgroup hosts.">i</span></label>
+<input name="winrmUser" placeholder="DOMAIN\administrator or admin@contoso.local"></div>
+<div class="field"><label>Password <span class="hint" data-tip="Password for the admin account. Held in memory only for this session - no file, no registry, no persistence.">i</span></label>
+<div class="pw-wrap">
+<input name="winrmPass" type="password" autocomplete="off">
+<button type="button" class="pw-toggle" onclick="togglePw(this)" title="Show/hide password" aria-label="Toggle password visibility">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+</button>
+</div>
+</div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;margin-top:10px;">
+<button type="button" class="btn btn-secondary" id="testCredsBtn" onclick="testCreds()">Test creds</button>
+<span id="credStatus" style="font-size:12px;color:var(--muted);">Validates against the domain (DOMAIN\user or UPN). Local accounts (.\user) require a manual target.</span>
+</div>
+</div>
+
+<div class="card">
 <div class="card-title">Hypervisor (optional) <span class="hint" data-tip="Hit 'Scan Hypervisor' to connect, list every VM, and tick which ones to collect Windows data from. Skip this whole section if you're running against bare-metal servers only.">i</span></div>
 <div class="card-sub">Connect to vCenter or an ESXi host. Hit <strong>Scan Hypervisor</strong> to discover VMs, then tick which ones to collect Windows data from. Or leave "None" for bare-metal-only runs.</div>
 <div class="grid3">
@@ -340,21 +361,6 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 <br>Example: <code style="font-family:var(--mono);color:var(--info);">192.168.10.4</code> or <code style="font-family:var(--mono);color:var(--info);">QES-OFFICE-DC</code></div>
 <div class="field"><label>Manual targets <span class="hint" data-tip="One host per line. IP or hostname. The script will try remote WinRM first; if that fails, you'll see an error row in the Run tab.">i</span></label>
 <textarea name="targets" placeholder="Optional - only if a host isn't in the HV"></textarea></div>
-
-<div class="section-hdr">Admin credentials <span class="hint" data-tip="Used to remotely sign in to every ticked VM + every manual target. Needs WinRM remoting permissions (domain admin works; local admin works for workgroup hosts).">i</span></div>
-<div class="card-sub" style="margin-bottom:10px;">Domain admin or local admin that can log into the target hosts. Held in memory only - never written to disk.</div>
-<div class="grid2">
-<div class="field"><label>Domain / Local admin <span class="hint" data-tip="Format: DOMAIN\\username for a domain admin, or .\\username for a local admin on workgroup hosts.">i</span></label>
-<input name="winrmUser" placeholder="DOMAIN\administrator or .\administrator"></div>
-<div class="field"><label>Password <span class="hint" data-tip="Password for the admin account. Held in memory only for this session - no file, no registry, no persistence.">i</span></label>
-<div class="pw-wrap">
-<input name="winrmPass" type="password" autocomplete="off">
-<button type="button" class="pw-toggle" onclick="togglePw(this)" title="Show/hide password" aria-label="Toggle password visibility">
-<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-</button>
-</div>
-</div>
-</div>
 <div class="callout">
 <strong>Coming soon:</strong> subnet auto-discovery (scan button). For now, list targets manually or use AD/DNS export.
 </div>
@@ -710,6 +716,45 @@ function togglePw(btn){
   const input = btn.parentElement.querySelector('input');
   if (!input) return;
   input.type = (input.type === 'password') ? 'text' : 'password';
+}
+
+async function testCreds(){
+  const form = document.getElementById('setupForm');
+  const user = (form.winrmUser.value || '').trim();
+  const pass = form.winrmPass.value || '';
+  const btn  = document.getElementById('testCredsBtn');
+  const st   = document.getElementById('credStatus');
+  if (!user || !pass) {
+    st.style.color = 'var(--warn)';
+    st.textContent = 'Enter a username and password first.';
+    return;
+  }
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = 'Checking...';
+  st.style.color = 'var(--muted)';
+  st.textContent = 'Contacting domain controller...';
+  try {
+    const resp = await fetch('/api/test-creds', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ winrmUser: user, winrmPass: pass })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      st.style.color = 'var(--ok)';
+      st.textContent = 'OK - ' + (data.message || 'credentials valid');
+    } else {
+      st.style.color = 'var(--crit)';
+      st.textContent = data.error || 'validation failed';
+    }
+  } catch(e) {
+    st.style.color = 'var(--crit)';
+    st.textContent = 'Error: ' + e.message;
+  } finally {
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
 }
 </script>
 </body></html>
@@ -1315,6 +1360,48 @@ try {
                     $payload | Add-Member -NotePropertyName targets -NotePropertyValue $targets -Force
                     $null = Start-DiscoveryRun -Payload $payload
                     Send-Json -Response $resp -Data @{ ok = $true; sessionDir = $script:Session.SessionDir; targetCount = $targets.Count }
+                    break
+                }
+                '^POST /api/test-creds$' {
+                    $body = Read-RequestBody -Request $req
+                    $c = $null
+                    try { $c = $body | ConvertFrom-Json -ErrorAction Stop } catch {
+                        Send-Json -Response $resp -Data @{ ok=$false; error='JSON parse failed' } -StatusCode 400; break
+                    }
+                    $u = "$($c.winrmUser)".Trim()
+                    $p = "$($c.winrmPass)"
+                    if (-not $u -or -not $p) {
+                        Send-Json -Response $resp -Data @{ ok=$false; error='username + password required' } -StatusCode 400; break
+                    }
+                    $dom = $null; $justUser = $null
+                    if ($u -match '^\.\\(.+)$') {
+                        Send-Json -Response $resp -Data @{ ok=$false; error='Local account (.\user) cannot be validated without a target. Will be tested during discovery.' }; break
+                    } elseif ($u -match '^([^\\]+)\\(.+)$') {
+                        $dom = $matches[1]; $justUser = $matches[2]
+                    } elseif ($u -like '*@*') {
+                        $dom = ($u -split '@',2)[1]; $justUser = $u
+                    } else {
+                        Send-Json -Response $resp -Data @{ ok=$false; error='Username needs a domain: DOMAIN\user or user@domain.local' }; break
+                    }
+                    try {
+                        Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
+                        $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
+                            [System.DirectoryServices.AccountManagement.ContextType]::Domain, $dom)
+                        $valid = $ctx.ValidateCredentials($justUser, $p)
+                        $ctx.Dispose()
+                        if ($valid) {
+                            Send-Json -Response $resp -Data @{ ok=$true; message="Valid on domain $dom" }
+                        } else {
+                            Send-Json -Response $resp -Data @{ ok=$false; error="Rejected by $dom (wrong password, expired, or locked)" }
+                        }
+                    } catch {
+                        $msg = $_.Exception.Message
+                        if ($msg -match '(?i)server.+not.+found|could not contact|server is not operational') {
+                            Send-Json -Response $resp -Data @{ ok=$false; error="Cannot reach domain '$dom' - DC unreachable from this host (VPN, DNS, or workgroup machine?)" }
+                        } else {
+                            Send-Json -Response $resp -Data @{ ok=$false; error="Validation error: $msg" }
+                        }
+                    }
                     break
                 }
                 '^POST /api/open-folder$' {
