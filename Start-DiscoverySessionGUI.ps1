@@ -26,7 +26,32 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version   = '4.1.8'
+
+# Resolve version dynamically. Priority:
+#   1. VERSION file at ../VERSION (written by install.ps1 at %LOCALAPPDATA%\Magna5\SDT\VERSION)
+#   2. VERSION file alongside the script (zero-install / dev mode)
+#   3. Containing folder name like 'SDT-4.1.20' (zip-extract default)
+#   4. Hardcoded fallback (kept in sync with the most recent tag)
+function Get-SdtVersion {
+    $candidates = @(
+        (Join-Path (Split-Path $PSScriptRoot -Parent) 'VERSION'),
+        (Join-Path $PSScriptRoot 'VERSION')
+    )
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path $p)) {
+            try {
+                $v = (Get-Content $p -Raw -EA Stop).Trim()
+                if ($v) { return ($v -replace '^v','') }
+            } catch { }
+        }
+    }
+    # Folder-name probe: 'SDT-4.1.20' or 'sdt-4.1.20'
+    $leaf = Split-Path $PSScriptRoot -Leaf
+    if ($leaf -match '^[Ss][Dd][Tt][-_]v?(\d+\.\d+\.\d+)') { return $matches[1] }
+    # Last-ditch fallback - this gets bumped at every release
+    return '4.1.20'
+}
+$script:Version   = Get-SdtVersion
 $script:ScriptDir = $PSScriptRoot
 $script:BaseUrl   = "http://localhost:$Port"
 
@@ -675,6 +700,19 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
                    radial-gradient(900px 400px at -200px 200px,rgba(139,92,246,0.08),transparent 50%);
   background-attachment:fixed;min-height:100vh;}
 .wrap{max-width:1280px;margin:0 auto;padding:0 28px 60px;}
+/* Report mode: hide everything except the Report tab content. Floating back button shown instead. */
+body.report-mode .hdr,
+body.report-mode .tab-nav,
+body.report-mode .footer { display:none; }
+body.report-mode .wrap { padding-top:60px; }
+.back-to-setup-btn {
+  display:none; position:fixed; top:14px; left:14px; z-index:200;
+  background:var(--elevated); color:var(--text); border:1px solid var(--border-2);
+  font-weight:600; font-size:12px; padding:8px 16px; border-radius:8px; cursor:pointer;
+  font-family:var(--sans); box-shadow:0 2px 8px rgba(0,0,0,0.4);
+}
+.back-to-setup-btn:hover { background:var(--elevated-2); }
+body.report-mode .back-to-setup-btn { display:inline-block; }
 .hdr{background:rgba(11,18,32,0.75);backdrop-filter:blur(18px);
   border-bottom:1px solid var(--border);padding:14px 28px;display:flex;justify-content:space-between;align-items:center;
   position:sticky;top:0;z-index:100;}
@@ -917,6 +955,12 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 <div class="card-title">Log</div>
 <div class="logbox" id="logbox">Waiting for discovery to start...</div>
 </div>
+
+<div style="margin-top:18px;text-align:center;">
+  <button type="button" class="btn btn-secondary" onclick="setTab('report')" style="padding:10px 24px;">
+    Jump to Report Tab &rarr;
+  </button>
+</div>
 </div>
 
 <!-- REPORT TAB -->
@@ -942,6 +986,9 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 function setTab(t){
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active', b.id==='tb-'+t));
   document.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active', p.id==='tab-'+t));
+  // Report mode: hide all chrome so the report is the only thing on screen.
+  document.body.classList.toggle('report-mode', t==='report');
+  if (t==='report') { window.scrollTo(0,0); }
 }
 
 // Holds the last hypervisor scan result so submit can pass checked VMs.
