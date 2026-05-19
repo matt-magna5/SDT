@@ -1298,24 +1298,67 @@ function renderReport(s){
   }
 
   if (s.ReportPath) {
-    el.innerHTML = `<p style="font-size:13px;">Report saved:</p>
-      <p><code style="font-family:var(--mono);color:var(--info);font-size:12px;word-break:break-all;">${escapeHtml(s.ReportPath)}</code></p>
-      <p>
-        <a href="file:///${escapeHtml(s.ReportPath.replace(/\\/g,'/'))}" target="_blank" class="btn" style="display:inline-block;text-decoration:none;">Open report</a>
-        ${zipBtn}
-        ${openFolderBtn}
-        ${viewLogBtn}
-        ${copyLogsBtn}
-      </p>
-      ${missingHtml}
-      <div id="genLogBox"></div>`;
-    document.getElementById('reportSub').textContent = 'Session complete. Click below to open the HTML report.';
+    // SUCCESS: minimal UI. One big button to open the report; everything else
+    // collapsed behind a small Details disclosure. No diagnostic clutter.
+    el.innerHTML = `<div style="text-align:center;padding:40px 20px;">
+        <a href="file:///${escapeHtml(s.ReportPath.replace(/\\/g,'/'))}" target="_blank" class="btn"
+           style="display:inline-block;text-decoration:none;font-size:16px;padding:18px 40px;">
+          Open HTML Report
+        </a>
+      </div>
+      <details style="margin-top:18px;">
+        <summary style="cursor:pointer;color:var(--muted);font-size:12px;">Details / extras</summary>
+        <div style="margin-top:12px;font-size:12px;">
+          <p>Report path: <code style="font-family:var(--mono);color:var(--info);word-break:break-all;">${escapeHtml(s.ReportPath)}</code></p>
+          <p>${zipBtn}${openFolderBtn}${viewLogBtn}${copyLogsBtn}</p>
+          ${missingHtml}
+          <div id="genLogBox"></div>
+        </div>
+      </details>`;
+    document.getElementById('reportSub').textContent = '';
   } else {
-    el.innerHTML = `<p style="color:var(--warn);">Report not generated - check log for errors.</p>
-      <p style="color:var(--muted);font-size:12px;">Session dir: <code style="font-family:var(--mono);">${escapeHtml(sessionDir)}</code></p>
-      <p>${openFolderBtn}${viewLogBtn}${copyLogsBtn}</p>
-      ${missingHtml}
-      <div id="genLogBox"></div>`;
+    // FAILURE: minimal warning + a single "Retry Report Generation" button.
+    // Diagnostic info collapsed behind a disclosure.
+    el.innerHTML = `<div style="text-align:center;padding:40px 20px;">
+        <p style="color:var(--warn);font-size:14px;margin-bottom:18px;">
+          Report not generated.
+        </p>
+        <button type="button" class="btn" onclick="retryReportGen(this)" style="font-size:14px;padding:14px 32px;">
+          Retry Report Generation
+        </button>
+      </div>
+      <details style="margin-top:18px;">
+        <summary style="cursor:pointer;color:var(--muted);font-size:12px;">Diagnostics</summary>
+        <div style="margin-top:12px;font-size:12px;">
+          <p style="color:var(--muted);">Session dir: <code style="font-family:var(--mono);">${escapeHtml(sessionDir)}</code></p>
+          <p>${openFolderBtn}${viewLogBtn}${copyLogsBtn}</p>
+          ${missingHtml}
+          <div id="genLogBox"></div>
+        </div>
+      </details>`;
+    document.getElementById('reportSub').textContent = '';
+  }
+}
+
+async function retryReportGen(btn){
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Regenerating...';
+  try {
+    const resp = await fetch('/api/regenerate-report', { method: 'POST' });
+    const data = await resp.json();
+    if (data.ok && data.reportPath) {
+      // Refresh the Report tab content via /api/status
+      const s = await (await fetch('/api/status')).json();
+      window._lastStatus = s;
+      renderReportPane(s);
+      return;
+    }
+    btn.textContent = data.error ? ('Failed: ' + data.error.substring(0, 60)) : 'Failed';
+    setTimeout(()=>{ btn.textContent = orig; btn.disabled = false; }, 4000);
+  } catch(e) {
+    btn.textContent = 'Failed: ' + e.message.substring(0, 60);
+    setTimeout(()=>{ btn.textContent = orig; btn.disabled = false; }, 4000);
   }
 }
 
@@ -1888,7 +1931,13 @@ function Start-DiscoveryRun {
             foreach ($t in $Session.Targets) {
                 if ($t.Kind -eq 'hypervisor') { continue }
                 if ($t.JsonPath -and (Test-Path $t.JsonPath)) {
-                    $serversList += @{ file = (Split-Path -Leaf $t.JsonPath) }
+                    $jname = Split-Path -Leaf $t.JsonPath
+                    # Derive name + id slug from the discovery filename so gen_report.py
+                    # never hits a KeyError on missing 'id'.
+                    $tBase = ($jname -replace '-discovery-\d{4}-\d{2}-\d{2}.*$','') -replace '\.json$',''
+                    $tSlug = ($tBase.ToLower() -replace '[^a-z0-9]+','-').Trim('-')
+                    if (-not $tSlug) { $tSlug = 'server' }
+                    $serversList += @{ file = $jname; name = $tBase; id = $tSlug; in_scope = $true }
                 }
             }
             $invFile = ''
@@ -1943,7 +1992,14 @@ function Start-DiscoveryRun {
                 try {
                     $autoServers = @(Get-ChildItem $Session.SessionDir -Filter '*-discovery-*.json' -EA 0 |
                         Where-Object { $_.Length -gt 100 } |
-                        ForEach-Object { @{ file = $_.Name } })
+                        ForEach-Object {
+                            # Derive server name + id slug from the discovery filename.
+                            # File pattern: <NAME>-discovery-<DATE>.json
+                            $base = $_.BaseName -replace '-discovery-\d{4}-\d{2}-\d{2}.*$',''
+                            $slug = ($base.ToLower() -replace '[^a-z0-9]+','-').Trim('-')
+                            if (-not $slug) { $slug = 'server' }
+                            @{ file = $_.Name; name = $base; id = $slug; in_scope = $true }
+                        })
                     $autoInv = ''
                     $invf = Get-ChildItem $Session.SessionDir -Filter '*inventory*.json' -EA 0 | Where-Object { $_.Length -gt 100 } | Select-Object -First 1
                     if ($invf) { $autoInv = $invf.Name }
@@ -2481,6 +2537,64 @@ namespace Win32 {
                         Send-Json -Response $resp -Data @{ ok = $true; path = $dir }
                     } catch {
                         Send-Json -Response $resp -Data @{ error = $_.Exception.Message } -StatusCode 500
+                    }
+                    break
+                }
+                '^POST /api/regenerate-report$' {
+                    # Self-heal: rebuild manifest from any *-discovery-*.json files
+                    # in the session dir and re-run gen_report.py. Used by the
+                    # "Retry Report Generation" button on the Report tab.
+                    $dir = $script:Session.SessionDir
+                    if (-not $dir -or -not (Test-Path $dir)) {
+                        Send-Json -Response $resp -Data @{ ok=$false; error='no session dir' } -StatusCode 400
+                        break
+                    }
+                    try {
+                        $gen = Join-Path $script:ScriptDir 'gen_report.py'
+                        $py  = Join-Path $script:ScriptDir 'python\python.exe'
+                        if (-not (Test-Path $py)) { $py = 'python' }
+                        $mf  = Join-Path $dir 'manifest.json'
+                        $autoServers = @(Get-ChildItem $dir -Filter '*-discovery-*.json' -EA 0 |
+                            Where-Object { $_.Length -gt 100 } |
+                            ForEach-Object {
+                                $base = $_.BaseName -replace '-discovery-\d{4}-\d{2}-\d{2}.*$',''
+                                $slug = ($base.ToLower() -replace '[^a-z0-9]+','-').Trim('-')
+                                if (-not $slug) { $slug = 'server' }
+                                @{ file = $_.Name; name = $base; id = $slug; in_scope = $true }
+                            })
+                        $autoInv = ''
+                        $invf = Get-ChildItem $dir -Filter '*inventory*.json' -EA 0 | Where-Object { $_.Length -gt 100 } | Select-Object -First 1
+                        if ($invf) { $autoInv = $invf.Name }
+                        $client = if ($script:Session.Client) { $script:Session.Client } else { 'CLIENT' }
+                        $manifestObj = @{
+                            client = $client; client_full = $client
+                            date = (Get-Date).ToString('yyyy-MM-dd')
+                            session_dir = '.'; output_dir = '.'
+                            inventory_file = $autoInv; logo_file = ''
+                            servers = $autoServers
+                        } | ConvertTo-Json -Depth 6
+                        [System.IO.File]::WriteAllText($mf, $manifestObj, [System.Text.Encoding]::UTF8)
+                        $stdOut = [System.IO.Path]::GetTempFileName()
+                        $stdErr = [System.IO.Path]::GetTempFileName()
+                        $p = Start-Process -FilePath $py -ArgumentList @($gen, $mf) `
+                            -NoNewWindow -PassThru -Wait `
+                            -RedirectStandardOutput $stdOut -RedirectStandardError $stdErr `
+                            -WorkingDirectory $dir -EA Stop
+                        $log = "[exit $($p.ExitCode)]`n" + (Get-Content $stdOut -Raw) + "`n--- STDERR ---`n" + (Get-Content $stdErr -Raw)
+                        Remove-Item $stdOut, $stdErr -EA SilentlyContinue
+                        # Append to gen_report.log so user can see the retry
+                        $reportLog = Join-Path $dir 'gen_report.log'
+                        Add-Content -Path $reportLog -Value "`n===== RETRY ($(Get-Date -f 'yyyy-MM-dd HH:mm:ss')) =====`n$log" -EA SilentlyContinue
+                        $html = Get-ChildItem $dir -Filter '*DiscoveryReport*.html' -EA 0 | Where-Object { $_.Length -gt 1024 } | Select-Object -First 1
+                        if ($html) {
+                            $script:Session.ReportPath = $html.FullName
+                            Add-Log "Report regenerated: $($html.Name)"
+                            Send-Json -Response $resp -Data @{ ok=$true; reportPath=$html.FullName }
+                        } else {
+                            Send-Json -Response $resp -Data @{ ok=$false; error='gen_report.py ran but no HTML produced'; log=$log } -StatusCode 500
+                        }
+                    } catch {
+                        Send-Json -Response $resp -Data @{ ok=$false; error=$_.Exception.Message } -StatusCode 500
                     }
                     break
                 }

@@ -1,5 +1,5 @@
 """
-gen_report.py — Magna5 Server Discovery Report Generator
+gen_report.py - Magna5 Server Discovery Report Generator
 Usage: python gen_report.py <manifest.json>
 Produces a single HTML file matching the MEKE gold-standard design.
 """
@@ -7,9 +7,9 @@ import json, html as htmlmod, sys, io, os, re, datetime, urllib.request, urllib.
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-# ── DETECTION RULES ───────────────────────────────────────────────────────────
+# -- DETECTION RULES -----------------------------------------------------------
 # Loaded from detection_rules.json alongside this script.
-# Per-session override: place a detection_rules.json in the session folder —
+# Per-session override: place a detection_rules.json in the session folder -
 # its entries are appended to the global rules (additive, not replacing).
 
 def _load_rules():
@@ -46,7 +46,7 @@ def _load_rules():
 
 RULES = _load_rules()
 
-# ── LIFECYCLE LOOKUP ──────────────────────────────────────────────────────────
+# -- LIFECYCLE LOOKUP ----------------------------------------------------------
 # Fetches EOL dates from endoflife.date API (community-maintained, no auth).
 # Falls back to detection_rules.json lifecycle section if offline.
 # Returns dict: major.minor -> {'eol': 'YYYY-MM-DD', 'status': 'EOL'|''}
@@ -132,7 +132,7 @@ OUTPUT_DIR   = resolve(CFG.get('output_dir', CFG['session_dir']))
 OUTPUT       = os.path.join(OUTPUT_DIR, f"{CLIENT}-DiscoveryReport-{DATE}.html")
 LOGO_FILE    = resolve(CFG.get('logo_file', ''))
 
-# ── LOAD DATA ─────────────────────────────────────────────────────────────────
+# -- LOAD DATA -----------------------------------------------------------------
 def jload(path):
     with open(path, encoding='utf-8-sig') as f:
         return json.load(f)
@@ -156,7 +156,7 @@ for _fname in sorted(os.listdir(SESSION_DIR)):
 servers = []
 for s in CFG.get('servers', []):
     if s.get('os_type') == 'linux':
-        # Linux entry — may have SSH JSON or be a placeholder
+        # Linux entry - may have SSH JSON or be a placeholder
         data = jload(os.path.join(SESSION_DIR, s['file'])) if s.get('file') else {}
         servers.append({**s, 'data': data})
     else:
@@ -169,7 +169,7 @@ if LOGO_FILE and os.path.exists(LOGO_FILE):
     with open(LOGO_FILE) as f:
         LOGO_B64 = f.read().strip()
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
+# -- HELPERS -------------------------------------------------------------------
 def h(s):
     return htmlmod.escape(str(s)) if s is not None else ''
 
@@ -265,7 +265,7 @@ def extract_forwarders(raw):
     if isinstance(raw, str) and raw.strip(): return raw
     return ''
 
-# ── FSMO CROSS-REFERENCE ──────────────────────────────────────────────────────
+# -- FSMO CROSS-REFERENCE ------------------------------------------------------
 def _norm_host(fqdn):
     return fqdn.split('.')[0].upper() if fqdn else ''
 
@@ -278,7 +278,7 @@ for _s in servers:
             _v = _ad.get(_f, '')
             if _v: FSMO_HOLDERS.add(_norm_host(_v))
 
-# ── ROLE LABEL DERIVATION ─────────────────────────────────────────────────────
+# -- ROLE LABEL DERIVATION -----------------------------------------------------
 def derive_role_label(srv):
     data  = srv['data']
     name  = srv['name'].upper()
@@ -326,7 +326,7 @@ def derive_role_label(srv):
     if has_hv:             parts.append('Hyper-V Host')
     return ' · '.join(parts) if parts else 'Windows Server'
 
-# ── FLAG DERIVATION ───────────────────────────────────────────────────────────
+# -- FLAG DERIVATION -----------------------------------------------------------
 def build_flags(srv):
     data  = srv['data']
     name  = srv['name']
@@ -348,8 +348,8 @@ def build_flags(srv):
 
     if eol_status in ('EOL', 'Near EOL') or 'Server 2016' in os_name or 'Server 2008' in os_name:
         sev = 'critical' if eol_status == 'EOL' or 'Server 2008' in os_name else 'warning'
-        flags.append((sev, 'Windows Server EOL — Upgrade Required',
-            f'{os_name} — support ends {eol_date or "Oct 12, 2027 (WS2016)"}. '
+        flags.append((sev, 'Windows Server EOL - Upgrade Required',
+            f'{os_name} - support ends {eol_date or "Oct 12, 2027 (WS2016)"}. '
             f'No security patches after end-of-support. Upgrade to Windows Server 2022.'))
 
     for d in as_list(data.get('Disks', [])):
@@ -357,13 +357,13 @@ def build_flags(srv):
         free = d.get('FreeGB', 0); total = d.get('TotalGB', 0)
         if pct >= 85:
             flags.append(('critical', f'Disk {drv} Near Capacity',
-                f'{name} {drv}: {pct}% used — only {free:.1f} GB free of {total:.1f} GB. Risk of service disruption.'))
+                f'{name} {drv}: {pct}% used - only {free:.1f} GB free of {total:.1f} GB. Risk of service disruption.'))
         elif pct >= 70:
             flags.append(('warning', f'Disk {drv} Space Moderate',
                 f'{name} {drv}: {pct}% used ({free:.1f} GB free of {total:.1f} GB). Monitor closely.'))
 
     if has_smb1:
-        flags.append(('critical', 'SMB 1.0/CIFS Enabled — Critical Security Risk',
+        flags.append(('critical', 'SMB 1.0/CIFS Enabled - Critical Security Risk',
             f'{name}: SMB 1.0 is the attack vector for WannaCry/NotPetya/EternalBlue ransomware. '
             f'Disable: Remove-WindowsFeature FS-SMB1'))
 
@@ -375,25 +375,25 @@ def build_flags(srv):
 
     up = float(sys_.get('UptimeDays', 0) or 0)
     if up > 90:
-        flags.append(('warning', f'Extended Uptime — {up:.0f} Days',
+        flags.append(('warning', f'Extended Uptime - {up:.0f} Days',
             f'{name} has not been rebooted in {up:.0f} days. Pending updates may not be applied.'))
 
     if isinstance(exch, dict) and exch.get('Installed'):
         exch_eol = exch.get('EOLStatus', '')
         if exch_eol in ('EOL', 'Near EOL'):
             sev = 'critical' if exch_eol == 'EOL' else 'warning'
-            flags.append((sev, f'Exchange {exch.get("VersionName","")} — {exch_eol}',
+            flags.append((sev, f'Exchange {exch.get("VersionName","")} - {exch_eol}',
                 f'{name}: reached end of support on {exch.get("EOLDate","")}. No security patches available.'))
 
     sql_inst = sql.get('Instances', {}) if isinstance(sql, dict) else {}
     if isinstance(sql_inst, dict) and sql_inst.get('Edition') and sql_inst.get('EOLStatus') == 'EOL':
-        flags.append(('critical', f'{sql_inst.get("Edition","")} — EOL and WS2022 Incompatible',
+        flags.append(('critical', f'{sql_inst.get("Edition","")} - EOL and WS2022 Incompatible',
             f'{name}: {sql_inst.get("Edition","")} (instance: {sql_inst.get("InstanceName","")}) EOL {sql_inst.get("EOLDate","")}. '
             f'NOT supported on Windows Server 2022. Must upgrade SQL to 2017+ before OS upgrade.'))
 
     return flags
 
-# ── SERVICE CATEGORIZATION ────────────────────────────────────────────────────
+# -- SERVICE CATEGORIZATION ----------------------------------------------------
 _SK       = RULES.get('service_keywords', {})
 _EDR_SVC  = tuple(_SK.get('edr',    []))
 _PAM_SVC  = tuple(_SK.get('pam',    []))
@@ -501,10 +501,10 @@ def find_svc_anomalies(svc_l):
             out.append({**svc, '_reason': reason})
     return out
 
-# ── BUILD PER-SERVER TAB ──────────────────────────────────────────────────────
+# -- BUILD PER-SERVER TAB ------------------------------------------------------
 def build_linux_tab(srv):
-    sid    = srv['id']
-    name   = srv['name']
+    name   = srv.get('name', '') or 'unknown-linux'
+    sid    = srv.get('id') or re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-') or 'linux'
     ip     = srv.get('ip', '')
     guest  = srv.get('guest_os', 'Linux')
     in_sc  = srv.get('in_scope', True)
@@ -533,7 +533,7 @@ def build_linux_tab(srv):
 
     scope_pill = f'<span class="pill pill-green">IN SCOPE</span>' if in_sc else f'<span class="pill pill-gray">OUT OF SCOPE</span>'
 
-    # ── HEADER BANNER ─────────────────────────────────────────────────────────
+    # -- HEADER BANNER ---------------------------------------------------------
     if has_data:
         os_pretty = data.get('OS', {}).get('PrettyName', guest)
         kernel    = data.get('OS', {}).get('Kernel', '')
@@ -573,7 +573,7 @@ def build_linux_tab(srv):
               f'border-radius:12px;font-weight:600;">🐧 Linux / Non-Windows</span>'
               f'</div></div></div>\n')
 
-    # ── NO DATA PLACEHOLDER ────────────────────────────────────────────────────
+    # -- NO DATA PLACEHOLDER ----------------------------------------------------
     if not has_data:
         placeholder = (f'<div style="text-align:center;padding:48px 24px;color:#6b6080;">'
                        f'<div style="font-size:28px;margin-bottom:12px;">🐧</div>'
@@ -587,7 +587,7 @@ def build_linux_tab(srv):
         tab_html = f'<div id="top-{sid}">\n{header}{placeholder}</div>\n'
         return {'id': sid, 'name': name, 'crit': 0, 'warn': 0, 'in_scope': in_sc, 'tab_html': tab_html}
 
-    # ── SYSTEM OVERVIEW ────────────────────────────────────────────────────────
+    # -- SYSTEM OVERVIEW --------------------------------------------------------
     ram_gb   = round(mem_total / 1024, 1) if mem_total else '?'
     ram_used = round(mem_used  / 1024, 1) if mem_used  else '?'
     stats = (f'<div class="stat-grid" style="grid-template-columns:repeat(3,1fr);">'
@@ -607,7 +607,7 @@ def build_linux_tab(srv):
     overview_body = stats + meta_tbl
     overview_card = lcard('System Overview', overview_body)
 
-    # ── DISKS ──────────────────────────────────────────────────────────────────
+    # -- DISKS ------------------------------------------------------------------
     disks_body = ''
     if disks:
         disks_body = ('<table><tr><th>Mount</th><th>Source</th><th>Size</th>'
@@ -626,7 +626,7 @@ def build_linux_tab(srv):
         disks_body = '<div style="color:#9ca3af;font-style:italic">No disk data collected.</div>'
     disks_card = lcard('Disk Storage', disks_body)
 
-    # ── NETWORK ────────────────────────────────────────────────────────────────
+    # -- NETWORK ----------------------------------------------------------------
     net_body = ''
     if network:
         net_body = '<table><tr><th>Interface</th><th>Addresses</th></tr>\n'
@@ -641,7 +641,7 @@ def build_linux_tab(srv):
         net_body = '<div style="color:#9ca3af;font-style:italic">No network data collected.</div>'
     net_card = lcard('Network', net_body)
 
-    # ── SERVICES ──────────────────────────────────────────────────────────────
+    # -- SERVICES --------------------------------------------------------------
     svc_body = ''
     if services:
         svc_body = ('<div style="display:flex;flex-wrap:wrap;gap:6px;">' +
@@ -661,8 +661,10 @@ def build_linux_tab(srv):
 
 def build_server_tab(srv):
     data    = srv['data']
-    sid     = srv['id']
-    name    = srv['name']
+    name    = srv.get('name', '') or 'unknown'
+    # Self-heal: manifest entries built by the GUI's recovery path don't always
+    # populate 'id'. Derive a stable lowercase slug from the name when missing.
+    sid     = srv.get('id') or re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-') or 'server'
     _rl     = srv.get('role_label', '')
     rlabel  = _rl if (_rl and _rl.lower() != name.lower()) else derive_role_label(srv)
     in_sc   = srv.get('in_scope', True)
@@ -800,18 +802,18 @@ def build_server_tab(srv):
             boot_pill = f' &nbsp;<span class="pill pill-{bclr}">{da} days ago{note}</span>'
         except: pass
 
-    # ── SMB1 BANNER ──────────────────────────────────────────────────────────
+    # -- SMB1 BANNER ----------------------------------------------------------
     smb1_banner = ''
     if has_smb1:
         smb1_banner = (
             '<div style="background:#fff0f0;border:1.5px solid #d63638;border-radius:8px;'
             'padding:12px 16px;margin-bottom:16px;display:flex;align-items:flex-start;gap:12px;">'
             '<span style="font-size:18px;flex-shrink:0">&#9940;</span>'
-            '<div><div style="font-size:9.5pt;font-weight:700;color:#d63638;">SMB 1.0/CIFS ENABLED — Critical Security Risk</div>'
+            '<div><div style="font-size:9.5pt;font-weight:700;color:#d63638;">SMB 1.0/CIFS ENABLED - Critical Security Risk</div>'
             '<div style="font-size:9pt;color:#7f2424;margin-top:3px;">SMB 1.0 is the attack vector for WannaCry, NotPetya, and EternalBlue ransomware. '
             'Disable: <code>Remove-WindowsFeature FS-SMB1</code></div></div></div>\n')
 
-    # ── SECURITY MINI-BOX (SBR) ──────────────────────────────────────────────
+    # -- SECURITY MINI-BOX (SBR) ----------------------------------------------
     def sec_row(icon, lbl, detail, status, sclr):
         bmap = {'green':'#20c800','yellow':'#f5a623','red':'#d63638','purple':'#5b1fa4','gray':'#9ca3af'}
         bgmap = {'green':'#f0fdf0','yellow':'#fff8e1','red':'#fff0f0','purple':'#f0f4ff','gray':'#f3f4f6'}
@@ -825,23 +827,23 @@ def build_server_tab(srv):
                 f'border:1px solid {bmap.get(sclr,"#9ca3af")};white-space:nowrap">{status}</span></div>\n')
 
     sec_rows  = sec_row('&#128737;', 'EDR / Endpoint',
-                        edr or 'No data collected — verify agent present',
+                        edr or 'No data collected - verify agent present',
                         'PROTECTED' if edr else 'NOT DETECTED', 'green' if edr else 'yellow')
     sec_rows += sec_row('&#128295;', 'RMM / Management',
-                        rmm or 'No data collected — verify agent present',
+                        rmm or 'No data collected - verify agent present',
                         'DETECTED' if rmm else 'NOT DETECTED', 'green' if rmm else 'yellow')
     if pam:
         sec_rows += sec_row('&#128273;', 'Privileged Access (PAM)', pam, 'ACTIVE', 'purple')
     sec_rows += sec_row('&#128190;', 'Backup / BDR',
-                        bdr or 'Not detected — verify with client',
+                        bdr or 'Not detected - verify with client',
                         'DETECTED' if bdr else 'NOT DETECTED', 'green' if bdr else 'yellow')
     if has_smb1:
         sec_rows += sec_row('&#9940;', 'SMB 1.0 Protocol',
-                            'ENABLED — ransomware attack vector (disable immediately)',
+                            'ENABLED - ransomware attack vector (disable immediately)',
                             'CRITICAL', 'red')
     security_mini = mini_box('Security &amp; Protection', sec_rows)
 
-    # ── OS & SYSTEM MINI-BOX (SBR left) ──────────────────────────────────────
+    # -- OS & SYSTEM MINI-BOX (SBR left) --------------------------------------
     plat_disp = vm_plat if vm_plat else ('Physical' if not is_vm else 'VM')
     os_sys_rows = (
         f'<tr><td style="color:#6b6080;width:110px;padding:3px 0">Platform</td>'
@@ -860,7 +862,7 @@ def build_server_tab(srv):
     os_sys_mini = mini_box('OS &amp; System',
         f'<table style="width:100%;font-size:9pt;border-collapse:collapse;">{os_sys_rows}</table>')
 
-    # ── AD MINI-BOX (SBR left, DCs only) ─────────────────────────────────────
+    # -- AD MINI-BOX (SBR left, DCs only) -------------------------------------
     ad_sbr_mini = ''
     if has_adds and isinstance(ad, dict) and ad.get('Installed'):
         fl_raw = str(ad.get('DomainFL', ad.get('ForestFL', '')))
@@ -868,7 +870,7 @@ def build_server_tab(srv):
         fl_lbl = f'Windows Server {fl_yr}' if fl_yr else fl_raw
         _stale_raw = ad.get('StaleUsers', '')
         stale_u = len(_stale_raw) if isinstance(_stale_raw, list) else (int(_stale_raw) if str(_stale_raw).isdigit() else 0)
-        # FSMORoles from list (actual data) — count as DC indicator
+        # FSMORoles from list (actual data) - count as DC indicator
         fsmo_list_sbr = ad.get('FSMORoles', [])
         if not isinstance(fsmo_list_sbr, list): fsmo_list_sbr = []
         fsmo_count = len(fsmo_list_sbr)
@@ -888,7 +890,7 @@ def build_server_tab(srv):
         ad_sbr_mini = mini_box('Active Directory',
             f'<table style="width:100%;font-size:9pt;border-collapse:collapse;">{ad_rows}</table>')
 
-    # ── STORAGE MINI-BOX (SBR left) ───────────────────────────────────────────
+    # -- STORAGE MINI-BOX (SBR left) -------------------------------------------
     disk_rows_s = ''.join(
         stor_row(d.get('Drive','?'), d.get('Label','') or '', d.get('TotalGB',0),
                  d.get('FreeGB',0), d.get('UsedPct',0))
@@ -902,7 +904,7 @@ def build_server_tab(srv):
         '<th style="font-size:8pt;padding:4px 0;color:#6b6080;font-weight:600">Free</th></tr>'
         + disk_rows_s + '</table>')
 
-    # ── SECURITY MINI-BOX (SBR left) ─────────────────────────────────────────
+    # -- SECURITY MINI-BOX (SBR left) -----------------------------------------
     def _sec_pill(val, missing_warn=True):
         if val:
             return f'<span class="pill pill-green">{h(val)}</span>'
@@ -924,7 +926,7 @@ def build_server_tab(srv):
         f'<table style="width:100%;font-size:9pt;border-collapse:collapse;">{sec_left_rows}</table>',
         last=True)
 
-    # ── ROLES MINI-BOX (SBR right) ────────────────────────────────────────────
+    # -- ROLES MINI-BOX (SBR right) --------------------------------------------
     role_bdg = ''.join(f'<span class="role-badge">{h(role_display.get(r,r))}</span>'
                        for r in sorted(role_names_raw) if r)
     single_point_warn = ''
@@ -936,7 +938,7 @@ def build_server_tab(srv):
     roles_mini = mini_box('Roles Running on This Server',
         f'<div style="display:flex;flex-wrap:wrap;gap:6px;">{role_bdg}</div>{single_point_warn}')
 
-    # ── SHARES MINI-BOX (SBR right) ───────────────────────────────────────────
+    # -- SHARES MINI-BOX (SBR right) -------------------------------------------
     shares_sbr_mini = ''
     if real_shares:
         shr = ''.join(
@@ -953,7 +955,7 @@ def build_server_tab(srv):
             f'<div style="display:flex;flex-wrap:wrap;gap:6px;">{role_bdg}</div>{single_point_warn}',
             last=True)
 
-    # ── SBR BLOCK ─────────────────────────────────────────────────────────────
+    # -- SBR BLOCK -------------------------------------------------------------
     sbr_html = f'''<div class="sbr-only">
 <div style="background:{sbr_grad(crit,warn)};border-radius:10px 10px 0 0;padding:16px 24px;display:flex;justify-content:space-between;align-items:center;">
   <div>
@@ -979,7 +981,7 @@ def build_server_tab(srv):
 </div></div></div>
 '''
 
-    # ── NAV BAR ───────────────────────────────────────────────────────────────
+    # -- NAV BAR ---------------------------------------------------------------
     sect_links = [('Alerts', f'{sid}-alerts'), ('Overview', f'{sid}-overview'),
                   ('Hardware', f'{sid}-hardware'), ('Applications', f'{sid}-apps'),
                   ('Roles', f'{sid}-roles'), ('Role Config', f'{sid}-roleconfig')]
@@ -1012,11 +1014,11 @@ def build_server_tab(srv):
         + '</div>\n'
     )
 
-    # ── ALERTS CARD ───────────────────────────────────────────────────────────
+    # -- ALERTS CARD -----------------------------------------------------------
     alerts_body = ''.join(flag_div(*f) for f in flags) or '<span class="pill pill-green">No critical alerts</span>\n'
     alerts_body += top_link(sid)
 
-    # ── SYSTEM OVERVIEW CARD ──────────────────────────────────────────────────
+    # -- SYSTEM OVERVIEW CARD --------------------------------------------------
     dom_short = domain.split('.')[0] if domain else 'WORKGROUP'
     os_disp   = os_name.replace('Windows Server ', 'WS').replace(' Standard','').replace(' Datacenter','').strip() or os_short
     def _ov_sec_row(icon, label, val, warn=True):
@@ -1045,7 +1047,7 @@ def build_server_tab(srv):
         f'<div class="stat-grid" style="grid-template-columns:repeat(2,1fr);">'
         f'<div class="stat-box"><div class="stat-num" style="font-size:14px">{h(os_disp)}</div><div class="stat-lbl">OS</div></div>'
         f'<div class="stat-box"><div class="stat-num">{up:.1f}d</div><div class="stat-lbl">Uptime</div></div>'
-        f'<div class="stat-box"><div class="stat-num" style="font-size:13px">{h(last_boot[:10] if last_boot else "—")}</div><div class="stat-lbl">Last Boot</div></div>'
+        f'<div class="stat-box"><div class="stat-num" style="font-size:13px">{h(last_boot[:10] if last_boot else "-")}</div><div class="stat-lbl">Last Boot</div></div>'
         f'<div class="stat-box"><div class="stat-num" style="font-size:{"12" if len(dom_short) > 9 else "14"}px">{h(dom_short)}</div><div class="stat-lbl">Domain</div></div>'
         f'</div>'
         f'<div class="meta-line"><strong>OS:</strong> {h(sys_.get("OSName",""))} (Build {h(os_build)}){_vm_badge}</div>'
@@ -1062,7 +1064,7 @@ def build_server_tab(srv):
         f'</div>'
     ) + top_link(sid)
 
-    # ── HARDWARE CARD ─────────────────────────────────────────────────────────
+    # -- HARDWARE CARD ---------------------------------------------------------
     plat_pill = pill(vm_plat or 'Physical', 'gray' if not vm_plat else 'purple')
     hw_body = f'''<div class="stat-grid">
 <div class="stat-box"><div class="stat-num">{cpu_c}</div><div class="stat-lbl">CPU Cores</div></div>
@@ -1090,7 +1092,7 @@ def build_server_tab(srv):
         hw_body += '</table>\n'
     hw_body += top_link(sid)
 
-    # ── INSTALLED APPS CARD ───────────────────────────────────────────────────
+    # -- INSTALLED APPS CARD ---------------------------------------------------
     apps_body = ''
     cat_order = [('Security', 'Security &amp; EDR'), ('Management', 'Management &amp; RMM'),
                  ('LOB', 'Line of Business / ERP / CRM'),
@@ -1121,10 +1123,10 @@ def build_server_tab(srv):
     if not apps_body:
         apps_body = ('<div class="flag-info"><div class="flag-label">No Data Collected</div>'
                     '<div class="flag-detail">Application inventory returned no data. '
-                    'Collection may have failed on this server — re-run discovery to retry.</div></div>\n')
+                    'Collection may have failed on this server - re-run discovery to retry.</div></div>\n')
     apps_body += top_link(sid)
 
-    # ── ROLES & FEATURES CARD ─────────────────────────────────────────────────
+    # -- ROLES & FEATURES CARD -------------------------------------------------
     _role_anchor = {'AD-Domain-Services': f'{sid}-roleconf-ad', 'DHCP': f'{sid}-roleconf-dhcp',
                     'DNS': f'{sid}-roleconf-dns', 'Hyper-V': f'{sid}-roleconf-hyperv',
                     'FileAndStorage-Services': f'{sid}-roleconf-files', 'NPAS': f'{sid}-roleconf-nps'}
@@ -1150,7 +1152,7 @@ def build_server_tab(srv):
         roles_body += '</table>\n'
     roles_body += top_link(sid)
 
-    # ── ROLE CONFIGURATION CARD ───────────────────────────────────────────────
+    # -- ROLE CONFIGURATION CARD -----------------------------------------------
     rc = ''
 
     # Active Directory
@@ -1158,9 +1160,9 @@ def build_server_tab(srv):
         fl_d = str(ad.get('DomainFL', '')); fl_f = str(ad.get('ForestFL', ''))
         fy_d = (re.search(r'20\d\d', fl_d) or type('', (), {'group': lambda s,n: ''})()).group(0)
         fy_f = (re.search(r'20\d\d', fl_f) or type('', (), {'group': lambda s,n: ''})()).group(0)
-        uc = str(ad.get('UserCount', '') or '—')
-        cc = str(ad.get('ComputerCount', '') or '—')
-        ou = str(ad.get('OUCount', '') or '—')
+        uc = str(ad.get('UserCount', '') or '-')
+        cc = str(ad.get('ComputerCount', '') or '-')
+        ou = str(ad.get('OUCount', '') or '-')
         pdce = ad.get('PDCEmulator', '')
         ridf = ad.get('RIDMaster', '')
         schema_m = ad.get('SchemaMaster', '')
@@ -1183,7 +1185,7 @@ def build_server_tab(srv):
 <div class="stat-box"><div class="stat-num">{h(ou)}</div><div class="stat-lbl">OUs</div></div>
 <div class="stat-box"><div class="stat-num">{len(fsmo_list) if fsmo_list else "&mdash;"}</div><div class="stat-lbl">FSMO Roles Here</div></div>
 </div>\n'''
-        # FSMO roles held by this server — use FSMORoles list directly
+        # FSMO roles held by this server - use FSMORoles list directly
         if fsmo_list:
             rc += sub('FSMO Roles Held By This DC', 'margin-top:12px')
             rc += '<div style="display:flex;flex-wrap:wrap;gap:10px;margin:10px 0;">\n'
@@ -1265,7 +1267,7 @@ def build_server_tab(srv):
                   f'<td style="font-family:monospace;font-size:8.5pt">{h(sc.get("StartRange",""))}</td>'
                   f'<td style="font-family:monospace;font-size:8.5pt">{h(sc.get("EndRange",""))}</td></tr>\n')
         if not scopes:
-            rc += '<tr><td colspan="7" style="color:#6b6080;font-style:italic">DHCP installed — no scope data collected</td></tr>\n'
+            rc += '<tr><td colspan="7" style="color:#6b6080;font-style:italic">DHCP installed - no scope data collected</td></tr>\n'
         rc += '</table>\n'
 
     # NPS
@@ -1303,14 +1305,14 @@ def build_server_tab(srv):
                     bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
                     enabled = pol.get('Enabled', True)
                     st = pill('Active', 'green') if enabled else pill('Disabled', 'gray')
-                    order = pol.get('ProcessingOrder', '—')
+                    order = pol.get('ProcessingOrder', '-')
                     rc += (f'<tr{bg}><td style="text-align:center;color:#6b6080">{h(str(order))}</td>'
                            f'<td style="font-weight:600">{h(pol.get("Name",""))}</td>'
                            f'<td>{st}</td></tr>\n')
                 rc += '</table>\n'
             if not nps_clients and not nps_policies and nps.get('Partial'):
                 rc += ('<div class="flag-info"><div class="flag-label">Partial NPS Data</div>'
-                      '<div class="flag-detail">NPS module unavailable — netsh fallback used. '
+                      '<div class="flag-detail">NPS module unavailable - netsh fallback used. '
                       'Export full config with: <code>netsh nps export filename=nps_config.xml exportPSK=YES</code></div></div>\n')
         else:
             rc += ('<div class="flag-info"><div class="flag-label">NPS Installed</div>'
@@ -1368,16 +1370,16 @@ def build_server_tab(srv):
         sql_eol_status = sql_inst.get('EOLStatus', '')
         sql_eol_c = 'red' if sql_eol_status == 'EOL' else ('yellow' if sql_eol_status == 'Near EOL' else 'green')
         sql_edition = sql_inst.get('Edition', '')
-        sql_ver = sql_inst.get('Version', '—')
-        sql_eol_date = sql_inst.get('EOLDate', '—')
-        sql_svc_acct = sql_inst.get('ServiceAccount', '—')
+        sql_ver = sql_inst.get('Version', '-')
+        sql_eol_date = sql_inst.get('EOLDate', '-')
+        sql_svc_acct = sql_inst.get('ServiceAccount', '-')
         sql_inst_name = sql_inst.get('InstanceName', 'Default')
         # Flag old editions
         old_sql_flag = any(yr in sql_edition for yr in ('2016', '2014', '2012'))
         rc += sub('SQL Server', 'margin-top:24px')
         if old_sql_flag:
             rc += (f'<div class="flag-critical" style="margin-bottom:12px;">'
-                   f'<div class="flag-label">&#9888; SQL Server EOL / Near-EOL — Upgrade Required</div>'
+                   f'<div class="flag-label">&#9888; SQL Server EOL / Near-EOL - Upgrade Required</div>'
                    f'<div class="flag-detail">{h(sql_edition)} reaches end of support {h(sql_eol_date)}. '
                    f'<strong>Not supported on Windows Server 2022.</strong> Must upgrade SQL to 2017+ before OS upgrade.</div></div>\n')
         rc += '<table><tr><th style="width:200px">Property</th><th>Value</th></tr>\n'
@@ -1387,14 +1389,14 @@ def build_server_tab(srv):
         rc += f'<tr style="background:#f5f4f8"><td><strong>EOL Date</strong></td><td>{h(sql_eol_date)} &nbsp;{pill(sql_eol_status or "Unknown", sql_eol_c)}</td></tr>\n'
         rc += f'<tr><td><strong>Service Account</strong></td><td><code>{h(sql_svc_acct)}</code></td></tr>\n'
         rc += f'<tr style="background:#f5f4f8"><td><strong>WS2022 Compatibility</strong></td><td>{pill("NOT SUPPORTED","red") if sql_eol_status=="EOL" else pill("Check Version","yellow")}</td></tr>\n'
-        rc += f'<tr><td><strong>Database List</strong></td><td style="color:#6b6080;font-style:italic;">Database list unavailable — pull from SQL Management Studio</td></tr>\n'
+        rc += f'<tr><td><strong>Database List</strong></td><td style="color:#6b6080;font-style:italic;">Database list unavailable - pull from SQL Management Studio</td></tr>\n'
         rc += '</table>\n'
 
     if not rc.strip():
         rc = '<div class="flag-info"><div class="flag-label">No Role Configuration Data</div><div class="flag-detail">No configurable server roles were detected on this server.</div></div>\n'
     rc += top_link(sid)
 
-    # ── DISK STORAGE CARD ─────────────────────────────────────────────────────
+    # -- DISK STORAGE CARD -----------------------------------------------------
     disk_body = '<table><tr><th>Drive</th><th>Label</th><th>Filesystem</th><th>Total (GB)</th><th>Used (GB)</th><th>Free (GB)</th><th style="min-width:140px">Utilization</th></tr>\n'
     for d in disks:
         pct      = d.get('UsedPct', 0)
@@ -1412,7 +1414,7 @@ def build_server_tab(srv):
                      f'<span style="font-size:8pt;color:#6b6080;">{pct}%</span></td></tr>\n')
     disk_body += '</table>\n' + top_link(sid)
 
-    # ── NETWORK CARD ──────────────────────────────────────────────────────────
+    # -- NETWORK CARD ----------------------------------------------------------
     net_body = sub('Network Adapters')
     net_body += '<table><tr><th>Description</th><th>IP Address(es)</th><th>Gateway</th><th>DNS</th><th>MAC</th><th>DHCP</th></tr>\n'
     if isinstance(adapters, dict):
@@ -1451,7 +1453,7 @@ def build_server_tab(srv):
         net_body += '</table>\n'
     net_body += top_link(sid)
 
-    # ── LISTENING PORTS CARD (collapsed) ──────────────────────────────────────
+    # -- LISTENING PORTS CARD (collapsed) --------------------------------------
     lp_body = sub(f'Listening Ports ({len(listen_ports)} unique)')
     lp_body += '<table><tr><th>Port</th><th>Process</th><th>Protocol</th><th>Local IP</th><th>PID</th></tr>\n'
     for i, lp in enumerate(listen_ports[:60]):
@@ -1464,7 +1466,7 @@ def build_server_tab(srv):
         lp_body += '<tr><td colspan="5" style="color:#6b6080;font-style:italic">No listening port data collected</td></tr>\n'
     lp_body += '</table>\n' + top_link(sid)
 
-    # ── SERVICES CARD ─────────────────────────────────────────────────────────
+    # -- SERVICES CARD ---------------------------------------------------------
     svc_body = f'''<div class="stat-grid" style="grid-template-columns: repeat(2,1fr)">
 <div class="stat-box"><div class="stat-num" style="color:#20c800">{running_count}</div><div class="stat-lbl">Running</div></div>
 <div class="stat-box"><div class="stat-num" style="color:{"#d63638" if stopped_auto_cnt else "#6b6080"}">{stopped_auto_cnt}</div><div class="stat-lbl">Stopped (Auto-start)</div></div>
@@ -1480,7 +1482,7 @@ def build_server_tab(srv):
                         f'<td style="font-size:8.5pt">{h(s.get("StartName",""))}</td></tr>\n')
         svc_body += '</table>\n'
     svc_body += f'<div class="sub-title" style="margin-top:10px">Running Services ({running_count})</div>\n'
-    _edr_lbl = f'EDR / Endpoint Protection — {edr}' if edr else 'EDR / Endpoint Protection'
+    _edr_lbl = f'EDR / Endpoint Protection - {edr}' if edr else 'EDR / Endpoint Protection'
     cat_display = [('EDR', _edr_lbl), ('PAM', 'Privileged Access Management'),
                    ('RMM', 'RMM / Managed Services'), ('HyperV', 'Virtualization (Hyper-V)'),
                    ('Core', 'Windows Core Services'), ('Print', 'Print Services'), ('Other', 'Other')]
@@ -1515,12 +1517,12 @@ def build_server_tab(srv):
             svc_body += '</table>\n'
     svc_body += top_link(sid)
 
-    # ── SERVICE ANOMALIES CARD ────────────────────────────────────────────────
+    # -- SERVICE ANOMALIES CARD ------------------------------------------------
     anom_body = ''
     if svc_anomalies:
         anom_body  = ('<div class="flag-info" style="margin-bottom:14px"><div class="flag-label">Service Security Flags</div>'
                      '<div class="flag-detail">Services running from suspicious paths (temp/user dirs) or as custom domain accounts. '
-                     'Review with client — LOB app service accounts are often legitimate.</div></div>\n')
+                     'Review with client - LOB app service accounts are often legitimate.</div></div>\n')
         anom_body += ('<table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:8.5pt">'
                      '<colgroup><col style="width:18%"><col style="width:22%"><col style="width:14%"><col style="width:46%"></colgroup>'
                      '<tr><th style="padding:6px 8px;text-align:left">Name</th>'
@@ -1535,7 +1537,7 @@ def build_server_tab(srv):
                          f'<td style="padding:5px 8px;word-break:break-all;color:#555">{h(sv.get("_reason",""))}</td></tr>\n')
         anom_body += '</table>\n' + top_link(sid)
 
-    # ── FILE SHARES CARD ──────────────────────────────────────────────────────
+    # -- FILE SHARES CARD ------------------------------------------------------
     shares_body = ''
     if sl:
         shares_body = '<table style="font-size:9pt;border-collapse:collapse;width:100%">\n'
@@ -1567,7 +1569,7 @@ def build_server_tab(srv):
                            f'<td style="padding:5px 8px">{flag_cell}</td></tr>\n')
         shares_body += '</table>\n' + top_link(sid)
 
-    # ── ASSEMBLE ──────────────────────────────────────────────────────────────
+    # -- ASSEMBLE --------------------------------------------------------------
     tab_html  = sbr_html + nav_html
     tab_html += card(f'{sid}-alerts',     'Alerts',                  alerts_body)
     tab_html += card(f'{sid}-overview',   'System Overview',         overview_body)
@@ -1587,7 +1589,7 @@ def build_server_tab(srv):
     return {'id': sid, 'name': name, 'role_label': rlabel,
             'in_scope': in_sc, 'crit': crit, 'warn': warn, 'tab_html': tab_html}
 
-# ── HYPER-V HOSTS TAB ─────────────────────────────────────────────────────────
+# -- HYPER-V HOSTS TAB ---------------------------------------------------------
 def build_hv_tab():
     if not hv_inventories:
         return '<div style="padding:24px;color:#6b6080;font-style:italic;">No Hyper-V inventory data collected.</div>'
@@ -1607,9 +1609,9 @@ def build_hv_tab():
             esxi_ver   = hvi.get('Version') or hvi.get('APIVersion', '')
             host_type  = 'ESXi'
             hs         = hvi.get('HostSummary', {}) or {}
-            model      = hs.get('Model', first_host.get('Model', '—'))
+            model      = hs.get('Model', first_host.get('Model', '-'))
             mfg        = hs.get('Manufacturer', first_host.get('Manufacturer', ''))
-            cpu_model  = hs.get('CPUModel', first_host.get('CPUModel', '—'))
+            cpu_model  = hs.get('CPUModel', first_host.get('CPUModel', '-'))
             cpu_cores  = hs.get('CPUCores', first_host.get('CPUCores', '?'))
             cpu_log    = hs.get('CPULogical', cpu_cores)
             ram_gb     = float(hs.get('TotalRAMgb', first_host.get('RAMgb', 0)) or 0)
@@ -1620,9 +1622,9 @@ def build_hv_tab():
             host_ip    = hvi.get('HostIP', '')
             esxi_ver   = hvi.get('ESXiVersion', '')
             host_type  = hvi.get('HostType', 'Hyper-V')
-            model      = hs.get('Model', '—')
+            model      = hs.get('Model', '-')
             mfg        = hs.get('Manufacturer', '')
-            cpu_model  = hs.get('CPUModel', '—')
+            cpu_model  = hs.get('CPUModel', '-')
             cpu_cores  = hs.get('CPUCores', '?')
             cpu_log    = hs.get('CPULogical', cpu_cores)
             ram_gb     = float(hs.get('TotalRAMgb', 0) or 0)
@@ -1650,7 +1652,7 @@ def build_hv_tab():
             state     = vm.get('PowerState', vm.get('State', '?'))
             sc        = 'green' if state in ('Running', 'POWERED_ON') else 'gray'
             snaps     = vm.get('Snapshots', 0) or 0
-            ip_val    = vm.get('IP', '') or vm.get('IPs', '') or '—'
+            ip_val    = vm.get('IP', '') or vm.get('IPs', '') or '-'
             guest_os  = vm.get('GuestOS', '')
             bg        = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
             last_col  = (f'<td style="padding:6px 10px;font-size:8pt;color:#6b6080">{h(guest_os)}</td>'
@@ -1746,7 +1748,7 @@ def build_hv_tab():
 </div>
 <div class="flag-info" style="margin-bottom:18px;">
   <div class="flag-label">Cloud Sizing Inputs</div>
-  <div class="flag-detail">Total across all Hyper-V hosts: <strong>{total_vcpu} vCPU</strong> allocated &middot; <strong>{total_ram:.0f} GB RAM</strong> allocated &middot; <strong>{total_running} of {total_vms} VMs</strong> running. These are allocated figures — right-size based on actual utilization before quoting.</div>
+  <div class="flag-detail">Total across all Hyper-V hosts: <strong>{total_vcpu} vCPU</strong> allocated &middot; <strong>{total_ram:.0f} GB RAM</strong> allocated &middot; <strong>{total_running} of {total_vms} VMs</strong> running. These are allocated figures - right-size based on actual utilization before quoting.</div>
 </div>'''
 
     sbr_html = f'''<div class="sbr-only">
@@ -1779,7 +1781,7 @@ def build_hv_tab():
                    else 'Hyper-V Host Summary')
     return top_anchor + sbr_html + card('hv-summary', f'{_card_title} ({len(hv_inventories)} Hosts)', hv_nav + summary_card + all_html)
 
-# ── SQL TAB ───────────────────────────────────────────────────────────────────
+# -- SQL TAB -------------------------------------------------------------------
 _DB_VENDORS = [
     ('solarwinds',   'SolarWinds'),
     ('wsus',         'Windows Server Update Services (WSUS)'),
@@ -1856,9 +1858,9 @@ def build_sql_tab():
     for s in sql_servers:
         inst = s['inst']
         anc  = s['server'].lower().replace('-','').replace('.','')
-        ver  = inst.get('Version','—'); ed = inst.get('Edition','—')
-        eol  = inst.get('EOLDate','—'); eol_s = inst.get('EOLStatus','')
-        svc  = inst.get('ServiceAccount','—')
+        ver  = inst.get('Version','-'); ed = inst.get('Edition','-')
+        eol  = inst.get('EOLDate','-'); eol_s = inst.get('EOLStatus','')
+        svc  = inst.get('ServiceAccount','-')
         conn = inst.get('Connected', False)
         eol_color = 'red' if eol_s == 'EOL' else ('yellow' if eol_s and 'near' in eol_s.lower() else 'green')
 
@@ -1870,17 +1872,17 @@ def build_sql_tab():
             vendor  = _db_vendor(name)
             data_mb = float(db.get('DataSizeMB', 0) or 0)
             log_mb  = float(db.get('LogSizeMB', 0) or 0)
-            state   = db.get('State','—')
-            recov   = db.get('RecoveryModel','—')
-            compat  = db.get('CompatLevel','—')
-            backup  = db.get('LastFullBackup','—') or '—'
+            state   = db.get('State','-')
+            recov   = db.get('RecoveryModel','-')
+            compat  = db.get('CompatLevel','-')
+            backup  = db.get('LastFullBackup','-') or '-'
             sc      = 'green' if state == 'ONLINE' else 'yellow'
             bg      = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
             data_disp = f'{data_mb/1024:.2f} GB' if data_mb >= 1024 else f'{data_mb:.0f} MB'
             log_disp  = f'{log_mb/1024:.2f} GB'  if log_mb  >= 1024 else f'{log_mb:.0f} MB'
             db_rows += (f'<tr{bg}>'
                         f'<td style="padding:6px 10px;font-weight:600;font-family:monospace;font-size:9pt">{h(name)}</td>'
-                        f'<td style="padding:6px 10px;font-size:8.5pt;color:#5b1fa4">{h(vendor) if vendor else "<span style=\'color:#c4b5fd\'>—</span>"}</td>'
+                        f'<td style="padding:6px 10px;font-size:8.5pt;color:#5b1fa4">{h(vendor) if vendor else "<span style=\'color:#c4b5fd\'>-</span>"}</td>'
                         f'<td style="padding:6px 10px;text-align:right">{data_disp}</td>'
                         f'<td style="padding:6px 10px;text-align:right;color:#6b6080">{log_disp}</td>'
                         f'<td style="padding:6px 10px">{pill(state, sc)}</td>'
@@ -1891,7 +1893,7 @@ def build_sql_tab():
 
         db_section = ''
         if not conn:
-            db_section = '<div class="flag-warning"><div class="flag-label">Deep connect failed</div><div class="flag-detail">Could not connect to SQL instance — database list unavailable. Verify the discovery account has SQL login permissions.</div></div>\n'
+            db_section = '<div class="flag-warning"><div class="flag-label">Deep connect failed</div><div class="flag-detail">Could not connect to SQL instance - database list unavailable. Verify the discovery account has SQL login permissions.</div></div>\n'
         elif dbs:
             db_section = (f'<table style="width:100%;font-size:9pt;border-collapse:collapse;margin-top:14px;">'
                           f'<tr style="background:#271e41">'
@@ -1917,7 +1919,7 @@ def build_sql_tab():
                  f'<div style="text-align:right;">'
                  f'<div style="font-size:9pt;font-weight:700;color:#5b1fa4;">{h(ed)}</div>'
                  f'<div style="font-size:8.5pt;color:#6b6080;">v{h(ver)} &middot; EOL {h(eol)} '
-                 f'<span class="pill pill-{eol_color}" style="font-size:7.5pt;">{h(eol_s) or "—"}</span></div>'
+                 f'<span class="pill pill-{eol_color}" style="font-size:7.5pt;">{h(eol_s) or "-"}</span></div>'
                  f'<div style="font-size:8.5pt;color:#6b6080;margin-top:4px;">Service: {h(svc)}</div>'
                  f'</div></div>\n'
                  f'{db_section}{top_lnk}</div>\n')
@@ -1926,7 +1928,7 @@ def build_sql_tab():
                 nav + summary + body)
 
 def build_eol_tab():
-    """EOL Summary — OS, SQL, Exchange, ESXi/vCenter across all servers."""
+    """EOL Summary - OS, SQL, Exchange, ESXi/vCenter across all servers."""
     today = datetime.date.today()
     rows  = []
 
@@ -1969,7 +1971,7 @@ def build_eol_tab():
                      exch.get('VersionName', ''),
                      exch.get('EOLDate', ''), exch.get('EOLStatus', ''))
 
-    # Installed app scan — detect EOL-trackable MS products from detection_rules.json
+    # Installed app scan - detect EOL-trackable MS products from detection_rules.json
     _eol_scan = [r for r in RULES.get('eol_product_scan', []) if 'keyword' in r]
     _seen_per_server = {}  # avoid dupes: (server, slug) pairs
 
@@ -2005,7 +2007,7 @@ def build_eol_tab():
                 _seen_per_server[key] = True
                 break  # only match first rule per app
 
-    # vSphere (vCenter + ESXi ship together on same version) — live lookup
+    # vSphere (vCenter + ESXi ship together on same version) - live lookup
     for inv in hv_inventories:
         if inv.get('_type') not in ('vSphereInventory',): continue
         hname = inv.get('Hostname', inv.get('Name', 'vSphere'))
@@ -2039,7 +2041,7 @@ def build_eol_tab():
         badge = f'<span style="background:{bc};color:#fff;border-radius:3px;padding:1px 7px;font-size:7.5pt;font-weight:700;">{bl}</span>'
         dl_str = (f'{days_left}d' if days_left is not None and days_left >= 0
                   else f'<span style="color:#d63638;font-weight:700;">{abs(days_left)}d ago</span>' if days_left is not None
-                  else '—')
+                  else '-')
         body += (f'<tr style="background:{bg}">'
                  f'<td style="text-align:center;font-weight:700;color:{bc}">{SEV_ICON[sev]}</td>'
                  f'<td style="font-weight:600">{h(srv_name)}</td>'
@@ -2061,7 +2063,7 @@ def build_private_cloud_tab():
 
     merged = {}  # keyed by uppercase name -> (name, cpu, ram, total_disk, used_disk, source)
 
-    # Primary: WinRM-discovered servers (best data — real disk usage)
+    # Primary: WinRM-discovered servers (best data - real disk usage)
     for srv in servers:
         if srv.get('os_type') == 'linux': continue
         d    = srv.get('data', {})
@@ -2079,7 +2081,7 @@ def build_private_cloud_tab():
         if cores or ram or total_disk:
             merged[name.upper()] = (name, cores, ram, total_disk, used_disk, 'WinRM', vm_type)
 
-    # Fill gaps: hypervisor inventory (VMs not WinRM-discovered — ODNS, vCenter, etc.)
+    # Fill gaps: hypervisor inventory (VMs not WinRM-discovered - ODNS, vCenter, etc.)
     _excluded = {v.upper() for v in CFG.get('exclude_vms', [])}
     for inv in hv_inventories:
         for vm in (inv.get('VMs', []) or []):
@@ -2148,12 +2150,12 @@ def build_private_cloud_tab():
                 f'<td style="{dim}">{cpu}</td>'
                 f'<td style="{dim}">{ram}</td>'
                 f'<td style="{dim}">{disk}</td>'
-                f'<td style="{dim}">{"—" if not used else used}</td></tr>\n')
+                f'<td style="{dim}">{"-" if not used else used}</td></tr>\n')
     excl_note_str = (f' <span style="font-size:8pt;font-weight:400;color:rgba(255,255,255,.6);">'
                      f'({len(excl_rows)} infrastructure/appliance excluded)</span>') if excl_rows else ''
     out += (f'<tr style="background:#271e41;color:#fff;font-weight:700;">'
             f'<td colspan="3">WORKLOAD TOTAL ({len(sizing_rows)} servers){excl_note_str}</td>'
-            f'<td>{tot_cpu}</td><td>{tot_ram}</td><td>{tot_disk}</td><td>{tot_used if tot_used else "—"}</td></tr>\n'
+            f'<td>{tot_cpu}</td><td>{tot_ram}</td><td>{tot_disk}</td><td>{tot_used if tot_used else "-"}</td></tr>\n'
             '</table>\n')
 
     # Commvault sizing card
@@ -2171,21 +2173,21 @@ def build_private_cloud_tab():
     return out
 
 
-# ── BUILD ALL TABS ─────────────────────────────────────────────────────────────
+# -- BUILD ALL TABS -------------------------------------------------------------
 tabs = [(build_linux_tab(s) if s.get('os_type') == 'linux' else build_server_tab(s)) for s in servers]
 virt_tab_html = build_hv_tab()
 sql_tab_html  = build_sql_tab()
 eol_tab_html  = build_eol_tab()
 cloud_tab_html = build_private_cloud_tab()
 
-# ── LOGO ──────────────────────────────────────────────────────────────────────
+# -- LOGO ----------------------------------------------------------------------
 if LOGO_B64:
     src = LOGO_B64 if LOGO_B64.startswith('data:') else f'data:image/png;base64,{LOGO_B64}'
     logo_html = f'<img src="{src}" style="height:32px;" alt="Magna5" class="logo-img">'
 else:
     logo_html = '<span style="font-size:14pt;font-weight:700;color:white;letter-spacing:1px;">MAGNA5</span>'
 
-# ── TABS HTML ─────────────────────────────────────────────────────────────────
+# -- TABS HTML -----------------------------------------------------------------
 tab_buttons = ''
 for t in tabs:
     is_linux = servers[[s['id'] for s in servers].index(t['id'])].get('os_type') == 'linux' if t['id'] in [s['id'] for s in servers] else False
@@ -2214,7 +2216,7 @@ if sql_tab_html:
 tab_contents += f'<div id="tab-eol" class="tab-content"><div style="padding:24px;">{eol_tab_html}</div></div>\n'
 tab_contents += f'<div id="tab-cloud" class="tab-content"><div style="padding:24px;">{cloud_tab_html}</div></div>\n'
 
-# ── FULL HTML ─────────────────────────────────────────────────────────────────
+# -- FULL HTML -----------------------------------------------------------------
 html_out = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
