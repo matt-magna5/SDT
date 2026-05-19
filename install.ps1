@@ -351,6 +351,39 @@ param(
 `$ErrorActionPreference = 'Continue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
+# ---- Self-heal: parse every PS1 in AppDir. If any has a syntax error,
+# the install is broken and we MUST update before launching anything. ----
+function Test-SdtHealth {
+    `$ps1s = Get-ChildItem `$AppDir -Filter '*.ps1' -EA SilentlyContinue
+    if (-not `$ps1s) { return @{ ok=`$false; reason='no .ps1 files in app dir' } }
+    foreach (`$f in `$ps1s) {
+        `$errs = `$null
+        try {
+            [System.Management.Automation.Language.Parser]::ParseFile(`$f.FullName, [ref]`$null, [ref]`$errs) | Out-Null
+            if (`$errs -and `$errs.Count -gt 0) {
+                return @{ ok=`$false; reason="parse error in `$(`$f.Name) at line `$(`$errs[0].Extent.StartLineNumber): `$(`$errs[0].Message)" }
+            }
+        } catch {
+            return @{ ok=`$false; reason="cannot parse `$(`$f.Name): `$(`$_.Exception.Message)" }
+        }
+    }
+    return @{ ok=`$true }
+}
+
+function Invoke-SdtRepair {
+    Write-Host "  [sdt] FORCE REPAIR - re-downloading from main..." -ForegroundColor Yellow
+    try {
+        `$inst = Invoke-WebRequest 'https://raw.githubusercontent.com/matt-magna5/SDT/main/install.ps1' -UseBasicParsing -TimeoutSec 30
+        `$sb = [ScriptBlock]::Create(`$inst.Content)
+        & `$sb -NoLaunch -Force
+        Write-Host "  [sdt] repair complete" -ForegroundColor Green
+        return `$true
+    } catch {
+        Write-Host "  [sdt] repair failed: `$(`$_.Exception.Message)" -ForegroundColor Red
+        return `$false
+    }
+}
+
 # ---- Loud auto-update - always prints status on every launch ----
 function Invoke-SdtAutoUpdate {
     `$local = if (Test-Path `$VerFile) { (Get-Content `$VerFile -Raw -EA 0).Trim() } else { '' }
@@ -419,6 +452,11 @@ switch -Regex (`$Mode) {
         } catch { Write-Host "Update failed: `$(`$_.Exception.Message)" -ForegroundColor Red }
         return
     }
+    '^(repair|reinstall|heal)$' {
+        # Same as update but bypasses every version check - always reinstalls.
+        Invoke-SdtRepair | Out-Null
+        return
+    }
     '^(uninstall|remove)$' {
         `$path = Split-Path `$AppDir -Parent
         Write-Host "Removing `$path ..." -ForegroundColor Yellow
@@ -428,6 +466,28 @@ switch -Regex (`$Mode) {
         `$new = (`$userPath -split ';') | Where-Object { `$_ -and `$_ -notmatch 'Magna5\\SDT\\bin' } | ForEach-Object { `$_ }
         [Environment]::SetEnvironmentVariable('Path', (`$new -join ';'), 'User')
         Write-Host "Uninstalled." -ForegroundColor Green
+        return
+    }
+}
+
+# BEFORE auto-update: validate the existing install. If broken, force repair.
+# This makes broken installs self-heal without the user needing to know about
+# 'sdt repair' or pasting one-liners.
+`$health = Test-SdtHealth
+if (-not `$health.ok) {
+    Write-Host "  [sdt] BROKEN INSTALL detected: `$(`$health.reason)" -ForegroundColor Red
+    Write-Host "  [sdt] auto-repairing..." -ForegroundColor Yellow
+    if (Invoke-SdtRepair) {
+        # Re-check after repair
+        `$health = Test-SdtHealth
+        if (-not `$health.ok) {
+            Write-Host "  [sdt] STILL broken after repair: `$(`$health.reason)" -ForegroundColor Red
+            Write-Host "  [sdt] aborting launch. Report this." -ForegroundColor Red
+            return
+        }
+        Write-Host "  [sdt] self-heal succeeded." -ForegroundColor Green
+    } else {
+        Write-Host "  [sdt] could not repair. Try: sdt uninstall; then reinstall." -ForegroundColor Red
         return
     }
 }
@@ -489,7 +549,8 @@ Say "Commands (in ANY new terminal):" Cyan
 Say "  sdt             browser GUI (default)" DarkGray
 Say "  sdt invoke      local per-host Invoke-ServerDiscovery" DarkGray
 Say "  sdt cli         legacy console session wizard" DarkGray
-Say "  sdt update      force re-install from GitHub" DarkGray
+Say "  sdt update      pull latest tag from GitHub" DarkGray
+Say "  sdt repair      force re-download (use if sdt won't launch)" DarkGray
 Say "  sdt uninstall   remove everything" DarkGray
 Say "  sdt version     show install info" DarkGray
 Say ""
