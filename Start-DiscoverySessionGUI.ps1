@@ -267,8 +267,31 @@ function Invoke-VsphereCollect {
                 '--pass-env', 'SDT_HV_PASS',
                 '--output',   $OutputDir
             )
-            $out = & $PyExe $pyArgs 2>&1 | Out-String
-            $combined += "`n=== attempt with --user '$u' ===`n$out`n"
+            # Use Start-Process with separate stdout/stderr files so Python's
+            # full traceback survives. Direct `2>&1 | Out-String` truncates
+            # after the first stderr line when $ErrorActionPreference is Stop
+            # somewhere up the call stack.
+            $stdOutFile = Join-Path $env:TEMP ("sdt-py-out-" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".txt")
+            $stdErrFile = Join-Path $env:TEMP ("sdt-py-err-" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".txt")
+            $out = ''
+            $exitCode = -1
+            try {
+                $proc = Start-Process -FilePath $PyExe -ArgumentList $pyArgs `
+                    -NoNewWindow -PassThru -Wait `
+                    -RedirectStandardOutput $stdOutFile `
+                    -RedirectStandardError  $stdErrFile `
+                    -ErrorAction Stop
+                $exitCode = $proc.ExitCode
+                $stdoutTxt = if (Test-Path $stdOutFile) { [System.IO.File]::ReadAllText($stdOutFile) } else { '' }
+                $stderrTxt = if (Test-Path $stdErrFile) { [System.IO.File]::ReadAllText($stdErrFile) } else { '' }
+                $out = "[exit $exitCode]`n--- STDOUT ---`n$stdoutTxt`n--- STDERR ---`n$stderrTxt"
+            } catch {
+                $out = "[Start-Process failed before Python ran]`n$($_.Exception.Message)`n$($_.ScriptStackTrace)"
+            } finally {
+                Remove-Item $stdOutFile -EA SilentlyContinue
+                Remove-Item $stdErrFile -EA SilentlyContinue
+            }
+            $combined += "`n=== attempt with --user '$u' (exit=$exitCode) ===`n$out`n"
 
             # Find any NEW inventory file written during this attempt
             $afterSet = @()
