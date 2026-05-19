@@ -700,19 +700,23 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
                    radial-gradient(900px 400px at -200px 200px,rgba(139,92,246,0.08),transparent 50%);
   background-attachment:fixed;min-height:100vh;}
 .wrap{max-width:1280px;margin:0 auto;padding:0 28px 60px;}
-/* Report mode: hide everything except the Report tab content. Floating back button shown instead. */
-body.report-mode .hdr,
-body.report-mode .tab-nav,
-body.report-mode .footer { display:none; }
-body.report-mode .wrap { padding-top:60px; }
+/* Tab nav removed - navigation is now button-driven. Hide the nav even when
+   present in the DOM, in case older clients still see it cached. */
+.tab-nav { display:none !important; }
+/* Floating "Back to Setup" button - shown on Run + Report panes only. */
 .back-to-setup-btn {
   display:none; position:fixed; top:14px; left:14px; z-index:200;
   background:var(--elevated); color:var(--text); border:1px solid var(--border-2);
-  font-weight:600; font-size:12px; padding:8px 16px; border-radius:8px; cursor:pointer;
-  font-family:var(--sans); box-shadow:0 2px 8px rgba(0,0,0,0.4);
+  font-weight:600; font-size:12.5px; padding:9px 18px; border-radius:8px; cursor:pointer;
+  font-family:var(--sans); box-shadow:0 2px 12px rgba(0,0,0,0.5);
 }
 .back-to-setup-btn:hover { background:var(--elevated-2); }
-body.report-mode .back-to-setup-btn { display:inline-block; }
+body.tab-run .back-to-setup-btn,
+body.tab-report .back-to-setup-btn { display:inline-block; }
+/* Report mode: also hide the sticky header + footer so report is the only thing on screen. */
+body.tab-report .hdr,
+body.tab-report .footer { display:none; }
+body.tab-report .wrap { padding-top:60px; }
 .hdr{background:rgba(11,18,32,0.75);backdrop-filter:blur(18px);
   border-bottom:1px solid var(--border);padding:14px 28px;display:flex;justify-content:space-between;align-items:center;
   position:sticky;top:0;z-index:100;}
@@ -817,8 +821,10 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
   </div>
   <span class="ver-chip">SDT GUI v__VERSION__</span>
 </div>
+<button type="button" class="back-to-setup-btn" onclick="setTab('setup')">&larr; Back to Setup</button>
 <div class="wrap">
-<div class="tab-nav">
+<!-- Tab nav removed in v4.1.22 - navigation is button-driven. Hidden via CSS. -->
+<div class="tab-nav" style="display:none;">
   <button class="tab-btn active" id="tb-setup" onclick="setTab('setup')">Setup</button>
   <button class="tab-btn" id="tb-run" onclick="setTab('run')">Run</button>
   <button class="tab-btn" id="tb-report" onclick="setTab('report')" disabled>Report</button>
@@ -986,9 +992,10 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 function setTab(t){
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active', b.id==='tb-'+t));
   document.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active', p.id==='tab-'+t));
-  // Report mode: hide all chrome so the report is the only thing on screen.
-  document.body.classList.toggle('report-mode', t==='report');
-  if (t==='report') { window.scrollTo(0,0); }
+  // Track current pane on body so CSS can hide chrome + show back button.
+  document.body.classList.remove('tab-setup','tab-run','tab-report');
+  document.body.classList.add('tab-' + t);
+  window.scrollTo(0,0);
 }
 
 // Holds the last hypervisor scan result so submit can pass checked VMs.
@@ -1300,8 +1307,10 @@ function renderReport(s){
   if (s.ReportPath) {
     // SUCCESS: minimal UI. One big button to open the report; everything else
     // collapsed behind a small Details disclosure. No diagnostic clutter.
+    // NOTE: Chrome blocks file:// links from http:// origins, so we serve the
+    // HTML through the local server at /api/report-html.
     el.innerHTML = `<div style="text-align:center;padding:40px 20px;">
-        <a href="file:///${escapeHtml(s.ReportPath.replace(/\\/g,'/'))}" target="_blank" class="btn"
+        <a href="/api/report-html" target="_blank" class="btn"
            style="display:inline-block;text-decoration:none;font-size:16px;padding:18px 40px;">
           Open HTML Report
         </a>
@@ -2537,6 +2546,27 @@ namespace Win32 {
                         Send-Json -Response $resp -Data @{ ok = $true; path = $dir }
                     } catch {
                         Send-Json -Response $resp -Data @{ error = $_.Exception.Message } -StatusCode 500
+                    }
+                    break
+                }
+                '^GET /api/report-html$' {
+                    # Stream the generated HTML report through the local HTTP
+                    # server. Chrome blocks file:// from http:// origins, so we
+                    # must serve it ourselves.
+                    $rp = $script:Session.ReportPath
+                    if (-not $rp -or -not (Test-Path $rp)) {
+                        Send-Response -Response $resp -Body '<h1>No report generated yet</h1>' -StatusCode 404
+                        break
+                    }
+                    try {
+                        $bytes = [System.IO.File]::ReadAllBytes($rp)
+                        $resp.StatusCode = 200
+                        $resp.ContentType = 'text/html; charset=utf-8'
+                        $resp.ContentLength64 = $bytes.Length
+                        $resp.OutputStream.Write($bytes, 0, $bytes.Length)
+                        $resp.OutputStream.Close()
+                    } catch {
+                        Send-Response -Response $resp -Body "<h1>Error reading report: $($_.Exception.Message)</h1>" -StatusCode 500
                     }
                     break
                 }
