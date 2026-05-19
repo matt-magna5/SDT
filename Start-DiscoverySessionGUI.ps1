@@ -222,15 +222,24 @@ function Invoke-LocalHyperVInventory {
 }
 
 function Test-PyImport {
-    param([string]$PyExe, [string]$Module)
+    # Returns $true/$false. Optionally writes diagnostic detail to [ref]$DiagOut.
+    param([string]$PyExe, [string]$Module, [ref]$DiagOut = $null)
     $outFile = [System.IO.Path]::GetTempFileName()
     $errFile = [System.IO.Path]::GetTempFileName()
     try {
         $p = Start-Process -FilePath $PyExe -ArgumentList @('-c', "import $Module") `
             -NoNewWindow -PassThru -Wait `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile -EA Stop
-        return ($p.ExitCode -eq 0)
-    } catch { return $false }
+        $ok = ($p.ExitCode -eq 0)
+        if (-not $ok -and $DiagOut) {
+            $stderr = if (Test-Path $errFile) { (Get-Content $errFile -Raw) } else { '' }
+            $DiagOut.Value = "import ${Module} failed (exit=$($p.ExitCode)): $stderr"
+        }
+        return $ok
+    } catch {
+        if ($DiagOut) { $DiagOut.Value = "Start-Process failed for import ${Module}: $($_.Exception.Message)" }
+        return $false
+    }
     finally {
         Remove-Item $outFile, $errFile -EA SilentlyContinue
     }
@@ -253,14 +262,43 @@ function Ensure-PyDeps {
     $log = "Missing: $($missing -join ', ')`n"
     $pyDir = Split-Path $PyExe -Parent
 
-    # Step 1: enable 'import site' in ._pth (embeddable Python disables it)
+    # Step 1: Fix ._pth so embeddable Python actually picks up site-packages.
+    #
+    # ROOT CAUSE FROM PRIOR FAILURE: embeddable Python's ._pth file OVERRIDES
+    # PYTHONPATH entirely. Just uncommenting 'import site' doesn't add
+    # Lib\site-packages to sys.path reliably across all builds. pip happily
+    # installs to Lib\site-packages and then 'import requests' fails because
+    # that dir isn't on sys.path.
+    #
+    # Fix: ensure ._pth contains BOTH 'import site' AND a literal
+    # 'Lib\site-packages' line. That guarantees pip's install target is on
+    # sys.path regardless of site.py's behavior.
     try {
         $pthFile = Get-ChildItem $pyDir -Filter 'python*._pth' -EA 0 | Select-Object -First 1
         if ($pthFile) {
             $pthContent = Get-Content $pthFile.FullName -Raw
+            $modified = $false
+            # Uncomment 'import site' if commented
             if ($pthContent -match '(?m)^\s*#\s*import\s+site\s*$') {
-                ($pthContent -replace '(?m)^\s*#\s*import\s+site\s*$','import site') | Set-Content $pthFile.FullName -Encoding ASCII
+                $pthContent = $pthContent -replace '(?m)^\s*#\s*import\s+site\s*$','import site'
+                $modified = $true
                 $log += "Enabled 'import site' in $($pthFile.Name)`n"
+            } elseif ($pthContent -notmatch '(?m)^\s*import\s+site\s*$') {
+                # Not present at all - append it
+                $pthContent = $pthContent.TrimEnd() + "`r`nimport site`r`n"
+                $modified = $true
+                $log += "Appended 'import site' to $($pthFile.Name)`n"
+            }
+            # Ensure 'Lib\site-packages' is on sys.path
+            if ($pthContent -notmatch '(?im)^\s*Lib\\site-packages\s*$') {
+                $pthContent = $pthContent.TrimEnd() + "`r`nLib\site-packages`r`n"
+                $modified = $true
+                $log += "Added 'Lib\site-packages' to $($pthFile.Name)`n"
+            }
+            if ($modified) {
+                # Write WITHOUT BOM (ASCII encoding) - Python embeddable launcher
+                # parses ._pth byte-by-byte and BOM characters break it.
+                [System.IO.File]::WriteAllText($pthFile.FullName, $pthContent, (New-Object System.Text.ASCIIEncoding))
             }
         }
     } catch { $log += "._pth tweak failed: $($_.Exception.Message)`n" }
