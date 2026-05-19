@@ -222,8 +222,9 @@ function Invoke-LocalHyperVInventory {
 }
 
 function Test-PyImport {
-    # Returns $true/$false. Optionally writes diagnostic detail to [ref]$DiagOut.
-    param([string]$PyExe, [string]$Module, [ref]$DiagOut = $null)
+    # Returns hashtable @{ ok=$bool; diag=<stderr text if fail> }
+    # Callers that only want the bool can do (Test-PyImport ...).ok
+    param([string]$PyExe, [string]$Module)
     $outFile = [System.IO.Path]::GetTempFileName()
     $errFile = [System.IO.Path]::GetTempFileName()
     try {
@@ -231,14 +232,14 @@ function Test-PyImport {
             -NoNewWindow -PassThru -Wait `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile -EA Stop
         $ok = ($p.ExitCode -eq 0)
-        if (-not $ok -and $DiagOut) {
+        $diag = ''
+        if (-not $ok) {
             $stderr = if (Test-Path $errFile) { (Get-Content $errFile -Raw) } else { '' }
-            $DiagOut.Value = "import ${Module} failed (exit=$($p.ExitCode)): $stderr"
+            $diag = "import ${Module} failed (exit=$($p.ExitCode)): $stderr"
         }
-        return $ok
+        return @{ ok=$ok; diag=$diag }
     } catch {
-        if ($DiagOut) { $DiagOut.Value = "Start-Process failed for import ${Module}: $($_.Exception.Message)" }
-        return $false
+        return @{ ok=$false; diag="Start-Process failed for import ${Module}: $($_.Exception.Message)" }
     }
     finally {
         Remove-Item $outFile, $errFile -EA SilentlyContinue
@@ -254,7 +255,8 @@ function Ensure-PyDeps {
     $required = @('requests','pyVmomi','urllib3')
     $missing = @()
     foreach ($m in $required) {
-        if (-not (Test-PyImport -PyExe $PyExe -Module $m)) { $missing += $m }
+        $r = Test-PyImport -PyExe $PyExe -Module $m
+        if (-not $r.ok) { $missing += $m }
     }
     if ($missing.Count -eq 0) { return @{ ok=$true; log=''; missing=@() } }
 
@@ -374,10 +376,10 @@ function Ensure-PyDeps {
     # about). If they import, we're good.
     $stillMissing = @()
     foreach ($m in $required) {
-        $diag = ''
-        if (-not (Test-PyImport -PyExe $PyExe -Module $m -DiagOut ([ref]$diag))) {
+        $r = Test-PyImport -PyExe $PyExe -Module $m
+        if (-not $r.ok) {
             $stillMissing += $m
-            if ($diag) { $log += "Post-install check: $diag`n" }
+            if ($r.diag) { $log += "Post-install check: $($r.diag)`n" }
         }
     }
     if ($stillMissing.Count -eq 0) {
@@ -454,10 +456,10 @@ function Ensure-PyDeps {
     # Re-check after wheel-direct
     $finalMissing = @()
     foreach ($m in $required) {
-        $diag = ''
-        if (-not (Test-PyImport -PyExe $PyExe -Module $m -DiagOut ([ref]$diag))) {
+        $r = Test-PyImport -PyExe $PyExe -Module $m
+        if (-not $r.ok) {
             $finalMissing += $m
-            if ($diag) { $log += "Final check: $diag`n" }
+            if ($r.diag) { $log += "Final check: $($r.diag)`n" }
         }
     }
     if ($finalMissing.Count -eq 0) {
