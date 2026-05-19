@@ -238,7 +238,7 @@ function Test-PyImport {
 
 function Ensure-PyDeps {
     # Self-heal portable Python: install requests + pyVmomi + urllib3 if any missing.
-    # Used by the zero-install run.ps1 path where install.ps1's pip bootstrap never ran.
+    # Safety net in case install.ps1's pip bootstrap was skipped or failed.
     # Returns @{ ok=$true/$false; log=<combined>; missing=@(...) }
     param([string]$PyExe, [string]$ScriptDir)
 

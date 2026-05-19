@@ -59,24 +59,52 @@ foreach ($d in @($Root, $BinDir, $AppDir)) {
 }
 
 # ----- Resolve latest tag ----------------------------------------------------
+# Query /tags FIRST (returns ALL tags including those without formal Release
+# objects). Falls back to /releases if /tags fails. Previously we only
+# queried /releases which meant tag-only updates (no Release object) were
+# invisible to auto-discovery and the install would pin to the last formally
+# released version. /tags is the authoritative source.
 if ($Version -eq 'latest') {
-    Say "Resolving latest release..." DarkCyan
+    Say "Resolving latest tag..." DarkCyan
     $Version = $null
     try {
-        $rel = Invoke-WebRequest 'https://api.github.com/repos/matt-magna5/SDT/releases?per_page=20' -UseBasicParsing -TimeoutSec 10
-        $releases = $rel.Content | ConvertFrom-Json
-        # Prefer v4+ / alpha / beta (GUI-capable), else newest overall
-        $guiTag = $releases | Where-Object { $_.tag_name -match '^v4' -or $_.tag_name -match 'alpha|beta|rc' } | Select-Object -First 1
-        $Version = if ($guiTag) { $guiTag.tag_name } else { $releases[0].tag_name }
-    } catch {
-        Say "Releases API failed: $($_.Exception.Message)" Yellow
-        foreach ($try in @('v4.0-alpha','v3.11','v3.10')) {
-            try {
-                $h = Invoke-WebRequest "https://github.com/matt-magna5/SDT/archive/refs/tags/$try.zip" -Method Head -UseBasicParsing -TimeoutSec 5
-                if ($h.StatusCode -eq 200) { $Version = $try; break }
-            } catch { continue }
+        $tagsResp = Invoke-WebRequest 'https://api.github.com/repos/matt-magna5/SDT/tags?per_page=50' -UseBasicParsing -TimeoutSec 10
+        $tags = ($tagsResp.Content | ConvertFrom-Json) | ForEach-Object { $_.name }
+        # Filter to semver-ish v4.x.y first (GUI-capable era), then newest by
+        # semver-aware sort. Fall back to whatever the API returned in order.
+        $semverTags = $tags | Where-Object { $_ -match '^v(\d+)\.(\d+)\.(\d+)(?:-(.+))?$' }
+        $v4Tags = $semverTags | Where-Object { $_ -match '^v4' }
+        if ($v4Tags) {
+            # Sort v4.x.y by numeric components (descending)
+            $sorted = $v4Tags | Sort-Object @{
+                Expression = {
+                    if ($_ -match '^v(\d+)\.(\d+)\.(\d+)') {
+                        [int]$matches[1] * 1000000 + [int]$matches[2] * 1000 + [int]$matches[3]
+                    } else { 0 }
+                }
+                Descending = $true
+            }
+            $Version = $sorted | Select-Object -First 1
+        } else {
+            $Version = $tags | Select-Object -First 1
         }
-        if (-not $Version) { throw "Could not determine SDT version" }
+    } catch {
+        Say "Tags API failed: $($_.Exception.Message). Falling back to /releases..." Yellow
+        try {
+            $rel = Invoke-WebRequest 'https://api.github.com/repos/matt-magna5/SDT/releases?per_page=20' -UseBasicParsing -TimeoutSec 10
+            $releases = $rel.Content | ConvertFrom-Json
+            $guiTag = $releases | Where-Object { $_.tag_name -match '^v4' -or $_.tag_name -match 'alpha|beta|rc' } | Select-Object -First 1
+            $Version = if ($guiTag) { $guiTag.tag_name } else { $releases[0].tag_name }
+        } catch {
+            Say "Releases API also failed. Probing known tags..." Yellow
+            foreach ($try in @('v4.1.13','v4.1.12','v4.1.11','v4.1.10','v4.1.9','v4.1.8')) {
+                try {
+                    $h = Invoke-WebRequest "https://github.com/matt-magna5/SDT/archive/refs/tags/$try.zip" -Method Head -UseBasicParsing -TimeoutSec 5
+                    if ($h.StatusCode -eq 200) { $Version = $try; break }
+                } catch { continue }
+            }
+            if (-not $Version) { throw "Could not determine SDT version" }
+        }
     }
     Say "Latest: $Version" DarkGreen
 }
@@ -330,14 +358,27 @@ function Invoke-SdtAutoUpdate {
         Write-Host ("  [sdt] update check skipped (SDT_NO_AUTOUPDATE=1, local v{0})" -f `$local) -ForegroundColor DarkGray
         return
     }
-    Write-Host ("  [sdt] checking GitHub for newer release (local v{0})..." -f `$local) -ForegroundColor DarkCyan
+    Write-Host ("  [sdt] checking GitHub for newer tag (local v{0})..." -f `$local) -ForegroundColor DarkCyan
     `$latest = `$null
     try {
         `$ProgressPreference = 'SilentlyContinue'
-        `$rel = Invoke-WebRequest 'https://api.github.com/repos/matt-magna5/SDT/releases?per_page=20' -UseBasicParsing -TimeoutSec 6 -EA Stop
-        `$releases = `$rel.Content | ConvertFrom-Json
-        `$guiTag = `$releases | Where-Object { `$_.tag_name -match '^v4' -or `$_.tag_name -match 'alpha|beta|rc' } | Select-Object -First 1
-        `$latest = if (`$guiTag) { `$guiTag.tag_name } else { `$releases[0].tag_name }
+        # Use /tags (includes tag-only updates without formal Release objects).
+        `$tagsResp = Invoke-WebRequest 'https://api.github.com/repos/matt-magna5/SDT/tags?per_page=50' -UseBasicParsing -TimeoutSec 6 -EA Stop
+        `$tags = (`$tagsResp.Content | ConvertFrom-Json) | ForEach-Object { `$_.name }
+        `$v4Tags = `$tags | Where-Object { `$_ -match '^v4\.(\d+)\.(\d+)' }
+        if (`$v4Tags) {
+            `$sorted = `$v4Tags | Sort-Object @{
+                Expression = {
+                    if (`$_ -match '^v(\d+)\.(\d+)\.(\d+)') {
+                        [int]`$matches[1] * 1000000 + [int]`$matches[2] * 1000 + [int]`$matches[3]
+                    } else { 0 }
+                }
+                Descending = `$true
+            }
+            `$latest = `$sorted | Select-Object -First 1
+        } else {
+            `$latest = `$tags | Select-Object -First 1
+        }
     } catch {
         Write-Host ("  [sdt] update check failed: {0} - running local v{1}" -f `$_.Exception.Message, `$local) -ForegroundColor DarkYellow
         return
