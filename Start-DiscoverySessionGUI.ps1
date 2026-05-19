@@ -700,23 +700,6 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
                    radial-gradient(900px 400px at -200px 200px,rgba(139,92,246,0.08),transparent 50%);
   background-attachment:fixed;min-height:100vh;}
 .wrap{max-width:1280px;margin:0 auto;padding:0 28px 60px;}
-/* Tab nav removed - navigation is now button-driven. Hide the nav even when
-   present in the DOM, in case older clients still see it cached. */
-.tab-nav { display:none !important; }
-/* Floating "Back to Setup" button - shown on Run + Report panes only. */
-.back-to-setup-btn {
-  display:none; position:fixed; top:14px; left:14px; z-index:200;
-  background:var(--elevated); color:var(--text); border:1px solid var(--border-2);
-  font-weight:600; font-size:12.5px; padding:9px 18px; border-radius:8px; cursor:pointer;
-  font-family:var(--sans); box-shadow:0 2px 12px rgba(0,0,0,0.5);
-}
-.back-to-setup-btn:hover { background:var(--elevated-2); }
-body.tab-run .back-to-setup-btn,
-body.tab-report .back-to-setup-btn { display:inline-block; }
-/* Report mode: also hide the sticky header + footer so report is the only thing on screen. */
-body.tab-report .hdr,
-body.tab-report .footer { display:none; }
-body.tab-report .wrap { padding-top:60px; }
 .hdr{background:rgba(11,18,32,0.75);backdrop-filter:blur(18px);
   border-bottom:1px solid var(--border);padding:14px 28px;display:flex;justify-content:space-between;align-items:center;
   position:sticky;top:0;z-index:100;}
@@ -821,10 +804,8 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
   </div>
   <span class="ver-chip">SDT GUI v__VERSION__</span>
 </div>
-<button type="button" class="back-to-setup-btn" onclick="setTab('setup')">&larr; Back to Setup</button>
 <div class="wrap">
-<!-- Tab nav removed in v4.1.22 - navigation is button-driven. Hidden via CSS. -->
-<div class="tab-nav" style="display:none;">
+<div class="tab-nav">
   <button class="tab-btn active" id="tb-setup" onclick="setTab('setup')">Setup</button>
   <button class="tab-btn" id="tb-run" onclick="setTab('run')">Run</button>
   <button class="tab-btn" id="tb-report" onclick="setTab('report')" disabled>Report</button>
