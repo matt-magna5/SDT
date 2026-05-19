@@ -297,8 +297,46 @@ function Invoke-VsphereCollect {
     if ($succeeded) {
         return @{ ok=$true; user=$succeeded; log=$combined; file=$successFile }
     }
-    $errMsg = if ($nonAuthFail) { 'non-auth failure - check connectivity / SSL / script output' } else { "auth failed for all $($uniqueVariants.Count) username format(s) tried" }
-    return @{ ok=$false; log=$combined; error=$errMsg; triedUsers=$uniqueVariants }
+
+    # Extract last meaningful Python error line(s) so the UI shows something
+    # actionable WITHOUT making the SE expand a collapsed log block.
+    $pyError = ''
+    $logLines = ($combined -split "`r?`n") | Where-Object { $_ -and $_.Trim() }
+    # Look for typical Python exception terminators (line that starts with
+    # "<Type>Error:", "<Type>Exception:", or "Errno N", or known vSphere errors)
+    $errPatterns = @(
+        '^\s*\w+(Error|Exception):\s*.+',
+        '^\s*pyVmomi\.vim\.fault\..+',
+        '^\s*ssl\.SSL\w+:.+',
+        '^\s*socket\.\w+:.+',
+        '^\s*urllib\d?\..+:.+',
+        '^\s*requests\.exceptions\..+',
+        '^\s*ConnectionRefusedError:.+',
+        '^\s*\[(SSL|Errno).+'
+    )
+    foreach ($pat in $errPatterns) {
+        $hit = $logLines | Where-Object { $_ -match $pat } | Select-Object -Last 1
+        if ($hit) { $pyError = $hit.Trim(); break }
+    }
+    if (-not $pyError) {
+        # Fallback: last non-empty line that isn't a banner
+        $pyError = ($logLines | Where-Object { $_ -notmatch '^={3,}|^\s*===\s*attempt' } | Select-Object -Last 1)
+        if ($pyError) { $pyError = $pyError.Trim() }
+    }
+
+    # Dump the full combined log to disk so it survives the response cycle
+    $logFile = ''
+    try {
+        if ($OutputDir -and (Test-Path $OutputDir)) {
+            $stamp = (Get-Date).ToString('yyyy-MM-dd-HHmmss')
+            $logFile = Join-Path $OutputDir "vsphere-scan-$stamp.log"
+            [System.IO.File]::WriteAllText($logFile, $combined, [System.Text.Encoding]::UTF8)
+        }
+    } catch { }
+
+    $errBase = if ($nonAuthFail) { 'non-auth failure - check connectivity / SSL / script output' } else { "auth failed for all $($uniqueVariants.Count) username format(s) tried" }
+    $errMsg = if ($pyError) { "$errBase. Python said: $pyError" } else { $errBase }
+    return @{ ok=$false; log=$combined; error=$errMsg; pyError=$pyError; logPath=$logFile; triedUsers=$uniqueVariants }
 }
 
 # -----------------------------------------------------------------------------
@@ -653,12 +691,15 @@ async function scanHv(){
     const data = await resp.json();
     if (!resp.ok || !data.ok) {
       const err = data.error || 'scan failed';
-      // Also surface the collector log tail if present so user can self-diagnose
+      // Auto-expand the log block. Saved-log path shown so SE can grab it later.
       if (data.log) {
         status.style.color = 'var(--crit)';
-        status.innerHTML = '<strong>Scan failed:</strong> ' + escapeHtml(err) +
-          '<details style="margin-top:10px;"><summary style="cursor:pointer;color:var(--muted);">Show Python/collector output</summary>' +
-          '<pre style="background:#07101f;color:#c7d1df;padding:10px;border-radius:6px;font-family:var(--mono);font-size:11px;max-height:300px;overflow:auto;white-space:pre-wrap;">' +
+        const pathLine = data.logPath
+          ? '<div style="margin-top:8px;font-size:11px;color:var(--muted);">Full log saved to: <code style="color:#a7b3ca;">' + escapeHtml(data.logPath) + '</code></div>'
+          : '';
+        status.innerHTML = '<strong>Scan failed:</strong> ' + escapeHtml(err) + pathLine +
+          '<details open style="margin-top:10px;"><summary style="cursor:pointer;color:var(--muted);">Python/collector output (auto-expanded)</summary>' +
+          '<pre style="background:#07101f;color:#c7d1df;padding:10px;border-radius:6px;font-family:var(--mono);font-size:11px;overflow:auto;white-space:pre-wrap;word-break:break-word;">' +
           escapeHtml(data.log) + '</pre></details>';
         return;
       }
@@ -1793,7 +1834,13 @@ try {
                             if ($collectResult.triedUsers) {
                                 $errMsg += ". Tried usernames: $($collectResult.triedUsers -join ', ')"
                             }
-                            Send-Json -Response $resp -Data @{ ok=$false; error=$errMsg; log=$collectResult.log } -StatusCode 500
+                            Add-Log "vSphere scan FAILED: $($collectResult.pyError -or $collectResult.error). Log: $($collectResult.logPath)"
+                            Send-Json -Response $resp -Data @{
+                                ok=$false; error=$errMsg
+                                log=$collectResult.log
+                                pyError=$collectResult.pyError
+                                logPath=$collectResult.logPath
+                            } -StatusCode 500
                             break
                         }
                         $outFile = Get-Item $collectResult.file
@@ -1817,7 +1864,23 @@ try {
                         }
                         Send-Json -Response $resp -Data @{ ok=$true; vms=$vms; count=$vms.Count; stagingFile=$outFile.FullName }
                     } catch {
-                        Send-Json -Response $resp -Data @{ ok=$false; error=$_.Exception.Message } -StatusCode 500
+                        # Always write a log file even when the catch fires before the collector runs.
+                        $errLog = ''
+                        try {
+                            if (Test-Path $stageDir) {
+                                $stamp = (Get-Date).ToString('yyyy-MM-dd-HHmmss')
+                                $errLog = Join-Path $stageDir "vsphere-scan-error-$stamp.log"
+                                $errBody = "Endpoint exception:`n$($_.Exception.Message)`n`nStackTrace:`n$($_.ScriptStackTrace)`n`nFullRecord:`n$($_ | Out-String)"
+                                [System.IO.File]::WriteAllText($errLog, $errBody, [System.Text.Encoding]::UTF8)
+                            }
+                        } catch { }
+                        Add-Log "vSphere scan endpoint FAILED: $($_.Exception.Message). Log: $errLog"
+                        Send-Json -Response $resp -Data @{
+                            ok=$false
+                            error=$_.Exception.Message
+                            log="$($_.Exception.Message)`n`n$($_.ScriptStackTrace)"
+                            logPath=$errLog
+                        } -StatusCode 500
                     }
                     break
                 }
