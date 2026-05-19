@@ -374,15 +374,97 @@ function Ensure-PyDeps {
     # about). If they import, we're good.
     $stillMissing = @()
     foreach ($m in $required) {
-        if (-not (Test-PyImport -PyExe $PyExe -Module $m)) { $stillMissing += $m }
+        $diag = ''
+        if (-not (Test-PyImport -PyExe $PyExe -Module $m -DiagOut ([ref]$diag))) {
+            $stillMissing += $m
+            if ($diag) { $log += "Post-install check: $diag`n" }
+        }
     }
-    # Don't unset PYTHONPATH - leave it for the actual collector run that
-    # follows. The collector will need site-packages too.
     if ($stillMissing.Count -eq 0) {
         Add-Log "Python deps installed OK."
         return @{ ok=$true; log=$log; missing=@() }
     }
-    return @{ ok=$false; log=$log + "Still missing after install: $($stillMissing -join ', ')"; missing=$stillMissing }
+
+    # FALLBACK LAYER 2: pip install succeeded but imports still fail. Most
+    # common cause: site-packages not on sys.path. Dump diagnostics so we know
+    # what python actually sees, then try the wheel-direct path.
+    $log += "`n=== Diagnostic dump (sys.path / site-packages contents) ===`n"
+    try {
+        $diagOut = [System.IO.Path]::GetTempFileName()
+        $diagErr = [System.IO.Path]::GetTempFileName()
+        $diagCode = 'import sys, os; print("--- sys.path ---"); [print(p) for p in sys.path]; sp = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages"); print("--- site-packages exists:", os.path.isdir(sp)); print("--- contents:"); [print(" ", x) for x in (os.listdir(sp) if os.path.isdir(sp) else [])]'
+        $p = Start-Process -FilePath $PyExe -ArgumentList @('-c', $diagCode) `
+            -NoNewWindow -PassThru -Wait -RedirectStandardOutput $diagOut -RedirectStandardError $diagErr -EA Stop
+        $log += (Get-Content $diagOut -Raw) + (Get-Content $diagErr -Raw)
+        Remove-Item $diagOut, $diagErr -EA SilentlyContinue
+    } catch { $log += "Diagnostic dump failed: $($_.Exception.Message)`n" }
+
+    # FALLBACK LAYER 3: wheel-direct install. Download pure-python wheels from
+    # PyPI's JSON API and extract directly into Lib\site-packages. Works even
+    # if pip itself is broken or sys.path is wrong.
+    $log += "`n=== Fallback: direct wheel install ===`n"
+    Add-Log "pip install didn't make modules importable. Trying wheel-direct fallback..."
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -EA SilentlyContinue
+    if (-not (Test-Path $sitePackages)) {
+        try { New-Item -ItemType Directory -Path $sitePackages -Force | Out-Null } catch { }
+    }
+    foreach ($pkg in $stillMissing) {
+        try {
+            $log += "Downloading wheel for $pkg from PyPI...`n"
+            $info = Invoke-RestMethod "https://pypi.org/pypi/$pkg/json" -UseBasicParsing -TimeoutSec 20
+            $version = $info.info.version
+            $files = $info.releases.$version
+            # Prefer py3-none-any; fall back to cp312-win_amd64 then cp311
+            $wheel = $files | Where-Object { $_.packagetype -eq 'bdist_wheel' -and $_.filename -match 'py3-none-any\.whl$' } | Select-Object -First 1
+            if (-not $wheel) {
+                $wheel = $files | Where-Object { $_.packagetype -eq 'bdist_wheel' -and $_.filename -match 'cp312.*win_amd64\.whl$' } | Select-Object -First 1
+            }
+            if (-not $wheel) {
+                $wheel = $files | Where-Object { $_.packagetype -eq 'bdist_wheel' -and $_.filename -match 'cp311.*win_amd64\.whl$' } | Select-Object -First 1
+            }
+            if (-not $wheel) {
+                $log += "  No compatible wheel for $pkg (need py3-none-any or cp31x win_amd64)`n"
+                continue
+            }
+            $whlPath = Join-Path $env:TEMP $wheel.filename
+            Invoke-WebRequest $wheel.url -OutFile $whlPath -UseBasicParsing -TimeoutSec 60
+            # Extract into site-packages (wheel is a zip)
+            try {
+                [System.IO.Compression.ZipFile]::ExtractToDirectory($whlPath, $sitePackages)
+            } catch [System.IO.IOException] {
+                # File already exists - extract individual entries, overwriting
+                $zip = [System.IO.Compression.ZipFile]::OpenRead($whlPath)
+                foreach ($entry in $zip.Entries) {
+                    $target = Join-Path $sitePackages $entry.FullName
+                    $targetDir = Split-Path $target -Parent
+                    if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+                    if (-not $entry.FullName.EndsWith('/')) {
+                        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+                    }
+                }
+                $zip.Dispose()
+            }
+            Remove-Item $whlPath -EA SilentlyContinue
+            $log += "  Extracted $($wheel.filename) -> $sitePackages`n"
+        } catch {
+            $log += "  Wheel-direct for $pkg failed: $($_.Exception.Message)`n"
+        }
+    }
+
+    # Re-check after wheel-direct
+    $finalMissing = @()
+    foreach ($m in $required) {
+        $diag = ''
+        if (-not (Test-PyImport -PyExe $PyExe -Module $m -DiagOut ([ref]$diag))) {
+            $finalMissing += $m
+            if ($diag) { $log += "Final check: $diag`n" }
+        }
+    }
+    if ($finalMissing.Count -eq 0) {
+        Add-Log "Python deps installed via wheel-direct fallback OK."
+        return @{ ok=$true; log=$log; missing=@() }
+    }
+    return @{ ok=$false; log=$log + "FAILED after pip + wheel-direct fallback. Still missing: $($finalMissing -join ', ')`n"; missing=$finalMissing }
 }
 
 function Invoke-VsphereCollect {
