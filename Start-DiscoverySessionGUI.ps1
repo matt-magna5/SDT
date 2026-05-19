@@ -221,6 +221,119 @@ function Invoke-LocalHyperVInventory {
     }
 }
 
+function Test-PyImport {
+    param([string]$PyExe, [string]$Module)
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath $PyExe -ArgumentList @('-c', "import $Module") `
+            -NoNewWindow -PassThru -Wait `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile -EA Stop
+        return ($p.ExitCode -eq 0)
+    } catch { return $false }
+    finally {
+        Remove-Item $outFile, $errFile -EA SilentlyContinue
+    }
+}
+
+function Ensure-PyDeps {
+    # Self-heal portable Python: install requests + pyVmomi + urllib3 if any missing.
+    # Used by the zero-install run.ps1 path where install.ps1's pip bootstrap never ran.
+    # Returns @{ ok=$true/$false; log=<combined>; missing=@(...) }
+    param([string]$PyExe, [string]$ScriptDir)
+
+    $required = @('requests','pyVmomi','urllib3')
+    $missing = @()
+    foreach ($m in $required) {
+        if (-not (Test-PyImport -PyExe $PyExe -Module $m)) { $missing += $m }
+    }
+    if ($missing.Count -eq 0) { return @{ ok=$true; log=''; missing=@() } }
+
+    Add-Log "Missing Python deps: $($missing -join ', '). Bootstrapping pip + installing..."
+    $log = "Missing: $($missing -join ', ')`n"
+    $pyDir = Split-Path $PyExe -Parent
+
+    # Step 1: enable 'import site' in ._pth (embeddable Python disables it)
+    try {
+        $pthFile = Get-ChildItem $pyDir -Filter 'python*._pth' -EA 0 | Select-Object -First 1
+        if ($pthFile) {
+            $pthContent = Get-Content $pthFile.FullName -Raw
+            if ($pthContent -match '(?m)^\s*#\s*import\s+site\s*$') {
+                ($pthContent -replace '(?m)^\s*#\s*import\s+site\s*$','import site') | Set-Content $pthFile.FullName -Encoding ASCII
+                $log += "Enabled 'import site' in $($pthFile.Name)`n"
+            }
+        }
+    } catch { $log += "._pth tweak failed: $($_.Exception.Message)`n" }
+
+    # Step 2: bootstrap pip via bundled get-pip.py, fall back to network mirrors
+    $getPipPy = Join-Path $pyDir 'get-pip.py'
+    if (-not (Test-Path $getPipPy)) {
+        $bundled = Join-Path $ScriptDir 'get-pip.py'
+        if (Test-Path $bundled) {
+            Copy-Item $bundled $getPipPy -Force
+            $log += "Using bundled get-pip.py`n"
+        } else {
+            $mirrors = @(
+                'https://bootstrap.pypa.io/get-pip.py',
+                'https://raw.githubusercontent.com/pypa/get-pip/main/public/get-pip.py'
+            )
+            foreach ($url in $mirrors) {
+                try {
+                    Invoke-WebRequest -Uri $url -OutFile $getPipPy -UseBasicParsing -TimeoutSec 30 -EA Stop
+                    if ((Get-Item $getPipPy).Length -gt 100000) {
+                        $log += "Downloaded get-pip.py from $url`n"
+                        break
+                    }
+                } catch { $log += "Mirror $url failed: $($_.Exception.Message)`n" }
+            }
+        }
+    }
+
+    if (-not (Test-Path $getPipPy)) {
+        return @{ ok=$false; log=$log + "Could not obtain get-pip.py"; missing=$missing }
+    }
+
+    # Run get-pip.py
+    if (-not (Test-PyImport -PyExe $PyExe -Module 'pip')) {
+        try {
+            $stdOut = [System.IO.Path]::GetTempFileName()
+            $stdErr = [System.IO.Path]::GetTempFileName()
+            $p = Start-Process -FilePath $PyExe -ArgumentList @($getPipPy,'--disable-pip-version-check') `
+                -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdOut -RedirectStandardError $stdErr -EA Stop
+            $log += "get-pip.py exit=$($p.ExitCode)`n"
+            $log += (Get-Content $stdOut -Raw) + (Get-Content $stdErr -Raw)
+            Remove-Item $stdOut, $stdErr -EA SilentlyContinue
+        } catch { $log += "get-pip.py failed: $($_.Exception.Message)`n" }
+    }
+
+    # Step 3: pip install required packages
+    if (Test-PyImport -PyExe $PyExe -Module 'pip') {
+        $pipArgs = @('-m','pip','install','--disable-pip-version-check') + $required
+        try {
+            $stdOut = [System.IO.Path]::GetTempFileName()
+            $stdErr = [System.IO.Path]::GetTempFileName()
+            $p = Start-Process -FilePath $PyExe -ArgumentList $pipArgs `
+                -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdOut -RedirectStandardError $stdErr -EA Stop
+            $log += "pip install exit=$($p.ExitCode)`n"
+            $log += (Get-Content $stdOut -Raw) + (Get-Content $stdErr -Raw)
+            Remove-Item $stdOut, $stdErr -EA SilentlyContinue
+        } catch { $log += "pip install failed: $($_.Exception.Message)`n" }
+    } else {
+        return @{ ok=$false; log=$log + "pip still not available after bootstrap"; missing=$missing }
+    }
+
+    # Re-check
+    $stillMissing = @()
+    foreach ($m in $required) {
+        if (-not (Test-PyImport -PyExe $PyExe -Module $m)) { $stillMissing += $m }
+    }
+    if ($stillMissing.Count -eq 0) {
+        Add-Log "Python deps installed OK."
+        return @{ ok=$true; log=$log; missing=@() }
+    }
+    return @{ ok=$false; log=$log + "Still missing after install: $($stillMissing -join ', ')"; missing=$stillMissing }
+}
+
 function Invoke-VsphereCollect {
     param(
         [string] $PyExe,
@@ -230,6 +343,30 @@ function Invoke-VsphereCollect {
         [string] $PassRaw,
         [string] $OutputDir
     )
+
+    # Self-heal: portable Python may be missing requests/pyVmomi/urllib3 when
+    # the SDT was launched via the zero-install run.ps1 path (which skips
+    # install.ps1's pip bootstrap). Ensure deps are present before invoking.
+    $sdtDir = Split-Path $ScriptPath -Parent
+    $dep = Ensure-PyDeps -PyExe $PyExe -ScriptDir $sdtDir
+    if (-not $dep.ok) {
+        $depLogFile = ''
+        try {
+            if ($OutputDir -and (Test-Path $OutputDir)) {
+                $stamp = (Get-Date).ToString('yyyy-MM-dd-HHmmss')
+                $depLogFile = Join-Path $OutputDir "vsphere-pydeps-$stamp.log"
+                [System.IO.File]::WriteAllText($depLogFile, $dep.log, [System.Text.Encoding]::UTF8)
+            }
+        } catch { }
+        return @{
+            ok=$false
+            log=$dep.log
+            error=("Python dependency setup failed. Missing modules: " + ($dep.missing -join ', ') + ". See log for pip/get-pip output.")
+            pyError=("ModuleNotFoundError: " + ($dep.missing -join ', '))
+            logPath=$depLogFile
+            triedUsers=@()
+        }
+    }
 
     # Build username variants to try in order
     $variants = [System.Collections.ArrayList]@()
