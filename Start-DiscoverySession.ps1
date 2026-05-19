@@ -232,6 +232,7 @@ function Get-SuggestedServers {
     } catch { }
 
     # ADSI/LDAP fallback - works on any domain-joined machine, no module needed
+    $ldapOK = $false
     if (-not $adOK) {
         try {
             $root   = [ADSI]'LDAP://RootDSE'
@@ -251,7 +252,71 @@ function Get-SuggestedServers {
                     [void]$found.Add([PSCustomObject]@{ Name=$n; IP=$dns; Source='AD (LDAP)'; Description=$dsc; OS=$os })
                 }
             }
+            $ldapOK = ($found.Count -gt 0)
         } catch { }
+    }
+
+    # If AD and LDAP both came up empty (workgroup HV host / VPN / disconnected
+    # from a DC), self-heal with two more fallbacks: subnet ping sweep + reverse
+    # DNS, then ARP cache scrape. These are best-effort and may turn up hosts
+    # that aren't servers -- caller filters anyway. All paths timeboxed.
+    if (-not $adOK -and -not $ldapOK) {
+        # Fallback 3: subnet sweep + reverse DNS (local /24 of every UP IPv4 NIC)
+        try {
+            $nics = Get-CimInstance Win32_NetworkAdapterConfiguration -EA SilentlyContinue |
+                    Where-Object { $_.IPEnabled -and $_.IPAddress }
+            $subnets = New-Object System.Collections.ArrayList
+            foreach ($n in $nics) {
+                foreach ($ip in @($n.IPAddress)) {
+                    if ($ip -match '^(\d+\.\d+\.\d+)\.\d+$' -and $ip -notmatch '^169\.254\.' -and $ip -notmatch '^127\.') {
+                        [void]$subnets.Add($matches[1])
+                    }
+                }
+            }
+            $subnets = $subnets | Select-Object -Unique
+            foreach ($s in $subnets) {
+                $pingJobs = @()
+                # Burst 1..254 in parallel, 600ms timeout per IP -- whole sweep is ~3s
+                1..254 | ForEach-Object {
+                    $ipTry = "$s.$_"
+                    $pingJobs += @{
+                        IP = $ipTry
+                        Ping = [System.Net.NetworkInformation.Ping]::new().SendPingAsync($ipTry, 600)
+                    }
+                }
+                [System.Threading.Tasks.Task]::WaitAll(@($pingJobs.Ping)) | Out-Null
+                foreach ($pj in $pingJobs) {
+                    try {
+                        if ($pj.Ping.Result.Status -eq 'Success') {
+                            $rdns = ''
+                            try { $rdns = ([System.Net.Dns]::GetHostEntry($pj.IP)).HostName } catch {}
+                            $nm = if ($rdns) { ($rdns -split '\.')[0] } else { $pj.IP }
+                            if (-not ($found | Where-Object { $_.Name -ieq $nm -or $_.IP -eq $pj.IP })) {
+                                [void]$found.Add([PSCustomObject]@{
+                                    Name=$nm; IP=$pj.IP; Source='Subnet sweep'; Description=''; OS=''
+                                })
+                            }
+                        }
+                    } catch {}
+                }
+            }
+        } catch {}
+
+        # Fallback 4: ARP cache scrape (anything we've recently talked to)
+        try {
+            $arp = (& arp -a 2>$null) | Where-Object { $_ -match '^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9A-Fa-f-]{17})\s+(\w+)' }
+            foreach ($ln in $arp) {
+                if ($ln -match '^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9A-Fa-f-]{17})\s+(\w+)') {
+                    $ipA = $matches[1]
+                    if ($ipA -match '^(169\.254\.|224\.|239\.|255\.)') { continue }
+                    if ($found | Where-Object { $_.IP -eq $ipA }) { continue }
+                    $rdnsA = ''
+                    try { $rdnsA = ([System.Net.Dns]::GetHostEntry($ipA)).HostName } catch {}
+                    $nmA = if ($rdnsA) { ($rdnsA -split '\.')[0] } else { $ipA }
+                    [void]$found.Add([PSCustomObject]@{ Name=$nmA; IP=$ipA; Source='ARP cache'; Description=''; OS='' })
+                }
+            }
+        } catch {}
     }
     return ,$found
 }
@@ -1180,6 +1245,73 @@ function Get-VSphereInventory {
 
 # -- Hyper-V enumeration via WMI -----------------------------------------------
 
+function Test-IsHyperVHost {
+    # Preflight: is the LOCAL machine a usable Hyper-V host?
+    # Returns: [pscustomobject]@{ IsHost=$true/$false; Reasons=@('...','...'); Detail=@{} }
+    # Self-healing: tries 4 independent signals; any 2 of 4 = pass.
+    # Used by HV-local mode (no remote Hyper-V supported in this build).
+    [CmdletBinding()] param()
+    $signals = [ordered]@{
+        vmms_service        = $null
+        hyperv_feature      = $null
+        hypervisor_present  = $null
+        get_vm_cmdlet       = $null
+    }
+    $reasons = New-Object System.Collections.ArrayList
+
+    # Signal 1: vmms service exists and is Running
+    try {
+        $svc = Get-Service -Name vmms -ErrorAction Stop
+        $signals.vmms_service = ($svc.Status -eq 'Running')
+        if ($svc.Status -ne 'Running') {
+            [void]$reasons.Add("vmms service is '$($svc.Status)', expected 'Running' (try: Start-Service vmms)")
+        }
+    } catch {
+        $signals.vmms_service = $false
+        [void]$reasons.Add("vmms service not found (Hyper-V role not installed)")
+    }
+
+    # Signal 2: Hyper-V Windows feature installed
+    try {
+        $feat = $null
+        if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
+            $feat = Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue
+            if ($feat) { $signals.hyperv_feature = ($feat.Installed -eq $true) }
+        } elseif (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+            $feat = Get-WindowsOptionalFeature -FeatureName Microsoft-Hyper-V -Online -ErrorAction SilentlyContinue
+            if ($feat) { $signals.hyperv_feature = ($feat.State -eq 'Enabled') }
+        }
+        if ($null -eq $signals.hyperv_feature) { $signals.hyperv_feature = $false }
+        if (-not $signals.hyperv_feature) { [void]$reasons.Add("Hyper-V Windows feature not installed/enabled") }
+    } catch {
+        $signals.hyperv_feature = $false
+        [void]$reasons.Add("could not query Windows features: $($_.Exception.Message)")
+    }
+
+    # Signal 3: HypervisorPresent flag on Win32_ComputerSystem
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $signals.hypervisor_present = [bool]$cs.HypervisorPresent
+        if (-not $signals.hypervisor_present) { [void]$reasons.Add("HypervisorPresent=false (CPU virt may be disabled in BIOS)") }
+    } catch {
+        $signals.hypervisor_present = $false
+        [void]$reasons.Add("could not query Win32_ComputerSystem: $($_.Exception.Message)")
+    }
+
+    # Signal 4: Get-VM cmdlet available (Hyper-V PS module loaded)
+    $signals.get_vm_cmdlet = [bool](Get-Command Get-VM -ErrorAction SilentlyContinue |
+                                     Where-Object { $_.ModuleName -eq 'Hyper-V' })
+    if (-not $signals.get_vm_cmdlet) { [void]$reasons.Add("Get-VM cmdlet from Hyper-V module not available (Install-WindowsFeature Hyper-V-PowerShell)") }
+
+    $passCount = ($signals.Values | Where-Object { $_ -eq $true }).Count
+    [pscustomobject]@{
+        IsHost  = ($passCount -ge 2)   # 2-of-4 quorum: tolerant of one missing signal
+        Reasons = $reasons
+        Detail  = $signals
+        PassCount = $passCount
+    }
+}
+
 function Get-HyperVVMs {
     # Primary: Get-VM inline (local) or Invoke-Command (remote)
     # Fallback: WMI Msvm_ComputerSystem (if WinRM unavailable on remote HV host)
@@ -1573,40 +1705,65 @@ function Add-HypervisorSource {
             $src.Cred = Get-Credential -Message "ESXi credentials for $($src.Host)"
         }
         'HyperV' {
-            Write-Host "  Hyper-V host hostname or IP" -ForegroundColor Gray
-            Write-Host "  (press Enter or type 'localhost' if running this script ON the HV host)" -ForegroundColor DarkGray
-            $src.Host = Read-Safe "  HV host"
-            if (-not $src.Host -or $src.Host -eq '') { $src.Host = 'localhost' }
+            # Hyper-V mode is LOCAL-ONLY: the tool must be installed and run on the
+            # Hyper-V host itself. No remote HV host, no creds prompt. Soft-warn +
+            # retry if preflight fails (user may need to install the role / start
+            # vmms / install the PS module).
+            $src.Host = $env:COMPUTERNAME
+            $src.Cred = $null
 
-            $isLocalHV = ($src.Host -match '^(localhost|127\.0\.0\.1)$' -or
-                          $src.Host -ieq $env:COMPUTERNAME)
+            $hvAttempt = 0
+            $hvProceed = $false
+            while (-not $hvProceed) {
+                $hvAttempt++
+                Write-Host ""
+                B-Line "Hyper-V preflight on $($env:COMPUTERNAME) (attempt #$hvAttempt)..."
+                $pf = Test-IsHyperVHost
+                Write-Host ("    vmms service running   : {0}" -f $pf.Detail.vmms_service)        -ForegroundColor DarkGray
+                Write-Host ("    Hyper-V feature on     : {0}" -f $pf.Detail.hyperv_feature)      -ForegroundColor DarkGray
+                Write-Host ("    HypervisorPresent flag : {0}" -f $pf.Detail.hypervisor_present)  -ForegroundColor DarkGray
+                Write-Host ("    Get-VM cmdlet present  : {0}" -f $pf.Detail.get_vm_cmdlet)       -ForegroundColor DarkGray
 
-            if ($isLocalHV) {
-                B-OK "Running ON the HV host ($($src.Host)) -- no credentials needed"
-                # cred stays null; Get-HyperVVMs will run Get-VM inline
-            } else {
-                Write-Host ""
-                Write-Host "  HYPER-V HOST credentials:" -ForegroundColor Yellow
-                Write-Host "    - Domain-joined host  ->  same domain creds as the servers  [Y]" -ForegroundColor DarkGray
-                Write-Host "    - Standalone/workgroup host  ->  local admin  (.\Administrator)  [N]" -ForegroundColor DarkGray
-                Write-Host ""
-                $ans = Read-Safe "  Same as domain creds? [Y/N]"
-                if ($ans -match '^[Nn]') {
-                    Write-Host "  Enter LOCAL admin credentials for the Hyper-V host $($src.Host):" -ForegroundColor Gray
-                    Write-Host "  (format: .\Administrator  or  .\localadmin)" -ForegroundColor DarkGray
-                    $src.Cred = Get-Credential -Message "LOCAL admin for Hyper-V host $($src.Host) -- format: .\Administrator"
+                if ($pf.IsHost) {
+                    B-OK "Hyper-V host confirmed ($($pf.PassCount)/4 signals). Running locally -- no creds needed."
+                    $hvProceed = $true
+                    break
                 }
-                # else: cred stays null - will use $script:DomainCred at runtime
+
+                # Not a HV host (or signals incomplete) -- soft warn + retry loop
+                B-Warn "This machine does not look like a Hyper-V host:"
+                foreach ($r in $pf.Reasons) { Write-Host "      - $r" -ForegroundColor Yellow }
+                Write-Host ""
+                Write-Host "  Hyper-V mode REQUIRES running on the Hyper-V host itself." -ForegroundColor White
+                Write-Host "  Fix it (install role, start vmms, install Hyper-V-PowerShell), then retry." -ForegroundColor Gray
+                Write-Host ""
+                Write-Host "  [R]  Retry preflight  (fix the issue above, then press R)" -ForegroundColor Cyan
+                Write-Host "  [F]  Force continue   (try local Get-VM anyway -- may fail)" -ForegroundColor Cyan
+                Write-Host "  [S]  Skip Hyper-V     (return to environment menu)" -ForegroundColor Cyan
+                Write-Host ""
+                $ans = Read-Safe "  Choice [R/F/S]"
+                switch -Regex ($ans) {
+                    '^[Rr]' { continue }
+                    '^[Ff]' { B-Warn "Forcing local Hyper-V mode despite failed preflight."; $hvProceed = $true; break }
+                    '^[Ss]' { $src = $null; $hvProceed = $true; break }
+                    default { Write-Host "  (R, F, or S)" -ForegroundColor DarkGray }
+                }
             }
         }
     }
     return $src
 }
 
+function _Add-HVSourceIfPresent {
+    param([string]$Type, [System.Collections.ArrayList]$List)
+    $s = Add-HypervisorSource $Type
+    if ($s) { [void]$List.Add($s) } else { B-Line "($Type entry skipped by user)" }
+}
+
 switch ($envType) {
-    '1' { [void]$hypervisorSources.Add((Add-HypervisorSource 'vCenter')) }
-    '2' { [void]$hypervisorSources.Add((Add-HypervisorSource 'ESXi')) }
-    '3' { [void]$hypervisorSources.Add((Add-HypervisorSource 'HyperV')) }
+    '1' { _Add-HVSourceIfPresent 'vCenter' $hypervisorSources }
+    '2' { _Add-HVSourceIfPresent 'ESXi'    $hypervisorSources }
+    '3' { _Add-HVSourceIfPresent 'HyperV'  $hypervisorSources }
     '4' { B-Line "bare metal / manual mode - will collect server list directly" }
     '5' {
         Write-Host ""
@@ -1617,9 +1774,9 @@ switch ($envType) {
             $hv = Read-Safe "  >"
             if ($hv -eq '') { break }
             switch ($hv) {
-                '1' { [void]$hypervisorSources.Add((Add-HypervisorSource 'vCenter')) }
-                '2' { [void]$hypervisorSources.Add((Add-HypervisorSource 'ESXi')) }
-                '3' { [void]$hypervisorSources.Add((Add-HypervisorSource 'HyperV')) }
+                '1' { _Add-HVSourceIfPresent 'vCenter' $hypervisorSources }
+                '2' { _Add-HVSourceIfPresent 'ESXi'    $hypervisorSources }
+                '3' { _Add-HVSourceIfPresent 'HyperV'  $hypervisorSources }
             }
         }
     }
@@ -1706,6 +1863,26 @@ if ($hypervisorSources.Count -gt 0) {
                 B-OK "  Got $($vms.Count) VMs from Hyper-V $($src.Host)"
                 $hvInv = Get-HyperVInventory -HVHost $src.Host -Cred $hvCred
                 if ($hvInv) { [void]$script:PendingInventories.Add(@{ Type='HyperV'; Host=$src.Host; Data=$hvInv }) }
+                # Register every guest from THIS local Hyper-V host so the
+                # discovery loop can route them through PowerShell Direct first
+                # (no network / firewall / per-guest WinRM trust required).
+                $isLocalHVForCascade = ($src.Host -match '^(localhost|127\.0\.0\.1)$' -or $src.Host -ieq $env:COMPUTERNAME)
+                if ($isLocalHVForCascade) {
+                    if (-not $script:HyperVLocalGuests) { $script:HyperVLocalGuests = @{} }
+                    foreach ($v in $vms) {
+                        if ($v.Name) {
+                            $script:HyperVLocalGuests[$v.Name] = @{ VMName = $v.Name; VMID = $v.VMID; IP = $v.IP }
+                            if ($v.IP) {
+                                foreach ($ip in ($v.IP -split ',\s*')) {
+                                    if ($ip -and -not $script:HyperVLocalGuests.ContainsKey($ip)) {
+                                        $script:HyperVLocalGuests[$ip] = @{ VMName = $v.Name; VMID = $v.VMID; IP = $ip }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    B-OK "  Registered $($vms.Count) guest(s) for PS Direct fast-path"
+                }
                 # Auto-add the HV host itself as a discovery target (produces a server tab in the report)
                 $isLocalHVSrc = ($src.Host -match '^(localhost|127\.0\.0\.1)$' -or $src.Host -ieq $env:COMPUTERNAME)
                 if (-not $isLocalHVSrc) {
@@ -2433,13 +2610,48 @@ foreach ($row in $autoRows) {
     $discError = ''
     # Fix 9 -- WinRM restore runs in finally so it fires even if discovery throws or Ctrl+C
     try {
+        # Cascade: easiest-to-hardest transport. For local Hyper-V guests we
+        # try PowerShell Direct first (no network needed, no firewall, no per-
+        # guest WinRM trust). On any failure -- exception, no JSON produced --
+        # we fall through to WinRM-by-IP. The fallback path is the original
+        # WinRM remoting code, untouched.
+        $hvGuestInfo = $null
+        if ($script:HyperVLocalGuests) {
+            foreach ($k in @($row.DisplayName, $row.ResolvedHost, $target)) {
+                if ($k -and $script:HyperVLocalGuests.ContainsKey($k)) { $hvGuestInfo = $script:HyperVLocalGuests[$k]; break }
+            }
+        }
+
         try {
             if ($isLocal) {
                 & $DiscoveryScript -OutputPath $sessionFolder
-            } else {
-                & $DiscoveryScript -ComputerName $target -Credential $script:DomainCred -OutputPath $sessionFolder
+                $ok = $true
             }
-            $ok = $true
+            elseif ($hvGuestInfo) {
+                # ---- Leg 1: PowerShell Direct via VMBus ----
+                $psDirectOK = $false
+                try {
+                    Write-Host "    [Discovery] Trying PowerShell Direct (VMName=$($hvGuestInfo.VMName))..." -ForegroundColor DarkCyan
+                    & $DiscoveryScript -HyperVGuestVMName $hvGuestInfo.VMName -Credential $script:DomainCred -OutputPath $sessionFolder
+                    $psDirectOK = $true
+                    Write-Log 'INFO' $row.DisplayName "PowerShell Direct path completed"
+                } catch {
+                    $psErr = $_.ToString()
+                    B-Warn "    PS Direct failed ($psErr) -- falling back to WinRM"
+                    Write-Log 'WARN' $row.DisplayName "PS Direct failed: $psErr"
+                }
+                if ($psDirectOK) {
+                    $ok = $true
+                } else {
+                    # ---- Leg 2: WinRM by IP/name ----
+                    & $DiscoveryScript -ComputerName $target -Credential $script:DomainCred -OutputPath $sessionFolder
+                    $ok = $true
+                }
+            }
+            else {
+                & $DiscoveryScript -ComputerName $target -Credential $script:DomainCred -OutputPath $sessionFolder
+                $ok = $true
+            }
         } catch {
             $discError = $_.ToString()
             B-Err "Discovery script exception on $target`: $discError"

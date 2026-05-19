@@ -40,7 +40,16 @@ param(
     [string]       $ComputerName = $env:COMPUTERNAME,
     [string]       $OutputPath   = $PSScriptRoot,
     [PSCredential] $Credential,
-    [switch]       $NonInteractive
+    [switch]       $NonInteractive,
+    # Hyper-V PowerShell Direct transport: when set, the collection block is sent
+    # via Invoke-Command -VMId/-VMName (in-band via VMBus) instead of WinRM. The
+    # orchestrator uses this as the first leg of the cascade for guests on the
+    # local Hyper-V host (no network, no firewall, no per-guest WinRM trust).
+    # Requires Hyper-V host 2016+ AND Windows guest 2016+/Win10+ with integration
+    # services. Credentials are still required (PS Direct authenticates AS A
+    # LOCAL guest account -- domain creds work if the guest is domain-joined).
+    [string]       $HyperVGuestVMId,
+    [string]       $HyperVGuestVMName
 )
 
 $ErrorActionPreference = 'Continue'
@@ -60,10 +69,12 @@ $script:CollectErrors  = [System.Collections.ArrayList]@()
 # Fix 1 -- TLS 1.2 for older .NET (ensures HTTPS downloads work on .NET 4.0 / PS 3/4)
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-$script:IsRemote = ($ComputerName -ne $env:COMPUTERNAME -and
-                    $ComputerName -ne 'localhost'         -and
-                    $ComputerName -ne '127.0.0.1'         -and
-                    $ComputerName -ne '.')
+$script:IsHVGuest = [bool]($HyperVGuestVMId -or $HyperVGuestVMName)
+$script:IsRemote  = $script:IsHVGuest -or (
+                     $ComputerName -ne $env:COMPUTERNAME -and
+                     $ComputerName -ne 'localhost'         -and
+                     $ComputerName -ne '127.0.0.1'         -and
+                     $ComputerName -ne '.')
 
 # -- AUTO-UPDATE (LOUD) --------------------------------------------------------
 # Check GitHub for a newer tag EVERY run. If newer, download, replace this
@@ -373,7 +384,7 @@ if ($script:IsRemote) {
             Write-Host ("  (x_x)  Connection test failed:") -ForegroundColor Red
             Write-Host ("         $errMsg") -ForegroundColor DarkRed
             if ($script:IsNonInteractive) {
-                Write-BuddyErr "RemotePreflight" "Connection test failed on $ComputerName: $errMsg (non-interactive - aborting this target)"
+                Write-BuddyErr "RemotePreflight" "Connection test failed on ${ComputerName}: $errMsg (non-interactive - aborting this target)"
                 exit 1
             }
             Write-Host ""
@@ -1826,7 +1837,12 @@ Write-Host ""
 $discoveryResult = $null
 
 if ($script:IsRemote) {
-    Write-Host ("  Sending collection block to $ComputerName...") -ForegroundColor DarkCyan
+    $transportLabel =
+        if ($script:IsHVGuest) {
+            $tgt = if ($HyperVGuestVMId) { "VMId=$HyperVGuestVMId" } else { "VMName=$HyperVGuestVMName" }
+            "Hyper-V PowerShell Direct ($tgt)"
+        } else { "WinRM to $ComputerName" }
+    Write-Host ("  Sending collection block via $transportLabel...") -ForegroundColor DarkCyan
     Write-Host ("  Remote execution is synchronous - buddy will animate while waiting.") -ForegroundColor DarkGray
     Write-Host ""
 
@@ -1838,12 +1854,23 @@ if ($script:IsRemote) {
         # serializes the ScriptBlock to a string. Invoke-Command then returns that string
         # as output instead of executing it. -AsJob bypasses serialization entirely.
         $icParams = @{
-            ComputerName = $ComputerName
             ScriptBlock  = $CollectionBlock
             AsJob        = $true
             ErrorAction  = 'Stop'
         }
-        if ($Credential) { $icParams.Credential = $Credential }
+        if ($script:IsHVGuest) {
+            # PowerShell Direct -- routes through Hyper-V VMBus, no network.
+            # Requires Credential (PS Direct does not support implicit creds).
+            if (-not $Credential) {
+                throw "PowerShell Direct requires -Credential (no implicit auth via VMBus). Pass a local-guest or domain credential."
+            }
+            if ($HyperVGuestVMId)   { $icParams.VMId   = $HyperVGuestVMId }
+            elseif ($HyperVGuestVMName) { $icParams.VMName = $HyperVGuestVMName }
+            $icParams.Credential = $Credential
+        } else {
+            $icParams.ComputerName = $ComputerName
+            if ($Credential) { $icParams.Credential = $Credential }
+        }
 
         $job = Invoke-Command @icParams
 
@@ -1851,7 +1878,11 @@ if ($script:IsRemote) {
         $spinIdx   = 0
         while ($job.State -eq 'Running') {
             $frame = $buddyFrames[$spinIdx % $buddyFrames.Count]
-            Write-Host ("`r  $frame  waiting for $ComputerName...  $($spinChars[$spinIdx % 4])   ") -NoNewline -ForegroundColor DarkCyan
+            if ($script:IsHVGuest) {
+                $gid = if ($HyperVGuestVMName) { $HyperVGuestVMName } else { $HyperVGuestVMId }
+                $waitTarget = "$gid (PS Direct)"
+            } else { $waitTarget = $ComputerName }
+            Write-Host ("`r  $frame  waiting for $waitTarget...  $($spinChars[$spinIdx % 4])   ") -NoNewline -ForegroundColor DarkCyan
             Start-Sleep -Milliseconds 400
             $spinIdx++
         }

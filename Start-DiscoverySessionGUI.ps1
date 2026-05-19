@@ -58,6 +58,169 @@ function Add-Log([string]$msg) {
 
 # Runs collect_vsphere_perf.py with auto-retry across username formats.
 # Returns hashtable: @{ ok=$true/$false; user=<succeeded-format>; log=<combined-log>; file=<json-path>; error=<short>; }
+function Test-IsLocalHyperVHost {
+    # GUI-side mirror of Test-IsHyperVHost in Start-DiscoverySession.ps1.
+    # Returns {IsHost, PassCount, Reasons[], Detail{}} -- 2-of-4 quorum.
+    [CmdletBinding()] param()
+    $sig = [ordered]@{ vmms_service=$false; hyperv_feature=$false; hypervisor_present=$false; get_vm_cmdlet=$false }
+    $reasons = New-Object System.Collections.ArrayList
+
+    try {
+        $svc = Get-Service -Name vmms -ErrorAction Stop
+        $sig.vmms_service = ($svc.Status -eq 'Running')
+        if (-not $sig.vmms_service) { [void]$reasons.Add("vmms service is '$($svc.Status)' (Start-Service vmms)") }
+    } catch { [void]$reasons.Add("vmms service not found -- Hyper-V role not installed") }
+
+    try {
+        if (Get-Command Get-WindowsFeature -EA SilentlyContinue) {
+            $f = Get-WindowsFeature -Name Hyper-V -EA SilentlyContinue
+            if ($f) { $sig.hyperv_feature = ($f.Installed -eq $true) }
+        } elseif (Get-Command Get-WindowsOptionalFeature -EA SilentlyContinue) {
+            $f = Get-WindowsOptionalFeature -FeatureName Microsoft-Hyper-V -Online -EA SilentlyContinue
+            if ($f) { $sig.hyperv_feature = ($f.State -eq 'Enabled') }
+        }
+        if (-not $sig.hyperv_feature) { [void]$reasons.Add("Hyper-V Windows feature not enabled") }
+    } catch { [void]$reasons.Add("could not query Windows features: $($_.Exception.Message)") }
+
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -EA Stop
+        $sig.hypervisor_present = [bool]$cs.HypervisorPresent
+        if (-not $sig.hypervisor_present) { [void]$reasons.Add("HypervisorPresent=false (CPU virt may be off in BIOS)") }
+    } catch { [void]$reasons.Add("could not query Win32_ComputerSystem") }
+
+    $sig.get_vm_cmdlet = [bool](Get-Command Get-VM -EA SilentlyContinue | Where-Object { $_.ModuleName -eq 'Hyper-V' })
+    if (-not $sig.get_vm_cmdlet) { [void]$reasons.Add("Get-VM (Hyper-V module) missing -- Install-WindowsFeature Hyper-V-PowerShell") }
+
+    $pass = ($sig.Values | Where-Object { $_ -eq $true }).Count
+    [pscustomobject]@{ IsHost=($pass -ge 2); PassCount=$pass; Reasons=$reasons; Detail=$sig }
+}
+
+function Invoke-LocalHyperVInventory {
+    # Runs Get-VM / Get-VMHost / Get-VMSwitch locally. Returns HyperVInventory
+    # object (same shape as Start-DiscoverySession.ps1 produces) + a flattened
+    # VM list for the UI. Self-heals: if Get-VM fails, falls back to WMI.
+    param([string]$OutputDir, [switch]$Force)
+
+    $pf = Test-IsLocalHyperVHost
+    if (-not $pf.IsHost -and -not $Force) {
+        return @{ ok=$false; preflight=$pf; error=("Not a Hyper-V host: " + ($pf.Reasons -join '; ')) }
+    }
+
+    $vms = @()
+    $invErr = ''
+    $hvInv = $null
+    try {
+        $hostCS  = Get-CimInstance Win32_ComputerSystem -EA Stop
+        $hostCPU = (Get-CimInstance Win32_Processor -EA SilentlyContinue | Select-Object -First 1)
+        $vols    = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -EA SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{
+                Drive   = $_.DeviceID
+                Label   = $_.VolumeName
+                TotalGB = if ($_.Size) { [math]::Round($_.Size/1GB,1) } else { 0 }
+                FreeGB  = if ($_.FreeSpace) { [math]::Round($_.FreeSpace/1GB,1) } else { 0 }
+                UsedPct = if ($_.Size -gt 0) { [math]::Round(100 - ($_.FreeSpace/$_.Size*100),1) } else { 0 }
+            }
+        }
+
+        $switches = @()
+        try {
+            $switches = Get-VMSwitch -EA Stop | ForEach-Object {
+                [pscustomobject]@{ Name=$_.Name; Type=$_.SwitchType.ToString(); NetAdapter=$_.NetAdapterInterfaceDescription }
+            }
+        } catch { Add-Log "Get-VMSwitch failed: $($_.Exception.Message)" }
+
+        # Primary: Get-VM (Hyper-V module). Fallback: WMI Msvm_ComputerSystem.
+        $rawVms = $null
+        try { $rawVms = Get-VM -EA Stop } catch {
+            Add-Log "Get-VM failed ($($_.Exception.Message)) -- trying WMI fallback"
+            try {
+                $rawVms = Get-CimInstance -Namespace 'root\virtualization\v2' -ClassName Msvm_ComputerSystem `
+                    -Filter "Caption='Virtual Machine'" -EA Stop
+            } catch { $invErr = "Both Get-VM and WMI failed: $($_.Exception.Message)" }
+        }
+
+        $vmList = @()
+        if ($rawVms) {
+            foreach ($vm in $rawVms) {
+                $isWmi = ($vm.PSObject.TypeNames -join ',') -match 'Msvm_ComputerSystem'
+                if ($isWmi) {
+                    $stateMap = @{ 2='Running'; 3='Off'; 9='Paused'; 6='Saved'; 10='Starting' }
+                    $state = if ($stateMap.ContainsKey([int]$vm.EnabledState)) { $stateMap[[int]$vm.EnabledState] } else { "$($vm.EnabledState)" }
+                    $vmList += [pscustomobject]@{
+                        Name=$vm.ElementName; State=$state; vCPU=$null; RAMgb=$null
+                        UptimeHours=$null; Snapshots=0; IPs=''; Disks=@(); NetworkAdapters=@()
+                        IntegrationServices=''
+                    }
+                } else {
+                    $ads = $null; $ips = @(); $disks = @(); $nets = @(); $snaps = 0; $intSvc = ''
+                    try { $ads = Get-VMNetworkAdapter -VM $vm -EA SilentlyContinue } catch {}
+                    if ($ads) {
+                        $ips = $ads | ForEach-Object { $_.IPAddresses } | Where-Object { $_ -and ($_ -notmatch ':') -and $_ -ne '0.0.0.0' }
+                        $nets = $ads | ForEach-Object {
+                            [pscustomobject]@{
+                                Name=$_.Name; SwitchName=$_.SwitchName; MacAddress=$_.MacAddress
+                                IPs=(($_.IPAddresses | Where-Object { $_ -notmatch ':' -and $_ -ne '0.0.0.0' }) -join ', ')
+                            }
+                        }
+                    }
+                    try {
+                        $disks = Get-VMHardDiskDrive -VM $vm -EA SilentlyContinue | ForEach-Object {
+                            $vhd = Get-VHD $_.Path -EA SilentlyContinue
+                            [pscustomobject]@{
+                                Path=$_.Path; ControllerType="$($_.ControllerType)"
+                                SizeGB  = if ($vhd) { [math]::Round($vhd.Size/1GB,1) } else { $null }
+                                UsedGB  = if ($vhd) { [math]::Round($vhd.FileSize/1GB,1) } else { $null }
+                                VHDType = if ($vhd) { "$($vhd.VhdType)" } else { $null }
+                            }
+                        }
+                    } catch {}
+                    try { $snaps = @(Get-VMSnapshot -VM $vm -EA SilentlyContinue).Count } catch {}
+                    try {
+                        $intSvc = (Get-VMIntegrationService -VM $vm -EA SilentlyContinue |
+                                   Where-Object { $_.Enabled } | Select-Object -ExpandProperty Name) -join ', '
+                    } catch {}
+                    $vmList += [pscustomobject]@{
+                        Name=$vm.Name; State="$($vm.State)"; vCPU=$vm.ProcessorCount
+                        RAMgb=[math]::Round($vm.MemoryAssigned/1GB,2)
+                        UptimeHours=[math]::Round($vm.Uptime.TotalHours,1)
+                        Snapshots=$snaps
+                        IPs=(($ips | Select-Object -First 4) -join ', ')
+                        Disks=$disks; NetworkAdapters=$nets; IntegrationServices=$intSvc
+                    }
+                }
+            }
+        }
+
+        $hvInv = [pscustomobject]@{
+            _type='HyperVInventory'
+            HVHost=$env:COMPUTERNAME
+            HostSummary=[pscustomobject]@{
+                Manufacturer=$hostCS.Manufacturer; Model=$hostCS.Model
+                TotalRAMgb=[math]::Round($hostCS.TotalPhysicalMemory/1GB,1)
+                CPUModel    = $(if ($hostCPU) { $hostCPU.Name.Trim() } else { '' })
+                CPUCores    = $(if ($hostCPU) { $hostCPU.NumberOfCores } else { 0 })
+                CPULogical  = $(if ($hostCPU) { $hostCPU.NumberOfLogicalProcessors } else { 0 })
+                Volumes=$vols
+            }
+            VirtualSwitches=$switches
+            VMs=$vmList
+            Preflight=$pf
+        }
+
+        if ($OutputDir) {
+            try {
+                if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+                $outFile = Join-Path $OutputDir ("{0}-hv-inventory-{1}.json" -f $env:COMPUTERNAME, (Get-Date -f 'yyyy-MM-dd'))
+                $hvInv | ConvertTo-Json -Depth 8 | Set-Content -Path $outFile -Encoding UTF8
+                return @{ ok=$true; inventory=$hvInv; vms=$vmList; file=$outFile; preflight=$pf }
+            } catch { Add-Log "Failed to write HV inventory: $($_.Exception.Message)" }
+        }
+        return @{ ok=$true; inventory=$hvInv; vms=$vmList; file=''; preflight=$pf }
+    } catch {
+        return @{ ok=$false; error=("Local Hyper-V inventory failed: " + $_.Exception.Message); preflight=$pf }
+    }
+}
+
 function Invoke-VsphereCollect {
     param(
         [string] $PyExe,
@@ -317,8 +480,8 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 <div class="card-title">Hypervisor (optional) <span class="hint" data-tip="Hit 'Scan Hypervisor' to connect, list every VM, and tick which ones to collect Windows data from. Skip this whole section if you're running against bare-metal servers only.">i</span></div>
 <div class="card-sub">Connect to vCenter or an ESXi host. Hit <strong>Scan Hypervisor</strong> to discover VMs, then tick which ones to collect Windows data from. Or leave "None" for bare-metal-only runs.</div>
 <div class="grid3">
-<div class="field"><label>Type <span class="hint" data-tip="vCenter/ESXi uses the vSphere SOAP API (works against both). Hyper-V is stubbed for now. 'None' skips hypervisor inventory entirely.">i</span></label>
-<select name="hvType"><option value="none">None</option><option value="vsphere">vCenter / ESXi</option><option value="hyperv">Hyper-V Host</option></select></div>
+<div class="field"><label>Type <span class="hint" data-tip="vCenter/ESXi uses the vSphere SOAP API (remote). Hyper-V is LOCAL-ONLY: must be run on the Hyper-V host itself (host/user/pass fields are ignored). 'None' skips hypervisor inventory entirely.">i</span></label>
+<select name="hvType" onchange="onHvTypeChange(this.value)"><option value="none">None</option><option value="vsphere">vCenter / ESXi (remote)</option><option value="hyperv">Hyper-V Host (local-only)</option></select></div>
 <div class="field"><label>IP / FQDN <span class="hint" data-tip="Hostname or IP of your vCenter server (or single ESXi host). Port 443 must be reachable.">i</span></label>
 <input name="hvHost" placeholder="192.168.10.75"></div>
 <div class="field"><label>User <span class="hint" data-tip="vCenter SSO account (e.g. administrator@vsphere.local) or local ESXi root. Needs read access to inventory + perf counters.">i</span></label>
@@ -432,6 +595,30 @@ function setTab(t){
 // Holds the last hypervisor scan result so submit can pass checked VMs.
 window._discoveredVMs = [];
 
+function onHvTypeChange(v){
+  // Hyper-V is local-only: dim host/user/pass since they're ignored.
+  const dim = (v === 'hyperv');
+  ['hvHost','hvUser','hvPass'].forEach(n => {
+    const el = document.querySelector('[name="'+n+'"]');
+    if (!el) return;
+    el.disabled = dim;
+    el.style.opacity = dim ? '0.45' : '1';
+    if (dim) el.placeholder = '(not used in Hyper-V local mode)';
+  });
+  const ss = document.getElementById('scanStatus');
+  if (ss) {
+    if (v === 'hyperv') {
+      ss.style.color = 'var(--muted)';
+      ss.innerHTML = 'Hyper-V mode is LOCAL-ONLY -- the tool must run on the Hyper-V host. Click <strong>Scan Hypervisor</strong> to run preflight + Get-VM on this machine.';
+    } else if (v === 'none') {
+      ss.textContent = '';
+    } else {
+      ss.style.color = 'var(--muted)';
+      ss.textContent = 'vCenter / ESXi -- enter host, user, and password, then Scan Hypervisor.';
+    }
+  }
+}
+
 function getHvFields(){
   const form = document.getElementById('setupForm');
   const fd = new FormData(form);
@@ -448,6 +635,10 @@ async function scanHv(){
   const status = document.getElementById('scanStatus');
   const hv = getHvFields();
   if (hv.hvType === 'none') { alert('Pick a hypervisor type first.'); return; }
+
+  // Hyper-V is LOCAL-ONLY: no host/creds prompt; runs preflight + Get-VM on this machine.
+  if (hv.hvType === 'hyperv') { return scanHvLocal(false); }
+
   if (!hv.hvHost || !hv.hvUser || !hv.hvPass) { alert('Hypervisor host, user, and password required.'); return; }
 
   btn.disabled = true; btn.textContent = 'Scanning...';
@@ -479,6 +670,58 @@ async function scanHv(){
     renderVmTable();
     status.style.color = 'var(--ok)';
     status.textContent = 'Scanned ' + window._discoveredVMs.length + ' VMs. Tick the ones to include in Windows discovery below.';
+  } catch(err) {
+    status.style.color = 'var(--crit)';
+    status.textContent = 'Scan failed: ' + err.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Scan Hypervisor';
+  }
+}
+
+// Hyper-V LOCAL mode: no remote host, no creds. Calls /api/hv-local-scan which runs
+// the preflight + Get-VM on the box this GUI is running on. If preflight fails, the
+// user sees the specific signal failures and can: (R)etry, (F)orce, or skip.
+async function scanHvLocal(force){
+  const btn = document.getElementById('scanHvBtn');
+  const status = document.getElementById('scanStatus');
+  btn.disabled = true; btn.textContent = force ? 'Forcing local scan...' : 'Running local Hyper-V scan...';
+  status.style.color = 'var(--muted)';
+  status.innerHTML = 'Hyper-V local mode -- preflight + Get-VM on this machine. No remote connection, no creds.';
+  try {
+    const resp = await fetch('/api/hv-local-scan', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ force: !!force })
+    });
+    const data = await resp.json();
+    if (!data.ok && data.preflight) {
+      // Preflight failed -- show signal table + retry/force/skip controls
+      status.style.color = 'var(--warn)';
+      const sig = data.detail || {};
+      const sigRow = (k,v) => '<tr><td style="padding:4px 10px;font-family:var(--mono);">' + k + '</td><td style="padding:4px 10px;">' + (v ? '<span style="color:var(--ok)">PASS</span>' : '<span style="color:var(--crit)">FAIL</span>') + '</td></tr>';
+      const reasons = (data.reasons || []).map(r => '<li>' + escapeHtml(r) + '</li>').join('');
+      status.innerHTML =
+        '<strong>This machine is not a Hyper-V host (' + (data.passCount || 0) + '/4 signals).</strong>' +
+        '<table style="margin-top:8px;font-size:11.5px;">' +
+          sigRow('vmms service running',        !!sig.vmms_service) +
+          sigRow('Hyper-V feature enabled',     !!sig.hyperv_feature) +
+          sigRow('HypervisorPresent flag',      !!sig.hypervisor_present) +
+          sigRow('Get-VM cmdlet available',     !!sig.get_vm_cmdlet) +
+        '</table>' +
+        '<ul style="margin-top:8px;font-size:12px;">' + reasons + '</ul>' +
+        '<div style="margin-top:10px;display:flex;gap:8px;">' +
+          '<button type="button" class="btn btn-secondary" onclick="scanHvLocal(false)">Retry preflight</button>' +
+          '<button type="button" class="btn btn-secondary" onclick="scanHvLocal(true)">Force scan anyway</button>' +
+        '</div>';
+      return;
+    }
+    if (!data.ok) { throw new Error(data.error || 'local Hyper-V scan failed'); }
+
+    window._discoveredVMs = (data.vms || []).map(v => ({...v, _checked: isWinVM(v)}));
+    document.getElementById('discoveredCard').style.display = '';
+    renderVmTable();
+    status.style.color = 'var(--ok)';
+    const forcedNote = data.forced ? ' (forced past preflight)' : '';
+    status.textContent = 'Hyper-V local scan: ' + window._discoveredVMs.length + ' VMs on ' + (data.host || 'this host') + forcedNote + '. Tick which to include in Windows discovery below.';
   } catch(err) {
     status.style.color = 'var(--crit)';
     status.textContent = 'Scan failed: ' + err.message;
@@ -1075,8 +1318,6 @@ function Start-DiscoveryRun {
                     }
                 }
                     # End of per-attempt ForEach-Object pipeline
-                    # (closing brace for the ForEach-Object script block is here:)
-                    }
                     # Check for this target's own JSON after this attempt
                     $probe = @(Get-ChildItem $Session.SessionDir -Filter "$addrShort-discovery-*.json" -EA 0 |
                         Sort-Object LastWriteTime -Descending | Select-Object -First 1)
@@ -1580,6 +1821,65 @@ try {
                     }
                     break
                 }
+                '^POST /api/hv-local-scan$' {
+                    # Hyper-V LOCAL mode -- preflight + Get-VM on this machine.
+                    # No remote host, no creds.  Body: { force: bool } (optional).
+                    $body = Read-RequestBody -Request $req
+                    $req2 = $null
+                    try { if ($body) { $req2 = $body | ConvertFrom-Json -EA Stop } } catch {}
+                    $force = $false
+                    if ($req2 -and $req2.PSObject.Properties.Name -contains 'force') { $force = [bool]$req2.force }
+
+                    $pf = Test-IsLocalHyperVHost
+                    if (-not $pf.IsHost -and -not $force) {
+                        Send-Json -Response $resp -Data @{
+                            ok=$false; preflight=$true
+                            isHost=$false; passCount=$pf.PassCount
+                            reasons=@($pf.Reasons); detail=$pf.Detail
+                            error="This machine is not a Hyper-V host. Fix the listed signals and retry, or pass force=true to try anyway."
+                        } -StatusCode 200   # 200 so JS can render the retry UI without treating it as a network error
+                        break
+                    }
+
+                    $stageDir = Join-Path $env:TEMP ("sdt-hvlocal-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+                    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+                    try {
+                        $res = Invoke-LocalHyperVInventory -OutputDir $stageDir -Force:$force
+                        if (-not $res.ok) {
+                            Send-Json -Response $resp -Data @{
+                                ok=$false; preflight=$false
+                                isHost=[bool]$pf.IsHost; passCount=$pf.PassCount
+                                error=$res.error
+                                reasons=@($pf.Reasons); detail=$pf.Detail
+                            } -StatusCode 500
+                            break
+                        }
+                        $script:Session.HvStagingFile = $res.file
+                        $script:Session.HvStagingDir  = $stageDir
+                        $vmsOut = @()
+                        foreach ($v in $res.vms) {
+                            $guestOsVal = 'Windows (Hyper-V guest)'
+                            try { if ($v.PSObject.Properties.Name -contains 'GuestOS' -and $v.GuestOS) { $guestOsVal = $v.GuestOS } } catch {}
+                            $vmsOut += @{
+                                Name       = $v.Name
+                                IPs        = $v.IPs
+                                GuestOS    = $guestOsVal
+                                PowerState = $v.State
+                            }
+                        }
+                        Send-Json -Response $resp -Data @{
+                            ok=$true; mode='hyperv-local'
+                            host=$env:COMPUTERNAME
+                            passCount=$pf.PassCount
+                            forced=[bool]$force
+                            vms=$vmsOut; count=$vmsOut.Count
+                            stagingFile=$res.file
+                        }
+                    } catch {
+                        Send-Json -Response $resp -Data @{ ok=$false; error=$_.Exception.Message } -StatusCode 500
+                    }
+                    break
+                }
                 '^POST /api/start$' {
                     if ($script:Session.Status -eq 'running') {
                         Send-Json -Response $resp -Data @{ error = 'A discovery session is already running.' } -StatusCode 409
@@ -1608,11 +1908,17 @@ try {
                     try { $hvType = "$($payload.hvType)" } catch { $hvType = '' }
                     $hvHost = ''
                     try { $hvHost = "$($payload.hvHost)" } catch { $hvHost = '' }
-                    if ($targets.Count -eq 0 -and ($hvType -eq '' -or $hvType -eq 'none' -or -not $hvHost)) {
+                    # Hyper-V local mode: no remote host required -- staging file from
+                    # /api/hv-local-scan is the proof of a valid hypervisor input.
+                    $hvLocalReady = ($hvType -eq 'hyperv') -and $script:Session.HvStagingFile -and (Test-Path $script:Session.HvStagingFile)
+                    if ($targets.Count -eq 0 -and ($hvType -eq '' -or $hvType -eq 'none' -or (-not $hvHost -and -not $hvLocalReady))) {
                         Send-Json -Response $resp -Data @{
-                            error = 'No targets and no hypervisor. Provide at least one target host OR hypervisor details.'
+                            error = 'No targets and no hypervisor. Provide at least one target host OR hypervisor details (run Scan Hypervisor first for Hyper-V local mode).'
                         } -StatusCode 400
                         break
+                    }
+                    if ($hvType -eq 'hyperv' -and -not $hvHost) {
+                        $payload | Add-Member -NotePropertyName hvHost -NotePropertyValue $env:COMPUTERNAME -Force
                     }
                     # Replace parsed targets back into payload for worker
                     $payload | Add-Member -NotePropertyName targets -NotePropertyValue $targets -Force
