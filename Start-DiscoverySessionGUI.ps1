@@ -223,12 +223,17 @@ function Invoke-LocalHyperVInventory {
 
 function Test-PyImport {
     # Returns hashtable @{ ok=$bool; diag=<stderr text if fail> }
-    # Callers that only want the bool can do (Test-PyImport ...).ok
+    # PS5 Start-Process -ArgumentList does NOT quote args with spaces, so
+    # passing @('-c','import requests') makes python see "-c import requests"
+    # and chokes on a bare "import". Workaround: write the import statement
+    # to a temp .py file and run python against the file path.
     param([string]$PyExe, [string]$Module)
+    $tmpPy = [System.IO.Path]::GetTempFileName() + '.py'
     $outFile = [System.IO.Path]::GetTempFileName()
     $errFile = [System.IO.Path]::GetTempFileName()
     try {
-        $p = Start-Process -FilePath $PyExe -ArgumentList @('-c', "import $Module") `
+        [System.IO.File]::WriteAllText($tmpPy, "import $Module`r`n", [System.Text.Encoding]::ASCII)
+        $p = Start-Process -FilePath $PyExe -ArgumentList @($tmpPy) `
             -NoNewWindow -PassThru -Wait `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile -EA Stop
         $ok = ($p.ExitCode -eq 0)
@@ -242,7 +247,7 @@ function Test-PyImport {
         return @{ ok=$false; diag="Start-Process failed for import ${Module}: $($_.Exception.Message)" }
     }
     finally {
-        Remove-Item $outFile, $errFile -EA SilentlyContinue
+        Remove-Item $tmpPy, $outFile, $errFile -EA SilentlyContinue
     }
 }
 
@@ -390,15 +395,29 @@ function Ensure-PyDeps {
     # FALLBACK LAYER 2: pip install succeeded but imports still fail. Most
     # common cause: site-packages not on sys.path. Dump diagnostics so we know
     # what python actually sees, then try the wheel-direct path.
+    # IMPORTANT: Use a temp .py file because PS5 Start-Process -ArgumentList
+    # doesn't quote args containing spaces. Passing -c "code with spaces"
+    # makes python see "-c code with spaces" unquoted and breaks.
     $log += "`n=== Diagnostic dump (sys.path / site-packages contents) ===`n"
     try {
         $diagOut = [System.IO.Path]::GetTempFileName()
         $diagErr = [System.IO.Path]::GetTempFileName()
-        $diagCode = 'import sys, os; print("--- sys.path ---"); [print(p) for p in sys.path]; sp = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages"); print("--- site-packages exists:", os.path.isdir(sp)); print("--- contents:"); [print(" ", x) for x in (os.listdir(sp) if os.path.isdir(sp) else [])]'
-        $p = Start-Process -FilePath $PyExe -ArgumentList @('-c', $diagCode) `
+        $diagPy  = [System.IO.Path]::GetTempFileName() + '.py'
+        $diagCode = @'
+import sys, os
+print("--- sys.path ---")
+for p in sys.path: print(p)
+sp = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages")
+print("--- site-packages exists:", os.path.isdir(sp))
+print("--- contents:")
+if os.path.isdir(sp):
+    for x in os.listdir(sp): print(" ", x)
+'@
+        [System.IO.File]::WriteAllText($diagPy, $diagCode, [System.Text.Encoding]::ASCII)
+        $p = Start-Process -FilePath $PyExe -ArgumentList @($diagPy) `
             -NoNewWindow -PassThru -Wait -RedirectStandardOutput $diagOut -RedirectStandardError $diagErr -EA Stop
         $log += (Get-Content $diagOut -Raw) + (Get-Content $diagErr -Raw)
-        Remove-Item $diagOut, $diagErr -EA SilentlyContinue
+        Remove-Item $diagOut, $diagErr, $diagPy -EA SilentlyContinue
     } catch { $log += "Diagnostic dump failed: $($_.Exception.Message)`n" }
 
     # FALLBACK LAYER 3: wheel-direct install. Download pure-python wheels from
