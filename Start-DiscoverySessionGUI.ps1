@@ -293,40 +293,53 @@ function Ensure-PyDeps {
         return @{ ok=$false; log=$log + "Could not obtain get-pip.py"; missing=$missing }
     }
 
-    # Run get-pip.py
-    if (-not (Test-PyImport -PyExe $PyExe -Module 'pip')) {
-        try {
-            $stdOut = [System.IO.Path]::GetTempFileName()
-            $stdErr = [System.IO.Path]::GetTempFileName()
-            $p = Start-Process -FilePath $PyExe -ArgumentList @($getPipPy,'--disable-pip-version-check') `
-                -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdOut -RedirectStandardError $stdErr -EA Stop
-            $log += "get-pip.py exit=$($p.ExitCode)`n"
-            $log += (Get-Content $stdOut -Raw) + (Get-Content $stdErr -Raw)
-            Remove-Item $stdOut, $stdErr -EA SilentlyContinue
-        } catch { $log += "get-pip.py failed: $($_.Exception.Message)`n" }
+    # Step 2: run get-pip.py to install pip into the embeddable Python.
+    # NOTE: we do NOT gate on Test-PyImport 'pip' - embeddable Python's ._pth
+    # quirk means `import pip` can fail even after a successful install
+    # (site-packages not picked up reliably until next invocation). We just run
+    # get-pip.py unconditionally - it's idempotent and fast if pip is already
+    # there. Cost ~2 sec, benefit: no false-negative gate.
+    try {
+        $stdOut = [System.IO.Path]::GetTempFileName()
+        $stdErr = [System.IO.Path]::GetTempFileName()
+        $p = Start-Process -FilePath $PyExe -ArgumentList @($getPipPy,'--disable-pip-version-check') `
+            -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdOut -RedirectStandardError $stdErr -EA Stop
+        $log += "get-pip.py exit=$($p.ExitCode)`n"
+        $log += (Get-Content $stdOut -Raw) + (Get-Content $stdErr -Raw)
+        Remove-Item $stdOut, $stdErr -EA SilentlyContinue
+    } catch { $log += "get-pip.py failed: $($_.Exception.Message)`n" }
+
+    # Belt-and-suspenders: force Lib\site-packages onto sys.path so subsequent
+    # python invocations can find pip even if ._pth wasn't updated correctly.
+    $sitePackages = Join-Path $pyDir 'Lib\site-packages'
+    $prevPyPath = $env:PYTHONPATH
+    if (Test-Path $sitePackages) {
+        if ($env:PYTHONPATH) { $env:PYTHONPATH = "$sitePackages;$env:PYTHONPATH" }
+        else                 { $env:PYTHONPATH = $sitePackages }
+        $log += "Set PYTHONPATH to include $sitePackages`n"
     }
 
-    # Step 3: pip install required packages
-    if (Test-PyImport -PyExe $PyExe -Module 'pip') {
-        $pipArgs = @('-m','pip','install','--disable-pip-version-check') + $required
-        try {
-            $stdOut = [System.IO.Path]::GetTempFileName()
-            $stdErr = [System.IO.Path]::GetTempFileName()
-            $p = Start-Process -FilePath $PyExe -ArgumentList $pipArgs `
-                -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdOut -RedirectStandardError $stdErr -EA Stop
-            $log += "pip install exit=$($p.ExitCode)`n"
-            $log += (Get-Content $stdOut -Raw) + (Get-Content $stdErr -Raw)
-            Remove-Item $stdOut, $stdErr -EA SilentlyContinue
-        } catch { $log += "pip install failed: $($_.Exception.Message)`n" }
-    } else {
-        return @{ ok=$false; log=$log + "pip still not available after bootstrap"; missing=$missing }
-    }
+    # Step 3: pip install required packages. Run unconditionally - if pip isn't
+    # available, python will say so in stderr and we capture it.
+    $pipArgs = @('-m','pip','install','--disable-pip-version-check') + $required
+    try {
+        $stdOut = [System.IO.Path]::GetTempFileName()
+        $stdErr = [System.IO.Path]::GetTempFileName()
+        $p = Start-Process -FilePath $PyExe -ArgumentList $pipArgs `
+            -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdOut -RedirectStandardError $stdErr -EA Stop
+        $log += "pip install exit=$($p.ExitCode)`n"
+        $log += (Get-Content $stdOut -Raw) + (Get-Content $stdErr -Raw)
+        Remove-Item $stdOut, $stdErr -EA SilentlyContinue
+    } catch { $log += "pip install failed: $($_.Exception.Message)`n" }
 
-    # Re-check
+    # Re-check the actual required modules (NOT pip - these are what we care
+    # about). If they import, we're good.
     $stillMissing = @()
     foreach ($m in $required) {
         if (-not (Test-PyImport -PyExe $PyExe -Module $m)) { $stillMissing += $m }
     }
+    # Don't unset PYTHONPATH - leave it for the actual collector run that
+    # follows. The collector will need site-packages too.
     if ($stillMissing.Count -eq 0) {
         Add-Log "Python deps installed OK."
         return @{ ok=$true; log=$log; missing=@() }
