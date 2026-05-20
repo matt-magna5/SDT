@@ -950,14 +950,11 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 </div>
 </div>
 
-<!-- REPORT TAB -->
+<!-- RESULTS TAB - minimal: 'Scan complete' + 2 buttons. All diagnostics
+     collapsed behind a small Details disclosure. -->
 <div id="tab-report" class="tab-pane">
-<div class="card">
-<div class="card-title">Report</div>
-<div class="card-sub" id="reportSub">The HTML report will appear here when the discovery session completes.</div>
 <div id="reportContent">
-<div style="color:var(--muted);font-style:italic;padding:20px;text-align:center;">Run a discovery session first.</div>
-</div>
+<div style="color:var(--muted);font-style:italic;padding:40px 20px;text-align:center;">Run a discovery session first.</div>
 </div>
 </div>
 
@@ -1290,47 +1287,55 @@ function renderReport(s){
   }
 
   if (s.ReportPath) {
-    // SUCCESS: minimal UI. One big button to open the report; everything else
-    // collapsed behind a small Details disclosure. No diagnostic clutter.
-    // NOTE: Chrome blocks file:// links from http:// origins, so we serve the
-    // HTML through the local server at /api/report-html.
-    el.innerHTML = `<div style="text-align:center;padding:40px 20px;">
-        <a href="/api/report-html" target="_blank" class="btn"
-           style="display:inline-block;text-decoration:none;font-size:16px;padding:18px 40px;">
-          Open HTML Report
-        </a>
+    // SUCCESS: blank page, "Scan complete" headline, two big buttons. All
+    // diagnostics collapsed behind small Details disclosure.
+    el.innerHTML = `<div style="text-align:center;padding:80px 20px 20px;">
+        <h1 style="font-size:28px;font-weight:700;margin-bottom:32px;">Scan complete</h1>
+        <div style="display:flex;gap:16px;justify-content:center;flex-wrap:wrap;">
+          <a href="/api/report-html" target="_blank" class="btn"
+             style="text-decoration:none;font-size:15px;padding:18px 36px;">
+            Open HTML Report
+          </a>
+          <button type="button" class="btn btn-secondary" onclick="openSessionFolder()"
+             style="font-size:15px;padding:18px 36px;">
+            Open Session Folder
+          </button>
+        </div>
       </div>
-      <details style="margin-top:18px;">
-        <summary style="cursor:pointer;color:var(--muted);font-size:12px;">Details / extras</summary>
+      <details style="margin-top:48px;max-width:700px;margin-left:auto;margin-right:auto;">
+        <summary style="cursor:pointer;color:var(--muted);font-size:11px;text-align:center;">Details &amp; logs</summary>
         <div style="margin-top:12px;font-size:12px;">
           <p>Report path: <code style="font-family:var(--mono);color:var(--info);word-break:break-all;">${escapeHtml(s.ReportPath)}</code></p>
-          <p>${zipBtn}${openFolderBtn}${viewLogBtn}${copyLogsBtn}</p>
+          <p>${zipBtn}${viewLogBtn}${copyLogsBtn}</p>
           ${missingHtml}
           <div id="genLogBox"></div>
         </div>
       </details>`;
-    document.getElementById('reportSub').textContent = '';
   } else {
-    // FAILURE: minimal warning + a single "Retry Report Generation" button.
-    // Diagnostic info collapsed behind a disclosure.
-    el.innerHTML = `<div style="text-align:center;padding:40px 20px;">
-        <p style="color:var(--warn);font-size:14px;margin-bottom:18px;">
-          Report not generated.
-        </p>
-        <button type="button" class="btn" onclick="retryReportGen(this)" style="font-size:14px;padding:14px 32px;">
-          Retry Report Generation
-        </button>
+    // FAILURE: blank page, warning + retry button. Diagnostics collapsed.
+    el.innerHTML = `<div style="text-align:center;padding:80px 20px 20px;">
+        <h1 style="font-size:28px;font-weight:700;margin-bottom:12px;color:var(--warn);">Scan complete (no report)</h1>
+        <p style="color:var(--muted);font-size:13px;margin-bottom:32px;">The discovery scans finished but the HTML report failed to generate.</p>
+        <div style="display:flex;gap:16px;justify-content:center;flex-wrap:wrap;">
+          <button type="button" class="btn" onclick="retryReportGen(this)"
+             style="font-size:15px;padding:18px 36px;">
+            Retry Report Generation
+          </button>
+          <button type="button" class="btn btn-secondary" onclick="openSessionFolder()"
+             style="font-size:15px;padding:18px 36px;">
+            Open Session Folder
+          </button>
+        </div>
       </div>
-      <details style="margin-top:18px;">
-        <summary style="cursor:pointer;color:var(--muted);font-size:12px;">Diagnostics</summary>
+      <details style="margin-top:48px;max-width:700px;margin-left:auto;margin-right:auto;">
+        <summary style="cursor:pointer;color:var(--muted);font-size:11px;text-align:center;">Diagnostics</summary>
         <div style="margin-top:12px;font-size:12px;">
           <p style="color:var(--muted);">Session dir: <code style="font-family:var(--mono);">${escapeHtml(sessionDir)}</code></p>
-          <p>${openFolderBtn}${viewLogBtn}${copyLogsBtn}</p>
+          <p>${viewLogBtn}${copyLogsBtn}</p>
           ${missingHtml}
           <div id="genLogBox"></div>
         </div>
       </details>`;
-    document.getElementById('reportSub').textContent = '';
   }
 }
 
