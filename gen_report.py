@@ -1,1043 +1,2415 @@
-"""SDT HTML report generator (v4.2 design).
-
-Top nav: Overview / Servers / Hypervisor / Active Directory / SQL /
-         Private Cloud Sizing / Commvault Sizing / EOL Risks
-
-Servers view uses a left sidebar nav (searchable) with the full per-server
-detail rendered in the right pane.
-
-Usage:
-    python gen_report.py <manifest.json>
-    python gen_report.py <session_dir>           # also accepted
-
-The output HTML is written to the session directory as
-`<Client>-DiscoveryReport-<date>.html` and the path is printed to stdout.
 """
-import sys, json
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
-from _report_lib import load_session, detect_security, env_rollup, filtered_flags, h
+gen_report.py - Magna5 Server Discovery Report Generator
+Usage: python gen_report.py <manifest.json>
+Produces a single HTML file matching the MEKE gold-standard design.
+"""
+import json, html as htmlmod, sys, io, os, re, datetime, urllib.request, urllib.error
 
-def render(session):
-    servers = session['servers']
-    env = env_rollup(servers)
-    client = session['client']
-    vc = session.get('vcenter') or {}
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-    # ----- vCenter / hypervisor stats -----
-    vc_html = ''
-    if vc:
-        cluster = vc.get('Cluster') or {}
-        hosts = vc.get('ESXHosts') or []
-        if not isinstance(hosts, list): hosts = []
-        vms = vc.get('VMs') or []
-        if not isinstance(vms, list): vms = []
-        ds_list = vc.get('Datastores') or []
-        if not isinstance(ds_list, list): ds_list = []
-        vms_on = [v for v in vms if isinstance(v, dict) and str(v.get('PowerState','')).lower() in ('poweredon','on')]
-        total_vcpu_on = sum(int(v.get('vCPUs') or 0) for v in vms_on)
-        total_ram_on  = sum(float(v.get('RAMgb') or 0) for v in vms_on)
-        total_disk_consumed = sum(float(v.get('DiskConsumedGB') or 0) for v in vms_on)
-        total_disk_prov = sum(float(v.get('DiskCapGB') or 0) for v in vms_on)
-        host_cores = sum(int(h0.get('Cores') or 0) for h0 in hosts if isinstance(h0,dict))
-        host_ram   = sum(float(h0.get('RAMgb') or 0) for h0 in hosts if isinstance(h0,dict))
-        host_rows = ''.join(
-            f'<tr><td>{h(ho.get("Name",""))}</td><td>{h(ho.get("Vendor",""))} {h(ho.get("Model",""))}</td>'
-            f'<td>{h(ho.get("ServiceTag",""))}</td><td>{ho.get("Cores","?")}c</td>'
-            f'<td>{ho.get("RAMgb","?")} GB</td><td>{ho.get("CPUUsagePct","?")}%</td>'
-            f'<td>{ho.get("MemUsagePct","?")}%</td></tr>'
-            for ho in hosts if isinstance(ho, dict)
-        )
-        ds_rows = ''.join(
-            f'<tr><td>{h(ds.get("Name",""))}</td><td>{h(ds.get("Type",""))}</td>'
-            f'<td>{ds.get("CapacityGB","?"):,} GB</td><td>{ds.get("FreeGB","?"):,} GB</td>'
-            f'<td><div class="bar"><div style="width:{min(100,float(ds.get("UsedPct") or 0))}%;'
-            f'background:{"#ef4444" if (ds.get("UsedPct") or 0)>=85 else "#22c55e"}"></div></div> {ds.get("UsedPct","?")}%</td></tr>'
-            for ds in ds_list if isinstance(ds, dict)
-        )
-        cluster_cap_gib = (cluster.get('CapacityMiB') or 0) / 1024
-        cluster_used_gib = (cluster.get('ConsumedMiB') or 0) / 1024
-        cluster_pct = (cluster_used_gib / cluster_cap_gib * 100) if cluster_cap_gib else 0
-        vc_html = f'''
-<h3>vCenter / Hypervisor <a class="jump" onclick="setViewByName('servers')">View VMs &rsaquo;</a></h3>
-<div class="hgrid">
-  <div class="hcell">
-    <h4>vCenter</h4>
-    <div class="stat-row"><b>Server:</b> <code>{h(vc.get("Server",""))}</code></div>
-    <div class="stat-row"><b>Version:</b> {h(vc.get("Version",""))}</div>
-    <div class="stat-row"><b>Cluster:</b> {h(cluster.get("Name",""))} ({cluster.get("NumHosts","?")} hosts)</div>
-    <div class="stat-row"><b>Perf window:</b> {vc.get("DurationDays","?")} days</div>
-  </div>
-  <div class="hcell">
-    <h4>Cluster Capacity</h4>
-    <div class="stat"><span class="snum">{cluster_cap_gib/1024:.1f}</span><span class="slbl">TiB total</span></div>
-    <div class="stat"><span class="snum">{cluster_used_gib/1024:.1f}</span><span class="slbl">TiB used</span></div>
-    <div class="stat"><span class="snum">{cluster_pct:.0f}%</span><span class="slbl">utilization</span></div>
-  </div>
-  <div class="hcell">
-    <h4>VMs (from vCenter)</h4>
-    <div class="stat"><span class="snum">{len(vms_on)}</span><span class="slbl">powered on (of {len(vms)})</span></div>
-    <div class="stat"><span class="snum">{total_vcpu_on}</span><span class="slbl">vCPU allocated</span></div>
-    <div class="stat"><span class="snum">{total_ram_on:.0f}</span><span class="slbl">GB RAM allocated</span></div>
-    <div class="stat"><span class="snum">{total_disk_consumed:,.0f} / {total_disk_prov:,.0f}</span><span class="slbl">GB disk used / provisioned</span></div>
-  </div>
-</div>
-<h4>ESX Hosts ({len(hosts)}{' of ' + str(cluster.get('NumHosts')) + ' in cluster' if cluster.get('NumHosts') and len(hosts) < int(cluster.get('NumHosts') or 0) else ''})</h4>
-<table class="t"><thead><tr><th>Host</th><th>Model</th><th>Service Tag</th><th>CPU</th><th>RAM</th><th>CPU Use</th><th>Mem Use</th></tr></thead><tbody>{host_rows or "<tr><td colspan=7 class=dim>No host detail.</td></tr>"}</tbody></table>
-<h4>Datastores ({len(ds_list)})</h4>
-<table class="t"><thead><tr><th>Name</th><th>Type</th><th>Capacity</th><th>Free</th><th>Used</th></tr></thead><tbody>{ds_rows}</tbody></table>
-'''
+# -- DETECTION RULES -----------------------------------------------------------
+# Loaded from detection_rules.json alongside this script.
+# Per-session override: place a detection_rules.json in the session folder -
+# its entries are appended to the global rules (additive, not replacing).
 
-    # ----- WinRM sizing rollup (guest-side data) -----
-    total_cores_guest = sum(int(s.get('cores') or 0) for s in servers)
-    total_ram_guest = sum(float(s.get('ram_gb') or 0) for s in servers)
-    total_disk_used = 0.0
-    total_disk_total = 0.0
-    for s in servers:
-        for d in s.get('disks',[]):
-            if isinstance(d, dict):
-                total_disk_used += float(d.get('TotalGB') or 0) - float(d.get('FreeGB') or 0)
-                total_disk_total += float(d.get('TotalGB') or 0)
+def _load_rules():
+    def _read(path):
+        try:
+            with open(path, encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
-    # ----- Security posture % + Detected tools breakdown -----
-    have_edr = have_rmm = have_backup = have_remote = 0
-    edr_products = {}   # product -> [server names]
-    rmm_products = {}
-    backup_products = {}
-    remote_products = {}
-    for s in servers:
-        sec = detect_security(s)
-        if sec.get('edr'): have_edr += 1
-        if sec.get('rmm'): have_rmm += 1
-        if sec.get('backup'): have_backup += 1
-        if sec.get('remote'): have_remote += 1
-        for p in sec.get('edr', []):    edr_products.setdefault(p, []).append(s['name'])
-        for p in sec.get('rmm', []):    rmm_products.setdefault(p, []).append(s['name'])
-        for p in sec.get('backup', []): backup_products.setdefault(p, []).append(s['name'])
-        for p in sec.get('remote', []): remote_products.setdefault(p, []).append(s['name'])
-    pct = lambda n: int(round(n*100/env['total'])) if env['total'] else 0
+    def _merge(base, over):
+        result = {}
+        for k in set(list(base.keys()) + list(over.keys())):
+            bv, ov = base.get(k, []), over.get(k, [])
+            if isinstance(bv, list) and isinstance(ov, list):
+                result[k] = bv + [x for x in ov if x not in bv]
+            elif isinstance(bv, dict) and isinstance(ov, dict):
+                result[k] = _merge(bv, ov)
+            else:
+                result[k] = ov if ov else bv
+        return result
 
-    def _tool_rows(products):
-        if not products: return '<tr><td colspan=2 class=dim>None detected</td></tr>'
-        return ''.join(
-            f'<tr><td><b>{h(p)}</b></td><td>{len(servers_with)} - {h(", ".join(servers_with[:4]))}{"..." if len(servers_with)>4 else ""}</td></tr>'
-            for p, servers_with in sorted(products.items(), key=lambda x:-len(x[1]))
-        )
-    tools_html = f'''
-<div class="tools-grid">
-  <div><h5>EDR / Endpoint Protection</h5><table class="t"><tbody>{_tool_rows(edr_products)}</tbody></table></div>
-  <div><h5>RMM</h5><table class="t"><tbody>{_tool_rows(rmm_products)}</tbody></table></div>
-  <div><h5>Backup Agent</h5><table class="t"><tbody>{_tool_rows(backup_products)}</tbody></table></div>
-  <div><h5>Remote Access</h5><table class="t"><tbody>{_tool_rows(remote_products)}</tbody></table></div>
-</div>'''
+    script_dir  = os.path.dirname(os.path.abspath(__file__))
+    global_path = os.path.join(script_dir, 'detection_rules.json')
+    rules = _read(global_path)
 
-    # ----- OS / platform tables -----
-    os_rows = ''.join(f'<tr><td>{h(k) or "<i>unknown</i>"}</td><td>{v}</td></tr>'
-                      for k,v in sorted(env['os_counts'].items(), key=lambda x:-x[1]))
-    plat_rows = ''.join(f'<tr><td>{h(k)}</td><td>{v}</td></tr>' for k,v in env['by_platform'].items())
+    # Per-session override (session folder = manifest directory)
+    if 'manifest_dir' in globals():
+        session_path = os.path.join(manifest_dir, 'detection_rules.json')
+        if os.path.exists(session_path):
+            rules = _merge(rules, _read(session_path))
 
-    # ----- AD rollup (dedupe by domain so we don't double-count multiple DCs) -----
-    ad_by_domain = {}  # domain -> {users, comps, ous, dcs, server_with_data}
-    for s in servers:
-        a = s.get('ad')
-        if not isinstance(a, dict) or not a.get('Installed'): continue
-        dom = a.get('DomainName')
-        if not dom: continue
-        if dom not in ad_by_domain or (s['name'] not in ad_by_domain[dom]['servers']):
-            ad_by_domain.setdefault(dom, {
-                'users': a.get('UserCount') or 0,
-                'computers': a.get('ComputerCount') or 0,
-                'ous': a.get('OUCount') or 0,
-                'dcs': a.get('DCCount') or 0,
-                'forest': a.get('ForestName'),
-                'domain_fl': a.get('DomainFL'),
-                'forest_fl': a.get('ForestFL'),
-                'pdc': a.get('PDCEmulator'),
-                'rid': a.get('RIDMaster'),
-                'schema': a.get('SchemaMaster'),
-                'stale_users': len(a.get('StaleUsers') or []) if isinstance(a.get('StaleUsers'), list) else (a.get('StaleUsers') or 0),
-                'stale_comps': len(a.get('StaleComputers') or []) if isinstance(a.get('StaleComputers'), list) else (a.get('StaleComputers') or 0),
-                'servers': [s['name']],
-                'raw': a,  # keep the richest one for AD tab detail
-            })
+    return rules
+
+RULES = _load_rules()
+
+# -- LIFECYCLE LOOKUP ----------------------------------------------------------
+# Fetches EOL dates from endoflife.date API (community-maintained, no auth).
+# Falls back to detection_rules.json lifecycle section if offline.
+# Returns dict: major.minor -> {'eol': 'YYYY-MM-DD', 'status': 'EOL'|''}
+
+_LIFECYCLE_CACHE = {}
+
+def get_lifecycle(product):
+    """Return {major_minor: {'eol': date_str, 'status': str}} for a product."""
+    global _LIFECYCLE_CACHE
+    if product in _LIFECYCLE_CACHE:
+        return _LIFECYCLE_CACHE[product]
+
+    result = {}
+
+    # Primary: endoflife.date public API
+    try:
+        url = f'https://endoflife.date/api/{product}.json'
+        req = urllib.request.Request(url, headers={'User-Agent': 'SDT-Report/3.0'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.load(r)
+        for entry in data:
+            cycle = str(entry.get('cycle', ''))
+            eol   = entry.get('eol', '')
+            # eol can be bool (False = supported) or a date string
+            if eol is False or eol == 'false':
+                eol_str, status = '', ''
+            elif eol is True or eol == 'true':
+                eol_str, status = '', 'EOL'
+            else:
+                eol_str = str(eol)
+                try:
+                    eol_dt = datetime.date.fromisoformat(eol_str[:10])
+                    status = 'EOL' if eol_dt <= datetime.date.today() else ''
+                except Exception:
+                    status = ''
+            result[cycle] = {'eol': eol_str, 'status': status}
+    except Exception:
+        # Fallback: detection_rules.json lifecycle section
+        lifecycle = RULES.get('lifecycle', {}).get(product, {})
+        result = lifecycle
+
+    _LIFECYCLE_CACHE[product] = result
+    return result
+
+
+def get_product_eol(product, version_str):
+    """Given a product and version string, return (eol_date, status, source)."""
+    lc = get_lifecycle(product)
+    if not lc:
+        return '', '', 'unavailable'
+
+    version_str = str(version_str or '')
+    # Try progressively shorter version matches: 7.0.3 -> 7.0 -> 7
+    parts = version_str.split('.')
+    for depth in range(len(parts), 0, -1):
+        key = '.'.join(parts[:depth])
+        if key in lc:
+            entry = lc[key]
+            return entry.get('eol', ''), entry.get('status', ''), 'endoflife.date'
+
+    return '', '', 'no-match'
+
+if len(sys.argv) < 2:
+    print("Usage: python gen_report.py <manifest.json>")
+    sys.exit(1)
+
+manifest_path = os.path.abspath(sys.argv[1])
+manifest_dir  = os.path.dirname(manifest_path)
+
+with open(manifest_path, encoding='utf-8-sig') as f:
+    CFG = json.load(f)
+
+def resolve(p):
+    if not p: return p
+    if os.path.isabs(p): return p
+    return os.path.normpath(os.path.join(manifest_dir, p))
+
+CLIENT       = CFG['client']
+CLIENT_FULL  = CFG.get('client_full', CLIENT)
+DATE         = CFG['date']
+SESSION_DIR  = resolve(CFG['session_dir'])
+OUTPUT_DIR   = resolve(CFG.get('output_dir', CFG['session_dir']))
+OUTPUT       = os.path.join(OUTPUT_DIR, f"{CLIENT}-DiscoveryReport-{DATE}.html")
+LOGO_FILE    = resolve(CFG.get('logo_file', ''))
+
+# -- LOAD DATA -----------------------------------------------------------------
+def jload(path):
+    with open(path, encoding='utf-8-sig') as f:
+        return json.load(f)
+
+_inv_file = CFG.get('inventory_file', '') or ''
+inv = jload(os.path.join(SESSION_DIR, _inv_file)) if _inv_file else {}
+
+# Auto-load all non-empty HV inventory files from the session directory
+hv_inventories = []
+for _fname in sorted(os.listdir(SESSION_DIR)):
+    if 'inventory' not in _fname.lower() or not _fname.endswith('.json'): continue
+    _fpath = os.path.join(SESSION_DIR, _fname)
+    if os.path.getsize(_fpath) < 100: continue
+    try:
+        _hinv = jload(_fpath)
+        if _hinv.get('_type') in ('HyperVInventory', 'vSphereInventory'):
+            hv_inventories.append(_hinv)
+    except Exception:
+        pass
+
+servers = []
+for s in CFG.get('servers', []):
+    if s.get('os_type') == 'linux':
+        # Linux entry - may have SSH JSON or be a placeholder
+        data = jload(os.path.join(SESSION_DIR, s['file'])) if s.get('file') else {}
+        servers.append({**s, 'data': data})
+    else:
+        path = os.path.join(SESSION_DIR, s['file'])
+        data = jload(path)
+        servers.append({**s, 'data': data})
+
+LOGO_B64 = ''
+if LOGO_FILE and os.path.exists(LOGO_FILE):
+    with open(LOGO_FILE) as f:
+        LOGO_B64 = f.read().strip()
+
+# -- HELPERS -------------------------------------------------------------------
+def h(s):
+    return htmlmod.escape(str(s)) if s is not None else ''
+
+def as_list(v):
+    if isinstance(v, dict): return [v]
+    if isinstance(v, list):
+        result = []
+        for item in v:
+            if isinstance(item, dict):  result.append(item)
+            elif isinstance(item, list): result.extend(x for x in item if isinstance(x, dict))
+        return result
+    return []
+
+def pill(text, color):
+    return f'<span class="pill pill-{color}">{h(str(text))}</span>'
+
+def flag_div(sev, title, detail):
+    return (f'<div class="flag-{sev}">'
+            f'<div class="flag-label">{h(title)}</div>'
+            f'<div class="flag-detail">{h(detail)}</div></div>\n')
+
+def disk_bar(pct):
+    c = '#d63638' if pct >= 85 else ('#f5a623' if pct >= 70 else '#20c800')
+    return (f'<div class="disk-bar-bg"><div class="disk-bar-fill" '
+            f'style="width:{min(pct,100)}%;background:{c}"></div></div>')
+
+def card(cid, title, body_html, collapsed=False):
+    btn = '&#9660; Expand' if collapsed else '&#9650; Collapse'
+    bc  = 'card-body collapsed' if collapsed else 'card-body'
+    return (f'<div class="card hide-sbr" id="{cid}">\n'
+            f'<div class="card-title"><span>{title}</span>'
+            f'<button class="collapse-btn" onclick="toggleCard(this)">{btn}</button></div>\n'
+            f'<div class="{bc}">\n{body_html}\n</div>\n</div>\n')
+
+def sub(t, style=''):
+    s = f' style="{style}"' if style else ''
+    return f'<div class="sub-title"{s}>{t}</div>\n'
+
+def top_link(tid):
+    return (f'<div style="text-align:right;margin-top:10px;">'
+            f'<a href="#top-{tid}" style="color:#5b1fa4;font-size:8.5pt;'
+            f'text-decoration:none;font-weight:600;">&#8593; Top</a></div>\n')
+
+def mini_box(title, content, last=False):
+    mb = '0' if last else '14px'
+    return (f'<div style="background:#f5f4f8;border-radius:8px;padding:14px 16px;margin-bottom:{mb};">'
+            f'<div style="font-size:8.5pt;font-weight:700;text-transform:uppercase;letter-spacing:.5px;'
+            f'color:#5b1fa4;border-bottom:1.5px solid #ede9fe;padding-bottom:6px;margin-bottom:12px;">'
+            f'{title}</div>{content}</div>\n')
+
+def stor_row(drv, lbl, total, free, pct):
+    c  = '#d63638' if pct >= 85 else ('#f5a623' if pct >= 70 else '#20c800')
+    pc = 'red' if pct >= 85 else ('yellow' if pct >= 70 else 'green')
+    lbl_part = f' &mdash; {h(lbl)}' if lbl else ''
+    return (f'<tr style="padding:6px 0">'
+            f'<td style="font-weight:700;white-space:nowrap">{h(drv)}{lbl_part}</td>'
+            f'<td style="font-size:8.5pt;color:#6b6080">{total:.0f} GB total</td>'
+            f'<td><span class="pill pill-{pc}">{pct}%</span></td>'
+            f'<td style="min-width:100px"><div class="disk-bar-bg"><div class="disk-bar-fill" '
+            f'style="width:{min(pct,100)}%;background:{c}"></div></div></td>'
+            f'<td style="font-size:8.5pt;color:#6b6080">{free:.0f} GB free</td></tr>\n')
+
+def sbr_grad(crit, warn):
+    if crit: return 'linear-gradient(135deg,#d63638,#b92b2e)'
+    if warn: return 'linear-gradient(135deg,#f5a623,#e0901a)'
+    return 'linear-gradient(135deg,#20c800,#158f00)'
+
+def sbr_badge(crit, warn):
+    if crit: return '&#128308; CRITICAL'
+    if warn: return '&#9888;&#65039; ATTENTION'
+    return '&#9989; HEALTHY'
+
+def tab_cls(crit, warn):
+    if crit: return ' has-critical'
+    if warn: return ' has-warning'
+    return ''
+
+def nav_link(anchor, label):
+    return (f'<a href="#{anchor}" style="color:#5b1fa4;font-size:9pt;text-decoration:none;'
+            f'font-weight:600;padding:4px 12px;border-radius:4px;background:#ede9fe;'
+            f'border:1px solid #c4b5fd;">{label}</a>\n')
+
+def unwrap_ad(raw):
+    if isinstance(raw, dict): return raw
+    if isinstance(raw, list):
+        return next((x for x in raw if isinstance(x, dict) and 'Installed' in x), {})
+    return {}
+
+def extract_forwarders(raw):
+    if isinstance(raw, list):
+        return ', '.join(x.get('IPAddressToString', '') for x in raw
+                         if isinstance(x, dict) and x.get('IPAddressToString'))
+    if isinstance(raw, str) and raw.strip(): return raw
+    return ''
+
+# -- FSMO CROSS-REFERENCE ------------------------------------------------------
+def _norm_host(fqdn):
+    return fqdn.split('.')[0].upper() if fqdn else ''
+
+FSMO_FIELDS = ('PDCEmulator', 'RIDMaster', 'InfrastructureMaster', 'SchemaMaster', 'DomainNamingMaster')
+FSMO_HOLDERS = set()
+for _s in servers:
+    _ad = unwrap_ad(_s['data'].get('AD', {}))
+    if isinstance(_ad, dict):
+        for _f in FSMO_FIELDS:
+            _v = _ad.get(_f, '')
+            if _v: FSMO_HOLDERS.add(_norm_host(_v))
+
+# -- ROLE LABEL DERIVATION -----------------------------------------------------
+def derive_role_label(srv):
+    data  = srv['data']
+    name  = srv['name'].upper()
+    roles = data.get('Roles', {})
+    ad    = unwrap_ad(data.get('AD', {}))
+    exch  = data.get('Exchange', {})
+    sql   = data.get('SQL', {})
+    sw    = data.get('FileShares', {})
+
+    if isinstance(exch, list): exch = next((x for x in exch if isinstance(x, dict) and x.get('Installed')), {})
+    role_list  = as_list(roles.get('InstalledRoles', []))
+    role_names = {r.get('Name', '') for r in role_list}
+    has_adds  = 'AD-Domain-Services' in role_names
+    has_dhcp  = 'DHCP' in role_names
+    has_nps   = 'NPAS' in role_names
+    has_print = 'Print-Services' in role_names
+    has_iis   = 'Web-Server' in role_names
+    has_hv    = 'Hyper-V' in role_names
+    sl = as_list(sw.get('Shares', [])) if isinstance(sw, dict) else []
+    real = [s for s in sl if isinstance(s, dict)
+            and not s.get('Name','').startswith('$')
+            and s.get('Name','') not in ('ADMIN$','IPC$','C$','print$','NETLOGON','SYSVOL','address')
+            and not (s.get('Path','') or '').endswith('LocalsplOnly')]
+    exch_ok = isinstance(exch, dict) and exch.get('Installed')
+    sql_inst = {}
+    if isinstance(sql, dict): sql_inst = sql.get('Instances', {})
+    elif isinstance(sql, list):
+        _sq = next((x for x in sql if isinstance(x, dict)), {})
+        sql_inst = _sq.get('Instances', {}) if _sq else {}
+    has_sql = isinstance(sql_inst, dict) and bool(sql_inst.get('Edition', ''))
+
+    if exch_ok: return 'Exchange Server'
+    if has_adds:
+        mods = []
+        if name in FSMO_HOLDERS: mods.append('FSMO')
+        if has_dhcp:             mods.append('DHCP')
+        if has_nps:              mods.append('NPS')
+        return 'Domain Controller' + (f' ({", ".join(mods)})' if mods else '')
+    parts = []
+    if real and has_print: parts.append('File & Print Server')
+    elif real:             parts.append('File Server')
+    elif has_print:        parts.append('Print Server')
+    if has_sql:            parts.append('SQL Server')
+    if has_iis and not parts: parts.append('Web Server')
+    if has_hv:             parts.append('Hyper-V Host')
+    return ' · '.join(parts) if parts else 'Windows Server'
+
+# -- FLAG DERIVATION -----------------------------------------------------------
+def build_flags(srv):
+    data  = srv['data']
+    name  = srv['name']
+    flags = []
+    sys_  = data.get('System', {})
+    hw    = data.get('Hardware', {})
+    roles = data.get('Roles', {})
+    ad    = unwrap_ad(data.get('AD', {}))
+    exch  = data.get('Exchange', {})
+    sql   = data.get('SQL', {})
+    if isinstance(exch, list): exch = next((x for x in exch if isinstance(x, dict) and x.get('Installed')), {})
+    if isinstance(sql, list):  sql  = next((x for x in sql if isinstance(x, dict)), {})
+
+    feat_names = [f.get('Name','') for f in as_list(roles.get('InstalledFeatures', []))]
+    has_smb1   = any('FS-SMB1' in n for n in feat_names)
+    eol_status = sys_.get('OSEOLStatus', sys_.get('EOLStatus', ''))
+    eol_date   = sys_.get('OSEOLDate',   sys_.get('EOLDate', ''))
+    os_name    = sys_.get('OSName', '')
+
+    if eol_status in ('EOL', 'Near EOL') or 'Server 2016' in os_name or 'Server 2008' in os_name:
+        sev = 'critical' if eol_status == 'EOL' or 'Server 2008' in os_name else 'warning'
+        flags.append((sev, 'Windows Server EOL - Upgrade Required',
+            f'{os_name} - support ends {eol_date or "Oct 12, 2027 (WS2016)"}. '
+            f'No security patches after end-of-support. Upgrade to Windows Server 2022.'))
+
+    for d in as_list(data.get('Disks', [])):
+        pct = d.get('UsedPct', 0); drv = d.get('Drive', '?')
+        free = d.get('FreeGB', 0); total = d.get('TotalGB', 0)
+        if pct >= 85:
+            flags.append(('critical', f'Disk {drv} Near Capacity',
+                f'{name} {drv}: {pct}% used - only {free:.1f} GB free of {total:.1f} GB. Risk of service disruption.'))
+        elif pct >= 70:
+            flags.append(('warning', f'Disk {drv} Space Moderate',
+                f'{name} {drv}: {pct}% used ({free:.1f} GB free of {total:.1f} GB). Monitor closely.'))
+
+    if has_smb1:
+        flags.append(('critical', 'SMB 1.0/CIFS Enabled - Critical Security Risk',
+            f'{name}: SMB 1.0 is the attack vector for WannaCry/NotPetya/EternalBlue ransomware. '
+            f'Disable: Remove-WindowsFeature FS-SMB1'))
+
+    ram_t = hw.get('RAMTotalGB', 0); ram_f = hw.get('RAMAvailGB', 0)
+    if ram_t > 0 and (1 - ram_f / ram_t) > 0.80:
+        pct = int((1 - ram_f / ram_t) * 100)
+        flags.append(('warning', f'High Memory Utilization ({pct}%)',
+            f'{name}: {pct}% RAM used ({ram_f:.1f} GB free of {ram_t:.1f} GB).'))
+
+    up = float(sys_.get('UptimeDays', 0) or 0)
+    if up > 90:
+        flags.append(('warning', f'Extended Uptime - {up:.0f} Days',
+            f'{name} has not been rebooted in {up:.0f} days. Pending updates may not be applied.'))
+
+    if isinstance(exch, dict) and exch.get('Installed'):
+        exch_eol = exch.get('EOLStatus', '')
+        if exch_eol in ('EOL', 'Near EOL'):
+            sev = 'critical' if exch_eol == 'EOL' else 'warning'
+            flags.append((sev, f'Exchange {exch.get("VersionName","")} - {exch_eol}',
+                f'{name}: reached end of support on {exch.get("EOLDate","")}. No security patches available.'))
+
+    sql_inst = sql.get('Instances', {}) if isinstance(sql, dict) else {}
+    if isinstance(sql_inst, dict) and sql_inst.get('Edition') and sql_inst.get('EOLStatus') == 'EOL':
+        flags.append(('critical', f'{sql_inst.get("Edition","")} - EOL and WS2022 Incompatible',
+            f'{name}: {sql_inst.get("Edition","")} (instance: {sql_inst.get("InstanceName","")}) EOL {sql_inst.get("EOLDate","")}. '
+            f'NOT supported on Windows Server 2022. Must upgrade SQL to 2017+ before OS upgrade.'))
+
+    return flags
+
+# -- SERVICE CATEGORIZATION ----------------------------------------------------
+_SK       = RULES.get('service_keywords', {})
+_EDR_SVC  = tuple(_SK.get('edr',    []))
+_PAM_SVC  = tuple(_SK.get('pam',    []))
+_RMM_SVC  = tuple(_SK.get('rmm',    []))
+_HV_SVC   = tuple(_SK.get('hyperv', []))
+_PRINT_SVC = tuple(_SK.get('print', []))
+_CORE_SVC = tuple(_SK.get('core',   []))
+
+def categorize_svcs(svc_l):
+    cats = {'EDR': [], 'PAM': [], 'RMM': [], 'HyperV': [], 'Core': [], 'Print': [],
+            'Other': [], 'StoppedAuto': []}
+    for svc in svc_l:
+        if not isinstance(svc, dict): continue
+        n = (svc.get('Name', '') + ' ' + svc.get('DisplayName', '')).lower()
+        state = svc.get('State', '')
+        mode  = svc.get('StartMode', '')
+        if state in ('Stopped', 'Stop') and mode in ('Auto', 'Automatic'):
+            cats['StoppedAuto'].append(svc)
+        if state != 'Running': continue
+        if   any(k in n for k in _EDR_SVC):   cats['EDR'].append(svc)
+        elif any(k in n for k in _PAM_SVC):   cats['PAM'].append(svc)
+        elif any(k in n for k in _RMM_SVC):   cats['RMM'].append(svc)
+        elif any(k in n for k in _HV_SVC):    cats['HyperV'].append(svc)
+        elif any(k in n for k in _PRINT_SVC): cats['Print'].append(svc)
+        elif any(k in n for k in _CORE_SVC):  cats['Core'].append(svc)
+        else:                                  cats['Other'].append(svc)
+    return cats
+
+def categorize_apps(app_l):
+    cats = {'Security': [], 'Management': [], 'LOB': [], 'Browser': [], 'Other': []}
+    skip_nm = ('microsoft visual c++', 'microsoft .net', 'windows sdk',
+               'microsoft update health', 'update for windows', 'security update for')
+    for app in app_l:
+        if not isinstance(app, dict): continue
+        nm  = (app.get('Name') or '').lower()
+        pub = (app.get('Publisher') or '').lower()
+        if any(s in nm for s in skip_nm): continue
+        if pub == 'microsoft corporation' and not any(k in nm for k in ('edge', 'defender', 'dynamics', 'business central')): continue
+        combined = nm + ' ' + pub
+        _ak = RULES.get('app_keywords', {})
+        if any(k in combined for k in _ak.get('security', [])):
+            cats['Security'].append(app)
+        elif any(k in combined for k in _ak.get('management', [])):
+            cats['Management'].append(app)
         else:
-            ad_by_domain[dom]['servers'].append(s['name'])
-    ad_domains = set(ad_by_domain.keys())
-    ad_total_users = sum(v['users'] for v in ad_by_domain.values())
-    ad_total_comps = sum(v['computers'] for v in ad_by_domain.values())
-    ad_total_ous = sum(v['ous'] for v in ad_by_domain.values())
+            lob_match = next(((k, v) for k, v in _ak.get('lob', []) if k in combined), None)
+            if lob_match:
+                cats['LOB'].append({**app, '_lob_label': lob_match[1]})
+            elif any(k in combined for k in _ak.get('browser', [])):
+                cats['Browser'].append(app)
+            else:
+                cats['Other'].append(app)
+    return cats
 
-    # ----- Top servers by criticality (top 8) -----
-    crit_list = []
-    for s in servers:
-        ff = filtered_flags(s)
-        c = sum(1 for f in ff if str(f.get('Severity','')).lower() in ('red','critical'))
-        w = sum(1 for f in ff if str(f.get('Severity','')).lower() in ('warn','warning'))
-        crit_list.append((c*10+w, c, w, s))
-    crit_list.sort(key=lambda x: x[0], reverse=True)
-    top_rows = ''.join(
-        f'<tr onclick="jumpToServer(\'{h(s["id"])}\')"><td><b>{h(s["name"])}</b></td>'
-        f'<td>{h(s["os"].replace("Microsoft Windows ",""))}</td>'
-        f'<td>{f"<span class=cnt crit>{c}</span>" if c else "0"}</td>'
-        f'<td>{f"<span class=cnt warn>{w}</span>" if w else "0"}</td></tr>'
-        for _,c,w,s in crit_list[:8]
+def detect_security(app_l, svc_l):
+    all_n = [((a.get('Name') or '') + ' ' + (a.get('Publisher') or '')).lower() for a in app_l]
+    all_s = [((s.get('DisplayName') or '') + ' ' + (s.get('Name') or '')).lower() for s in svc_l]
+    combined = all_n + all_s
+    edr = rmm = pam = bdr = rmt = None
+
+    _sp = RULES.get('security_products', {})
+
+    def _first_match(category):
+        for entry in _sp.get(category, []):
+            k, v = entry[0], entry[1]
+            if any(k in n for n in combined):
+                return v
+        return None
+
+    edr = _first_match('edr')
+    rmm = _first_match('rmm')
+    pam = _first_match('pam')
+    rmt = _first_match('remote_access')
+    bdr = _first_match('backup')
+
+    return edr, rmm, pam, bdr, rmt
+
+_SUSPICIOUS_PATH_FRAGS = tuple(RULES.get('suspicious_paths', [
+    'c:\\users\\', '\\appdata\\', 'c:\\windows\\temp\\',
+    'c:\\temp\\', 'c:\\tmp\\', 'c:\\programdata\\temp\\',
+    '$recycle.bin', '\\recycler\\'
+]))
+
+_BUILTIN_ACCT_PREFIXES = (
+    'localsystem', 'local system', 'nt authority\\', 'nt service\\',
+    'localservice', 'local service', 'networkservice', 'network service',
+)
+
+def find_svc_anomalies(svc_l):
+    """Flag services in suspicious locations or running as custom domain accounts."""
+    out = []
+    for svc in svc_l:
+        if not isinstance(svc, dict): continue
+        if svc.get('State', '') != 'Running': continue
+        path = (svc.get('Path', '') or '').strip().lower().lstrip('"')
+        acct = (svc.get('StartName', '') or '').strip().lower()
+
+        reason = None
+        if path and any(frag in path for frag in _SUSPICIOUS_PATH_FRAGS):
+            reason = f'Executable in suspicious location: {svc.get("Path","")[:120]}'
+        elif acct and '\\' in acct and not any(acct.startswith(p) for p in _BUILTIN_ACCT_PREFIXES):
+            reason = f'Custom domain account as service identity: {svc.get("StartName","")}'
+
+        if reason:
+            out.append({**svc, '_reason': reason})
+    return out
+
+# -- BUILD PER-SERVER TAB ------------------------------------------------------
+def build_linux_tab(srv):
+    name   = srv.get('name', '') or 'unknown-linux'
+    sid    = srv.get('id') or re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-') or 'linux'
+    ip     = srv.get('ip', '')
+    guest  = srv.get('guest_os', 'Linux')
+    in_sc  = srv.get('in_scope', True)
+    data   = srv['data']
+    has_data = bool(data and data.get('_type') == 'LinuxDiscovery')
+
+    # Teal/dark-green colour palette for Linux tabs
+    HDR   = '#0f4c5c'
+    HDR2  = '#1a7a8a'
+    TEAL  = '#0d9488'
+    LTEAL = '#ccfbf1'
+    DTEAL = '#134e4a'
+
+    def lcard(title, body, collapsed=False):
+        cid = f'{sid}-{re.sub(r"[^a-z0-9]","",title.lower())}'
+        btn = f'<button class="collapse-btn" onclick="toggleCard(\'{cid}\')">' + ('▲ Collapse' if not collapsed else '▼ Expand') + '</button>'
+        state = ' collapsed' if collapsed else ''
+        return (f'<div class="card" style="border-color:#a7f3d0;">\n'
+                f'<div class="card-title" style="color:{DTEAL};border-bottom-color:{TEAL};">{h(title)}{btn}</div>\n'
+                f'<div class="card-body{state}" id="{cid}">{body}</div></div>\n')
+
+    def disk_bar(pct):
+        col = '#d63638' if pct >= 85 else '#f5a623' if pct >= 70 else TEAL
+        return (f'<div class="disk-bar-bg"><div class="disk-bar-fill" '
+                f'style="width:{min(pct,100)}%;background:{col};"></div></div>')
+
+    scope_pill = f'<span class="pill pill-green">IN SCOPE</span>' if in_sc else f'<span class="pill pill-gray">OUT OF SCOPE</span>'
+
+    # -- HEADER BANNER ---------------------------------------------------------
+    if has_data:
+        os_pretty = data.get('OS', {}).get('PrettyName', guest)
+        kernel    = data.get('OS', {}).get('Kernel', '')
+        arch      = data.get('OS', {}).get('Architecture', '')
+        cores     = data.get('CPU', {}).get('Cores', '?')
+        cpu_model = data.get('CPU', {}).get('ModelName', '')
+        mem_total = data.get('Memory', {}).get('TotalMB', 0)
+        mem_used  = data.get('Memory', {}).get('UsedMB', 0)
+        mem_free  = data.get('Memory', {}).get('FreeMB', 0)
+        mem_pct   = int(mem_used / mem_total * 100) if mem_total else 0
+        hostname  = data.get('Hostname', name)
+        collected = data.get('CollectedAt', '')
+        disks     = data.get('Disks', []) or []
+        network   = data.get('Network', []) or []
+        services  = data.get('Services', []) or []
+        os_line   = h(os_pretty)
+        meta_line = ' · '.join(filter(None, [h(kernel), h(arch)]))
+    else:
+        os_pretty = guest; hostname = name; cores = '?'
+        mem_total = mem_used = mem_free = mem_pct = 0
+        cpu_model = kernel = arch = collected = ''
+        disks = network = services = []
+        os_line = h(guest); meta_line = 'SSH discovery not collected'
+
+    header = (f'<div style="background:linear-gradient(135deg,{HDR},{HDR2});border-radius:10px 10px 0 0;'
+              f'padding:16px 24px;margin-bottom:0;">'
+              f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+              f'<div>'
+              f'<div style="font-size:18px;font-weight:700;color:#fff;">{h(hostname)} '
+              f'<span style="font-size:10pt;font-weight:400;color:rgba(255,255,255,.65);">({h(ip)})</span></div>'
+              f'<div style="font-size:9pt;color:rgba(255,255,255,.8);margin-top:4px;">{os_line}</div>'
+              f'<div style="font-size:8pt;color:rgba(255,255,255,.55);margin-top:2px;">{meta_line}</div>'
+              f'</div>'
+              f'<div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">'
+              f'{scope_pill}'
+              f'<span style="background:rgba(255,255,255,.15);color:#fff;font-size:8pt;padding:3px 10px;'
+              f'border-radius:12px;font-weight:600;">🐧 Linux / Non-Windows</span>'
+              f'</div></div></div>\n')
+
+    # -- NO DATA PLACEHOLDER ----------------------------------------------------
+    if not has_data:
+        placeholder = (f'<div style="text-align:center;padding:48px 24px;color:#6b6080;">'
+                       f'<div style="font-size:28px;margin-bottom:12px;">🐧</div>'
+                       f'<div style="font-size:13pt;font-weight:700;color:{DTEAL};margin-bottom:8px;">'
+                       f'SSH Discovery Not Collected</div>'
+                       f'<div style="font-size:9.5pt;">This box was identified as Linux/non-Windows.<br>'
+                       f'Re-run discovery and choose <strong>Y</strong> at the Linux SSH prompt to collect data.</div>'
+                       f'<div style="margin-top:16px;font-size:8.5pt;color:#9ca3af;">'
+                       f'Guest OS reported by hypervisor: {h(guest)}</div>'
+                       f'</div>')
+        tab_html = f'<div id="top-{sid}">\n{header}{placeholder}</div>\n'
+        return {'id': sid, 'name': name, 'crit': 0, 'warn': 0, 'in_scope': in_sc, 'tab_html': tab_html}
+
+    # -- SYSTEM OVERVIEW --------------------------------------------------------
+    ram_gb   = round(mem_total / 1024, 1) if mem_total else '?'
+    ram_used = round(mem_used  / 1024, 1) if mem_used  else '?'
+    stats = (f'<div class="stat-grid" style="grid-template-columns:repeat(3,1fr);">'
+             f'<div class="stat-box"><div class="stat-num" style="color:{TEAL};">{cores}</div>'
+             f'<div class="stat-lbl">CPU Cores</div></div>'
+             f'<div class="stat-box"><div class="stat-num" style="color:{TEAL};">{ram_gb}</div>'
+             f'<div class="stat-lbl">RAM (GB)</div></div>'
+             f'<div class="stat-box"><div class="stat-num" style="color:{TEAL};">{mem_pct}%</div>'
+             f'<div class="stat-lbl">RAM Used</div></div></div>')
+    meta_rows = [('Hostname', hostname), ('IP', ip), ('OS', os_pretty),
+                 ('Kernel', kernel), ('Architecture', arch),
+                 ('CPU Model', cpu_model), ('Collected', collected)]
+    meta_tbl = '<table>' + ''.join(
+        f'<tr><td style="font-weight:600;width:130px;color:{DTEAL}">{h(k)}</td>'
+        f'<td>{h(v)}</td></tr>'
+        for k, v in meta_rows if v) + '</table>'
+    overview_body = stats + meta_tbl
+    overview_card = lcard('System Overview', overview_body)
+
+    # -- DISKS ------------------------------------------------------------------
+    disks_body = ''
+    if disks:
+        disks_body = ('<table><tr><th>Mount</th><th>Source</th><th>Size</th>'
+                      '<th>Used</th><th>Free</th><th style="min-width:120px">Usage</th></tr>\n')
+        for i, d in enumerate(disks):
+            if not isinstance(d, dict): continue
+            pct = d.get('UsePct', 0)
+            bg  = 'background:#f5f4f8;' if i % 2 else ''
+            disks_body += (f'<tr style="{bg}"><td style="font-family:monospace">{h(d.get("Mount",""))}</td>'
+                           f'<td style="font-size:8.5pt;color:#6b6080">{h(d.get("Source",""))}</td>'
+                           f'<td>{h(d.get("Size",""))}</td><td>{h(d.get("Used",""))}</td>'
+                           f'<td>{h(d.get("Free",""))}</td>'
+                           f'<td>{disk_bar(pct)}<span style="font-size:8pt;color:#6b6080">{pct}%</span></td></tr>\n')
+        disks_body += '</table>'
+    else:
+        disks_body = '<div style="color:#9ca3af;font-style:italic">No disk data collected.</div>'
+    disks_card = lcard('Disk Storage', disks_body)
+
+    # -- NETWORK ----------------------------------------------------------------
+    net_body = ''
+    if network:
+        net_body = '<table><tr><th>Interface</th><th>Addresses</th></tr>\n'
+        for i, a in enumerate(network):
+            if not isinstance(a, dict): continue
+            bg  = 'background:#f5f4f8;' if i % 2 else ''
+            addrs = ', '.join(a.get('Addresses') or [])
+            net_body += (f'<tr style="{bg}"><td style="font-family:monospace;font-weight:600">'
+                         f'{h(a.get("Interface",""))}</td><td>{h(addrs)}</td></tr>\n')
+        net_body += '</table>'
+    else:
+        net_body = '<div style="color:#9ca3af;font-style:italic">No network data collected.</div>'
+    net_card = lcard('Network', net_body)
+
+    # -- SERVICES --------------------------------------------------------------
+    svc_body = ''
+    if services:
+        svc_body = ('<div style="display:flex;flex-wrap:wrap;gap:6px;">' +
+                    ''.join(f'<span style="background:{LTEAL};color:{DTEAL};border-radius:4px;'
+                            f'padding:3px 10px;font-size:8.5pt;font-weight:600;">{h(s.get("Name","") if isinstance(s,dict) else s)}</span>'
+                            for s in services[:60]) + '</div>')
+        if len(services) > 60:
+            svc_body += f'<div style="font-size:8pt;color:#9ca3af;margin-top:8px;">+ {len(services)-60} more</div>'
+    else:
+        svc_body = '<div style="color:#9ca3af;font-style:italic">No service data collected.</div>'
+    svc_card = lcard('Running Services', svc_body, collapsed=len(services) > 20)
+
+    body = f'<div style="padding:0 16px 16px;">\n{overview_card}{disks_card}{net_card}{svc_card}</div>\n'
+    tab_html = f'<div id="top-{sid}">\n{header}{body}</div>\n'
+    return {'id': sid, 'name': name, 'crit': 0, 'warn': 0, 'in_scope': in_sc, 'tab_html': tab_html}
+
+
+def build_server_tab(srv):
+    data    = srv['data']
+    name    = srv.get('name', '') or 'unknown'
+    # Self-heal: manifest entries built by the GUI's recovery path don't always
+    # populate 'id'. Derive a stable lowercase slug from the name when missing.
+    sid     = srv.get('id') or re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-') or 'server'
+    _rl     = srv.get('role_label', '')
+    rlabel  = _rl if (_rl and _rl.lower() != name.lower()) else derive_role_label(srv)
+    in_sc   = srv.get('in_scope', True)
+    flags   = build_flags(srv)
+    crit    = sum(1 for f in flags if f[0] == 'critical')
+    warn    = sum(1 for f in flags if f[0] == 'warning')
+
+    sys_  = data.get('System', {})
+    hw    = data.get('Hardware', {})
+    net   = data.get('Network', {})
+    roles_d = data.get('Roles', {})
+    ad    = unwrap_ad(data.get('AD', {}))
+    dns   = data.get('DNS', {})
+    dhcp  = data.get('DHCP', {})
+    nps   = data.get('NPS', {})
+    exch  = data.get('Exchange', {})
+    sql   = data.get('SQL', {})
+    sw    = data.get('FileShares', {})
+    apps  = data.get('Apps', [])
+    svcs  = data.get('Services', [])
+    meta  = data.get('Meta', {})
+
+    if isinstance(exch, list): exch = next((x for x in exch if isinstance(x, dict) and x.get('Installed')), {})
+    if isinstance(sql, list):  sql  = next((x for x in sql if isinstance(x, dict)), {})
+    sql_inst = sql.get('Instances', {}) if isinstance(sql, dict) else {}
+
+    # System
+    os_name    = sys_.get('OSName', '').replace('Microsoft ', '')
+    os_build   = str(sys_.get('OSBuild', ''))
+    last_boot  = sys_.get('LastBoot', sys_.get('LastBootTime', ''))
+    eol_date   = sys_.get('OSEOLDate', sys_.get('EOLDate', ''))
+    eol_status = sys_.get('OSEOLStatus', sys_.get('EOLStatus', ''))
+    domain     = (sys_.get('Domain', '') or
+                  (ad.get('DomainName', '') if isinstance(ad, dict) else '') or
+                  (ad.get('ForestName', '') if isinstance(ad, dict) else ''))
+    hostname   = sys_.get('Hostname', name)
+    install_dt = sys_.get('OSInstallDate', '')
+    ps_ver     = sys_.get('PSVersion', '')
+    run_as     = sys_.get('RunAsUser', '')
+    up         = float(sys_.get('UptimeDays', 0) or 0)
+    collected  = meta.get('CollectedAt', '')
+
+    # Hardware
+    ram_t   = float(hw.get('RAMTotalGB', 0) or 0)
+    ram_f   = float(hw.get('RAMAvailGB', 0) or 0)
+    ram_pct = int((1 - ram_f / ram_t) * 100) if ram_t else 0
+    cpu_c   = hw.get('CPUCores', '?')
+    cpu_n   = hw.get('CPUName', '')
+    vm_plat = hw.get('VMPlatform', '')
+    is_vm   = hw.get('IsVM', True)
+    mfr     = hw.get('Manufacturer', '')
+    model   = hw.get('Model', '')
+    serial  = hw.get('SerialNumber', '')
+    bios_v  = hw.get('BIOSVersion', '')
+    bios_d  = hw.get('BIOSDate', '')
+    board   = hw.get('BoardProduct', '')
+
+    # Network
+    adapters   = net.get('Adapters', {})
+    est_conns  = as_list(net.get('EstablishedConns', []))
+    listen_raw = as_list(net.get('ListeningPorts', []))
+    listen_ports = [x for x in listen_raw if isinstance(x, dict)]
+    if not listen_ports:
+        listen_ports = [x for x in est_conns if isinstance(x, dict) and x.get('State') == 'LISTENING']
+
+    # Primary IP from adapters
+    if isinstance(adapters, dict):
+        ip_str = adapters.get('IPAddresses', adapters.get('IP', ''))
+        ip     = ip_str.split(',')[0].strip() if ip_str else ''
+        gw     = adapters.get('Gateway', '')
+        dns_ip = adapters.get('DNS', '')
+        mac    = adapters.get('MAC', '')
+    else:
+        ip = gw = dns_ip = mac = ''
+        for a in as_list(adapters):
+            if not isinstance(a, dict): continue
+            s = a.get('IPAddresses', a.get('IP', ''))
+            if s: ip = s.split(',')[0].strip()
+            if a.get('Gateway'): gw = a['Gateway']
+            if a.get('DNS'):     dns_ip = a['DNS']
+            if a.get('MAC'):     mac = a['MAC']
+            break
+
+    # Roles
+    role_list    = as_list(roles_d.get('InstalledRoles', []))
+    feature_list = as_list(roles_d.get('InstalledFeatures', []))
+    role_names_raw = {r.get('Name', '') for r in role_list}
+    role_display   = {r.get('Name', ''): r.get('DisplayName', r.get('Name', '')) for r in role_list}
+    feat_names     = [f.get('Name', '') for f in feature_list]
+    has_smb1  = any('FS-SMB1' in n for n in feat_names)
+    has_adds  = 'AD-Domain-Services' in role_names_raw or (isinstance(ad, dict) and ad.get('Installed'))
+    has_dhcp  = 'DHCP' in role_names_raw or (isinstance(dhcp, dict) and dhcp.get('Installed'))
+    has_dns   = 'DNS' in role_names_raw or (isinstance(dns, dict) and dns.get('Installed'))
+    has_nps   = 'NPAS' in role_names_raw or (isinstance(nps, dict) and nps.get('Installed'))
+    has_print = 'Print-Services' in role_names_raw
+    has_hv    = 'Hyper-V' in role_names_raw
+    has_files = 'FileAndStorage-Services' in role_names_raw
+
+    # Shares
+    sl = as_list(sw.get('Shares', [])) if isinstance(sw, dict) else []
+    real_shares = [s for s in sl if isinstance(s, dict)
+                   and not s.get('Name','').startswith('$')
+                   and s.get('Name','') not in ('ADMIN$','IPC$','C$','print$','NETLOGON','SYSVOL','address')
+                   and not (s.get('Path','') or '').endswith('LocalsplOnly')]
+
+    disks    = as_list(data.get('Disks', []))
+    svc_list = as_list(svcs)
+    app_list = as_list(apps)
+
+    svc_cats      = categorize_svcs(svc_list)
+    app_cats      = categorize_apps(app_list)
+    svc_anomalies = find_svc_anomalies(svc_list)
+    edr, rmm, pam, bdr, rmt = detect_security(app_list, svc_list)
+
+    running_count     = sum(len(v) for k, v in svc_cats.items() if k != 'StoppedAuto')
+    stopped_auto_cnt  = len(svc_cats['StoppedAuto'])
+    scope_pill        = pill("IN SCOPE", "green") if in_sc else pill("OUT OF SCOPE", "gray")
+
+    # OS short labels
+    os_yr = (re.search(r'20\d\d', os_name) or type('', (), {'group': lambda s,n: ''})()).group(0)
+    os_short     = f'WS{os_yr[2:]}' if os_yr else os_name[:8]
+    os_eol_str   = ('Supported to 2031' if '2022' in os_name else
+                    'Supported to 2029' if '2019' in os_name else
+                    'EOL Oct 2027'      if '2016' in os_name else eol_status or 'Check EOL')
+    os_eol_color = 'green' if '2022' in os_name or '2019' in os_name else 'yellow'
+
+    # Last boot age
+    boot_pill = ''
+    if last_boot:
+        try:
+            bd = datetime.datetime.strptime(last_boot[:10], '%Y-%m-%d')
+            da = (datetime.datetime.now() - bd).days
+            bclr = 'yellow' if da > 90 else 'green'
+            note = ' &mdash; reboot recommended' if da > 90 else ''
+            boot_pill = f' &nbsp;<span class="pill pill-{bclr}">{da} days ago{note}</span>'
+        except: pass
+
+    # -- SMB1 BANNER ----------------------------------------------------------
+    smb1_banner = ''
+    if has_smb1:
+        smb1_banner = (
+            '<div style="background:#fff0f0;border:1.5px solid #d63638;border-radius:8px;'
+            'padding:12px 16px;margin-bottom:16px;display:flex;align-items:flex-start;gap:12px;">'
+            '<span style="font-size:18px;flex-shrink:0">&#9940;</span>'
+            '<div><div style="font-size:9.5pt;font-weight:700;color:#d63638;">SMB 1.0/CIFS ENABLED - Critical Security Risk</div>'
+            '<div style="font-size:9pt;color:#7f2424;margin-top:3px;">SMB 1.0 is the attack vector for WannaCry, NotPetya, and EternalBlue ransomware. '
+            'Disable: <code>Remove-WindowsFeature FS-SMB1</code></div></div></div>\n')
+
+    # -- SECURITY MINI-BOX (SBR) ----------------------------------------------
+    def sec_row(icon, lbl, detail, status, sclr):
+        bmap = {'green':'#20c800','yellow':'#f5a623','red':'#d63638','purple':'#5b1fa4','gray':'#9ca3af'}
+        bgmap = {'green':'#f0fdf0','yellow':'#fff8e1','red':'#fff0f0','purple':'#f0f4ff','gray':'#f3f4f6'}
+        fgmap = {'green':'#065f46','yellow':'#92400e','red':'#991b1b','purple':'#5b1fa4','gray':'#374151'}
+        return (f'<div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #f0edf8;">'
+                f'<span style="font-size:14px;flex-shrink:0">{icon}</span>'
+                f'<div style="flex:1"><div style="font-size:9pt;font-weight:600;color:#271e41">{lbl}</div>'
+                f'<div style="font-size:8pt;color:#6b6080">{detail}</div></div>'
+                f'<span style="background:{bgmap.get(sclr,"#f3f4f6")};color:{fgmap.get(sclr,"#374151")};'
+                f'font-size:7.5pt;font-weight:700;padding:2px 8px;border-radius:10px;'
+                f'border:1px solid {bmap.get(sclr,"#9ca3af")};white-space:nowrap">{status}</span></div>\n')
+
+    sec_rows  = sec_row('&#128737;', 'EDR / Endpoint',
+                        edr or 'No data collected - verify agent present',
+                        'PROTECTED' if edr else 'NOT DETECTED', 'green' if edr else 'yellow')
+    sec_rows += sec_row('&#128295;', 'RMM / Management',
+                        rmm or 'No data collected - verify agent present',
+                        'DETECTED' if rmm else 'NOT DETECTED', 'green' if rmm else 'yellow')
+    if pam:
+        sec_rows += sec_row('&#128273;', 'Privileged Access (PAM)', pam, 'ACTIVE', 'purple')
+    sec_rows += sec_row('&#128190;', 'Backup / BDR',
+                        bdr or 'Not detected - verify with client',
+                        'DETECTED' if bdr else 'NOT DETECTED', 'green' if bdr else 'yellow')
+    if has_smb1:
+        sec_rows += sec_row('&#9940;', 'SMB 1.0 Protocol',
+                            'ENABLED - ransomware attack vector (disable immediately)',
+                            'CRITICAL', 'red')
+    security_mini = mini_box('Security &amp; Protection', sec_rows)
+
+    # -- OS & SYSTEM MINI-BOX (SBR left) --------------------------------------
+    plat_disp = vm_plat if vm_plat else ('Physical' if not is_vm else 'VM')
+    os_sys_rows = (
+        f'<tr><td style="color:#6b6080;width:110px;padding:3px 0">Platform</td>'
+        f'<td>{h(plat_disp)}{(" VM on " + h(vm_plat)) if is_vm and vm_plat else ""}</td></tr>'
+        f'<tr><td style="color:#6b6080;padding:3px 0">OS</td>'
+        f'<td>{h(os_name)} <span class="pill pill-{os_eol_color}">{h(os_eol_str)}</span></td></tr>'
+        f'<tr><td style="color:#6b6080;padding:3px 0">Last Reboot</td>'
+        f'<td>{h(last_boot[:10] if last_boot else "")}{boot_pill}</td></tr>'
+        f'<tr><td style="color:#6b6080;padding:3px 0">RAM</td>'
+        f'<td>{ram_t:.1f} GB total &nbsp;'
+        f'<span class="pill pill-{"yellow" if ram_pct > 75 else "green"}">'
+        f'{ram_f:.1f} GB free ({100-ram_pct}%)</span></td></tr>'
+        f'<tr><td style="color:#6b6080;padding:3px 0">Deployed</td>'
+        f'<td>{h(install_dt[:10] if install_dt else "")}</td></tr>'
     )
+    os_sys_mini = mini_box('OS &amp; System',
+        f'<table style="width:100%;font-size:9pt;border-collapse:collapse;">{os_sys_rows}</table>')
 
-    # ----- Top SQL DBs by size -----
-    all_dbs = []
-    for s in servers:
-        inst = s['sql'].get('Instances') if isinstance(s['sql'], dict) else None
-        if not (isinstance(inst, dict) and inst.get('InstanceName')): continue
-        dbs = inst.get('Databases', []) or []
-        if not isinstance(dbs, list): dbs = []
-        for db in dbs:
-            if isinstance(db, dict):
-                all_dbs.append((db.get('DataSizeMB') or 0, s['name'], db.get('Name',''), db.get('RecoveryModel','')))
-    all_dbs.sort(reverse=True)
-    sql_top_rows = ''.join(
-        f'<tr><td>{h(srv)}</td><td>{h(db)}</td><td>{sz:,} MB</td><td>{h(rec)}</td></tr>'
-        for sz,srv,db,rec in all_dbs[:8]
+    # -- AD MINI-BOX (SBR left, DCs only) -------------------------------------
+    ad_sbr_mini = ''
+    if has_adds and isinstance(ad, dict) and ad.get('Installed'):
+        fl_raw = str(ad.get('DomainFL', ad.get('ForestFL', '')))
+        fl_yr  = (re.search(r'20\d\d', fl_raw) or type('', (), {'group': lambda s,n: fl_raw})()).group(0) if fl_raw else ''
+        fl_lbl = f'Windows Server {fl_yr}' if fl_yr else fl_raw
+        _stale_raw = ad.get('StaleUsers', '')
+        stale_u = len(_stale_raw) if isinstance(_stale_raw, list) else (int(_stale_raw) if str(_stale_raw).isdigit() else 0)
+        # FSMORoles from list (actual data) - count as DC indicator
+        fsmo_list_sbr = ad.get('FSMORoles', [])
+        if not isinstance(fsmo_list_sbr, list): fsmo_list_sbr = []
+        fsmo_count = len(fsmo_list_sbr)
+        ad_rows = (
+            f'<tr><td style="color:#6b6080;width:130px;padding:3px 0">Domain</td><td>{h(domain)}</td></tr>'
+            + (f'<tr><td style="color:#6b6080;padding:3px 0">FSMO Roles</td>'
+               f'<td><span class="pill pill-purple">{fsmo_count} role(s) on this DC</span></td></tr>'
+               if fsmo_count else '')
+            + f'<tr><td style="color:#6b6080;padding:3px 0">Functional Level</td>'
+            f'<td>{h(fl_lbl)}'
+            + ('&nbsp;<span class="pill pill-yellow">upgrade recommended</span>' if fl_yr and fl_yr < '2019' else '')
+            + '</td></tr>'
+        )
+        if stale_u:
+            ad_rows += (f'<tr><td style="color:#6b6080;padding:3px 0">Stale Users</td>'
+                       f'<td><span class="pill pill-yellow">~{stale_u} accounts (90+ days inactive)</span></td></tr>')
+        ad_sbr_mini = mini_box('Active Directory',
+            f'<table style="width:100%;font-size:9pt;border-collapse:collapse;">{ad_rows}</table>')
+
+    # -- STORAGE MINI-BOX (SBR left) -------------------------------------------
+    disk_rows_s = ''.join(
+        stor_row(d.get('Drive','?'), d.get('Label','') or '', d.get('TotalGB',0),
+                 d.get('FreeGB',0), d.get('UsedPct',0))
+        for d in disks)
+    storage_mini = mini_box('Storage',
+        '<table style="width:100%;border-collapse:collapse;">'
+        '<tr><th style="text-align:left;font-size:8pt;padding:4px 0;color:#6b6080;font-weight:600">Drive</th>'
+        '<th style="font-size:8pt;padding:4px 0;color:#6b6080;font-weight:600"></th>'
+        '<th style="font-size:8pt;padding:4px 0;color:#6b6080;font-weight:600">Used</th>'
+        '<th style="min-width:100px"></th>'
+        '<th style="font-size:8pt;padding:4px 0;color:#6b6080;font-weight:600">Free</th></tr>'
+        + disk_rows_s + '</table>')
+
+    # -- SECURITY MINI-BOX (SBR left) -----------------------------------------
+    def _sec_pill(val, missing_warn=True):
+        if val:
+            return f'<span class="pill pill-green">{h(val)}</span>'
+        return f'<span class="pill pill-yellow">&#9888; None detected</span>' if missing_warn else '<span class="pill pill-gray">&mdash;</span>'
+
+    sec_left_rows = (
+        f'<tr><td style="color:#6b6080;width:90px;padding:4px 0;font-size:8.5pt;">&#128737;&#65039; EDR</td>'
+        f'<td style="padding:4px 0">{_sec_pill(edr, missing_warn=True)}</td></tr>'
+        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">&#9881;&#65039; RMM</td>'
+        f'<td style="padding:4px 0">{_sec_pill(rmm, missing_warn=True)}</td></tr>'
+        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">&#128279; Remote</td>'
+        f'<td style="padding:4px 0">{_sec_pill(rmt, missing_warn=False)}</td></tr>'
+        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">&#128190; Backup</td>'
+        f'<td style="padding:4px 0">{_sec_pill(bdr, missing_warn=False)}</td></tr>'
+        f'<tr><td style="color:#6b6080;padding:4px 0;font-size:8.5pt;">&#128273; PAM</td>'
+        f'<td style="padding:4px 0">{_sec_pill(pam, missing_warn=False)}</td></tr>'
     )
+    sec_left_mini = mini_box('Security &amp; Protection',
+        f'<table style="width:100%;font-size:9pt;border-collapse:collapse;">{sec_left_rows}</table>',
+        last=True)
 
-    # ----- Findings (env-wide) -----
-    findings_blocks = []
-    if env.get('eol_at_risk'):
-        findings_blocks.append(f'<div class="f-row crit" onclick="setViewByName(\'eol\')"><b>OS EOL/at-risk &rsaquo;</b><div>{", ".join(env["eol_at_risk"])}</div></div>')
-    if env.get('no_edr'):
-        p = pct(len(env["no_edr"]))
-        findings_blocks.append(f'<div class="f-row warn"><b>No 3rd-party EDR ({p}%)</b><div>{len(env["no_edr"])}/{env["total"]} on Defender baseline only</div></div>')
-    if env.get('high_disk'):
-        findings_blocks.append(f'<div class="f-row warn"><b>Disk &gt;85%</b><div>{", ".join(env["high_disk"])}</div></div>')
-    if env.get('sql_servers'):
-        findings_blocks.append(f'<div class="f-row info" onclick="setViewByName(\'sql\')"><b>SQL Server present ({len(env["sql_servers"])}) &rsaquo;</b><div>{", ".join(env["sql_servers"])}</div></div>')
-    if env.get('has_smb1'):
-        findings_blocks.append(f'<div class="f-row info"><b>SMB 1.0 enabled (env-wide)</b><div>{len(env["has_smb1"])}/{env["total"]} — rolled up, not per-server spam</div></div>')
-    if env.get('has_veeam'):
-        findings_blocks.append(f'<div class="f-row info"><b>Veeam detected</b><div>{", ".join(env["has_veeam"])}</div></div>')
+    # -- ROLES MINI-BOX (SBR right) --------------------------------------------
+    role_bdg = ''.join(f'<span class="role-badge">{h(role_display.get(r,r))}</span>'
+                       for r in sorted(role_names_raw) if r)
+    single_point_warn = ''
+    if has_adds and has_dhcp and has_dns:
+        single_point_warn = (f'<div style="margin-top:10px;font-size:8.5pt;color:#92400e;'
+                            f'background:#fff8e1;border-radius:6px;padding:8px 12px;">&#9888;&#65039; '
+                            f'All critical network services run on a single VM. If {h(name)} fails: '
+                            f'users cannot log in, DNS may not resolve, or DHCP may not assign addresses.</div>')
+    roles_mini = mini_box('Roles Running on This Server',
+        f'<div style="display:flex;flex-wrap:wrap;gap:6px;">{role_bdg}</div>{single_point_warn}')
 
-    overview_html = f'''
-{vc_html}
+    # -- SHARES MINI-BOX (SBR right) -------------------------------------------
+    shares_sbr_mini = ''
+    if real_shares:
+        shr = ''.join(
+            f'<tr><td style="padding:5px 8px;font-weight:600">{h(s.get("Name",""))}</td>'
+            f'<td style="padding:5px 8px;font-family:monospace;font-size:8pt">{h(s.get("Path",""))}</td></tr>'
+            for s in real_shares[:6])
+        shares_sbr_mini = mini_box(f'Network Shares ({len(real_shares)})',
+            '<table style="width:100%;font-size:9pt;border-collapse:collapse;">'
+            '<tr style="background:#ede9fe"><th style="padding:5px 8px;text-align:left;font-size:8pt">Share</th>'
+            '<th style="padding:5px 8px;text-align:left;font-size:8pt">Path</th></tr>'
+            + shr + '</table>', last=True)
+    else:
+        roles_mini = mini_box('Roles Running on This Server',
+            f'<div style="display:flex;flex-wrap:wrap;gap:6px;">{role_bdg}</div>{single_point_warn}',
+            last=True)
 
-<h3>Guest-Side Sizing Rollup (from WinRM) <a class="jump" onclick="setViewByName('servers')">View all servers &rsaquo;</a></h3>
-<div class="hgrid">
-  <div class="hcell"><h4>Compute</h4>
-    <div class="stat"><span class="snum">{env['total']}</span><span class="slbl">discovered servers</span></div>
-    <div class="stat"><span class="snum">{total_cores_guest}</span><span class="slbl">total cores</span></div>
-    <div class="stat"><span class="snum">{total_ram_guest:.0f}</span><span class="slbl">GB RAM total</span></div>
+    # -- SBR BLOCK -------------------------------------------------------------
+    sbr_html = f'''<div class="sbr-only">
+<div style="background:{sbr_grad(crit,warn)};border-radius:10px 10px 0 0;padding:16px 24px;display:flex;justify-content:space-between;align-items:center;">
+  <div>
+    <div style="font-size:18px;font-weight:700;color:#fff;letter-spacing:.3px;">{h(name)}</div>
+    <div style="font-size:9pt;color:rgba(255,255,255,.85);margin-top:3px;">{h(rlabel)} &middot; {h(ip)} &middot; {h(os_name)} &middot; {scope_pill}</div>
   </div>
-  <div class="hcell"><h4>Storage (guest disks)</h4>
-    <div class="stat"><span class="snum">{total_disk_total:,.0f}</span><span class="slbl">GB provisioned</span></div>
-    <div class="stat"><span class="snum">{total_disk_used:,.0f}</span><span class="slbl">GB used</span></div>
-    <div class="stat"><span class="snum">{int(total_disk_used*100/total_disk_total) if total_disk_total else 0}%</span><span class="slbl">utilization</span></div>
-  </div>
-  <div class="hcell"><h4>Active Directory</h4>
-    <div class="stat"><span class="snum">{len(ad_domains)}</span><span class="slbl">domain(s)</span></div>
-    <div class="stat"><span class="snum">{ad_total_users:,}</span><span class="slbl">users (sum)</span></div>
-    <div class="stat"><span class="snum">{ad_total_comps:,}</span><span class="slbl">computers (sum)</span></div>
-    <div class="stat"><span class="snum">{ad_total_ous}</span><span class="slbl">OUs (sum)</span></div>
-  </div>
-</div>
-
-<h3>Security & Management Coverage</h3>
-<div class="hgrid">
-  <div class="hcell">
-    <h4>Coverage %</h4>
-    <div class="stat-row"><b>3rd-party EDR:</b> {have_edr}/{env['total']} ({pct(have_edr)}%)</div>
-    <div class="stat-row"><b>RMM:</b> {have_rmm}/{env['total']} ({pct(have_rmm)}%)</div>
-    <div class="stat-row"><b>Backup agent:</b> {have_backup}/{env['total']} ({pct(have_backup)}%)</div>
-    <div class="stat-row"><b>Remote access:</b> {have_remote}/{env['total']} ({pct(have_remote)}%)</div>
-  </div>
-  <div class="hcell" style="grid-column:span 2;">
-    <h4>OS Breakdown</h4>
-    <table class="t"><tbody>{os_rows}</tbody></table>
-  </div>
-</div>
-
-<h3>Detected Tools in Environment</h3>
-{tools_html}
-
-<h3>Top Servers by Severity <a class="jump" onclick="setViewByName('servers')">All servers &rsaquo;</a></h3>
-<table class="t clickable"><thead><tr><th>Server</th><th>OS</th><th>Critical</th><th>Warning</th></tr></thead><tbody>{top_rows}</tbody></table>
-
-<h3>Top SQL Databases by Size <a class="jump" onclick="setViewByName('sql')">All SQL &rsaquo;</a></h3>
-<table class="t"><thead><tr><th>Server</th><th>Database</th><th>Size</th><th>Recovery</th></tr></thead><tbody>{sql_top_rows or "<tr><td colspan=4 class=dim>No SQL databases.</td></tr>"}</tbody></table>
-
-<h3>Environment-Wide Findings</h3>
-<div class="findings-list">{''.join(findings_blocks) or '<p class="dim">No findings rolled up.</p>'}</div>
-'''
-
-    # =============== SERVERS TAB ==============
-    rail_items = []
-    for s in servers:
-        has_crit = any(str(f.get('Severity','')).lower() in ('red','critical') for f in filtered_flags(s))
-        badge = '<span class="dot crit"></span>' if has_crit else ''
-        rail_items.append(
-            f'<li data-name="{h(s["name"]).lower()}" data-os="{h(s["os"]).lower()}" '
-            f'onclick="showServer(this, \'{h(s["id"])}\')">'
-            f'<div class="rail-name">{badge}{h(s["name"])}</div>'
-            f'<div class="rail-meta">{h(s["os"].replace("Microsoft Windows ",""))}</div></li>'
-        )
-    rail_html = '\n'.join(rail_items)
-
-    panels = []
-    for s in servers:
-        sec = detect_security(s)
-        ff = filtered_flags(s)
-        crit = sum(1 for f in ff if str(f.get('Severity','')).lower() in ('red','critical'))
-        warn = sum(1 for f in ff if str(f.get('Severity','')).lower() in ('warn','warning'))
-
-        # Findings block
-        flag_html = ''
-        if ff:
-            rows = ''.join(
-                f'<tr><td><span class="sev {str(f.get("Severity","info")).lower()}">{h(str(f.get("Severity","info")).upper())}</span></td>'
-                f'<td><b>{h(f.get("Title",""))}</b></td>'
-                f'<td>{h(f.get("Detail",""))}</td></tr>'
-                for f in ff
-            )
-            flag_html = f'<h3>Findings ({len(ff)})</h3><table class="t">{rows}</table>'
-
-        # Disks
-        disk_html = ''.join(
-            f'<tr><td>{h(d.get("Drive",""))}</td><td>{h(d.get("Label",""))}</td>'
-            f'<td>{d.get("TotalGB","")} GB</td><td>{d.get("FreeGB","")} GB</td>'
-            f'<td><div class="bar"><div style="width:{min(100,float(d.get("UsedPct") or 0))}%;'
-            f'background:{"#ef4444" if (d.get("UsedPct") or 0)>=85 else "#22c55e"}"></div></div> {d.get("UsedPct","")}%</td></tr>'
-            for d in s['disks']
-        )
-
-        # Security & Mgmt
-        sec_html = ''
-        for cat, label in [('edr','EDR'),('rmm','RMM'),('backup','Backup'),('remote','Remote Access')]:
-            val = ', '.join(sec.get(cat, [])) or '<i class="dim">none detected</i>'
-            sec_html += f'<div><b>{label}:</b> {val}</div>'
-
-        # Roles & features
-        roles = s.get('roles', [])
-        if not isinstance(roles, list): roles = []
-        role_names = []
-        for r in roles:
-            if isinstance(r, dict):
-                if r.get('Installed') or r.get('InstallState') == 'Installed':
-                    nm = r.get('DisplayName') or r.get('Name') or ''
-                    if nm: role_names.append(nm)
-            elif isinstance(r, str):
-                role_names.append(r)
-        roles_html = ''
-        if role_names:
-            roles_html = f'<h3>Installed Roles & Features ({len(role_names)})</h3>' + \
-                ''.join(f'<span class="chip">{h(rn)}</span>' for rn in role_names[:60])
-
-        # AD (per-server)
-        ad_html = ''
-        adobj = s.get('ad')
-        if isinstance(adobj, dict) and adobj.get('Installed'):
-            su = adobj.get('StaleUsers')
-            sc = adobj.get('StaleComputers')
-            ad_html = f'''<h3>Active Directory: {h(adobj.get("DomainName",""))}</h3>
-<table class="kv">
-  <tr><td>Forest</td><td>{h(adobj.get("ForestName",""))}</td></tr>
-  <tr><td>Domain / Forest FL</td><td>{h(adobj.get("DomainFL",""))} / {h(adobj.get("ForestFL",""))}</td></tr>
-  <tr><td>PDC Emulator</td><td>{h(adobj.get("PDCEmulator",""))}</td></tr>
-  <tr><td>RID Master</td><td>{h(adobj.get("RIDMaster",""))}</td></tr>
-  <tr><td>Schema Master</td><td>{h(adobj.get("SchemaMaster",""))}</td></tr>
-  <tr><td>Users / Computers / OUs</td><td>{adobj.get("UserCount","?")} / {adobj.get("ComputerCount","?")} / {adobj.get("OUCount","?")}</td></tr>
-  <tr><td>Stale users (90+ days)</td><td>{len(su) if isinstance(su, list) else su or 0}</td></tr>
-  <tr><td>Stale computers</td><td>{len(sc) if isinstance(sc, list) else sc or 0}</td></tr>
-</table>
-<p class="dim" style="margin-top:6px;font-size:12px;">Full AD breakdown on the Active Directory tab.</p>'''
-
-        # SQL
-        sql_html = ''
-        sql_inst = s['sql'].get('Instances') if isinstance(s['sql'], dict) else None
-        if isinstance(sql_inst, dict) and sql_inst.get('InstanceName'):
-            dbs = sql_inst.get('Databases', []) or []
-            if not isinstance(dbs, list): dbs = []
-            db_rows = ''.join(
-                f'<tr><td>{h(db.get("Name"))}</td><td>{db.get("DataSizeMB","")} MB</td>'
-                f'<td>{db.get("LogSizeMB","")} MB</td>'
-                f'<td>{h(db.get("RecoveryModel",""))}</td>'
-                f'<td>{db.get("CompatLevel","")}</td>'
-                f'<td>{h(db.get("LastFullBackup",""))}</td></tr>'
-                for db in dbs
-            )
-            sql_html = f'''<h3>SQL Server</h3>
-<p><b>{h(sql_inst.get("InstanceName"))}</b> — {h(sql_inst.get("Edition",""))} {h(sql_inst.get("Version",""))} — EOL {h(sql_inst.get("EOLDate",""))} ({h(sql_inst.get("EOLStatus",""))})</p>
-<p>Service Account: <code>{h(sql_inst.get("ServiceAccount",""))}</code></p>
-<table class="t"><thead><tr><th>Database</th><th>Data</th><th>Log</th><th>Recovery</th><th>Compat</th><th>Last Full</th></tr></thead><tbody>{db_rows}</tbody></table>'''
-
-        # IIS
-        iis_html = ''
-        iis = s.get('iis') or {}
-        if isinstance(iis, dict) and iis.get('Installed'):
-            sites = iis.get('Sites', []) or []
-            if not isinstance(sites, list): sites = []
-            pools = iis.get('AppPools', []) or []
-            if not isinstance(pools, list): pools = []
-            if sites or pools:
-                site_rows = ''.join(
-                    f'<tr><td>{h(x.get("Name"))}</td><td>{h(x.get("State"))}</td><td>{h(x.get("Bindings",""))}</td><td>{h(x.get("PhysicalPath",""))}</td></tr>'
-                    for x in sites if isinstance(x, dict)
-                )
-                pool_rows = ''.join(
-                    f'<tr><td>{h(x.get("Name"))}</td><td>{h(x.get("State"))}</td><td>{h(x.get("ManagedRuntimeVersion",""))}</td></tr>'
-                    for x in pools if isinstance(x, dict)
-                )
-                iis_html = '<h3>IIS</h3>'
-                if site_rows:
-                    iis_html += f'<table class="t"><thead><tr><th>Site</th><th>State</th><th>Bindings</th><th>Path</th></tr></thead><tbody>{site_rows}</tbody></table>'
-                if pool_rows:
-                    iis_html += f'<h4>App Pools</h4><table class="t"><thead><tr><th>Pool</th><th>State</th><th>.NET</th></tr></thead><tbody>{pool_rows}</tbody></table>'
-
-        # Hyper-V VMs
-        hv_html = ''
-        vms = s.get('hyperv_vms', [])
-        if isinstance(vms, list) and vms:
-            vm_rows = ''.join(
-                f'<tr><td>{h(v.get("Name"))}</td><td>{h(v.get("State"))}</td><td>{v.get("vCPU","")}</td>'
-                f'<td>{v.get("RAMgb","")} GB</td><td>{v.get("UptimeHours","")}h</td><td>{v.get("Snapshots","")}</td></tr>'
-                for v in vms if isinstance(v, dict)
-            )
-            hv_html = f'<h3>Hyper-V VMs ({len(vms)})</h3><table class="t"><thead><tr><th>Name</th><th>State</th><th>vCPU</th><th>RAM</th><th>Uptime</th><th>Snaps</th></tr></thead><tbody>{vm_rows}</tbody></table>'
-
-        # Shares
-        share_html = ''
-        if s['shares']:
-            rows = ''.join(
-                f'<tr><td>{h(sh.get("Name"))}</td><td>{h(sh.get("Path"))}</td></tr>'
-                for sh in s['shares'] if isinstance(sh, dict)
-            )
-            if rows:
-                share_html = f'<h3>File Shares ({len(s["shares"])})</h3><table class="t"><thead><tr><th>Share</th><th>Path</th></tr></thead><tbody>{rows}</tbody></table>'
-
-        # Network adapters
-        net_html = ''
-        adapters = s.get('network_adapters', [])
-        if isinstance(adapters, list) and adapters:
-            ad_rows = ''.join(
-                f'<tr><td>{h(a.get("Description") or a.get("Name",""))}</td>'
-                f'<td>{h(a.get("IPv4") or a.get("IPAddress",""))}</td>'
-                f'<td>{h(a.get("MACAddress",""))}</td>'
-                f'<td>{h(a.get("DefaultGateway",""))}</td>'
-                f'<td>{h(a.get("DNSServers",""))}</td></tr>'
-                for a in adapters if isinstance(a, dict)
-            )
-            if ad_rows:
-                net_html = f'<h3>Network</h3><table class="t"><thead><tr><th>Adapter</th><th>IP</th><th>MAC</th><th>Gateway</th><th>DNS</th></tr></thead><tbody>{ad_rows}</tbody></table>'
-
-        # Apps (collapsed)
-        apps_html = ''
-        if s['apps']:
-            app_rows = ''.join(
-                f'<tr><td>{h(a.get("Name",""))}</td><td>{h(a.get("Publisher",""))}</td><td>{h(a.get("Version",""))}</td></tr>'
-                for a in s['apps'] if isinstance(a, dict)
-            )
-            apps_html = f'<details><summary><h3 style="display:inline;">Installed Applications ({len(s["apps"])})</h3></summary><table class="t"><thead><tr><th>Name</th><th>Publisher</th><th>Version</th></tr></thead><tbody>{app_rows}</tbody></table></details>'
-
-        panels.append(f'''
-<div class="panel" id="p-{h(s['id'])}">
-  <div class="phead">
-    <h2>{h(s['name'])}</h2>
-    <div class="meta">{h(s['os'])} — {h(s['platform'])} — {s.get('cores','?')}c / {s.get('ram_gb','?')} GB RAM</div>
-    <div class="badges">
-      {f'<span class="badge crit">{crit} critical</span>' if crit else ''}
-      {f'<span class="badge warn">{warn} warning</span>' if warn else ''}
-      <span class="badge">{len(s['apps'])} apps</span>
-      <span class="badge">{s['services_count']} services</span>
-      <span class="badge">{len(role_names)} roles</span>
+  <div style="display:flex;align-items:center;gap:14px;">
+    <div style="text-align:center;background:rgba(255,255,255,.{25 if crit else 15});border-radius:8px;padding:8px 14px;">
+      <div style="font-size:22px;font-weight:700;color:#fff;">{crit}</div>
+      <div style="font-size:7pt;color:rgba(255,255,255,.8);text-transform:uppercase;font-weight:600;">Critical</div>
     </div>
-  </div>
-  <div class="grid">
-    <div class="cell"><h4>System</h4>
-      <div>Hostname: {h(s['name'])}</div>
-      <div>Domain: {h(s['domain'])}</div>
-      <div>Uptime: {s['uptime_days']} days</div>
-      <div>CPU: {h(s['cpu'])}</div>
-      <div>Hardware: {h(s['mfr'])} {h(s['model'])}</div>
+    <div style="text-align:center;background:rgba(255,255,255,.{25 if warn else 15});border-radius:8px;padding:8px 14px;">
+      <div style="font-size:22px;font-weight:700;color:#fff;">{warn}</div>
+      <div style="font-size:7pt;color:rgba(255,255,255,.8);text-transform:uppercase;font-weight:600;">Warning</div>
     </div>
-    <div class="cell"><h4>Security & Management</h4>{sec_html}</div>
-  </div>
-  {flag_html}
-  <h3>Disks</h3>
-  <table class="t"><thead><tr><th>Drive</th><th>Label</th><th>Total</th><th>Free</th><th>Used</th></tr></thead><tbody>{disk_html}</tbody></table>
-  {net_html}
-  {roles_html}
-  {ad_html}
-  {sql_html}
-  {iis_html}
-  {hv_html}
-  {share_html}
-  {apps_html}
-</div>''')
-
-    # =============== HYPERVISOR TAB ==============
-    hv_tab_html = '<p class="dim">No hypervisor inventory collected.</p>'
-    if vc:
-        cluster = vc.get('Cluster') or {}
-        hosts = vc.get('ESXHosts') or []
-        if not isinstance(hosts, list): hosts = []
-        vms = vc.get('VMs') or []
-        if not isinstance(vms, list): vms = []
-        ds_list = vc.get('Datastores') or []
-        if not isinstance(ds_list, list): ds_list = []
-        lic = vc.get('Licenses') or []
-        if not isinstance(lic, list): lic = []
-
-        host_rows = ''.join(
-            f'<tr><td><b>{h(ho.get("Name",""))}</b></td><td>{h(ho.get("Vendor",""))} {h(ho.get("Model",""))}</td>'
-            f'<td>{h(ho.get("ServiceTag",""))}</td>'
-            f'<td>{h(ho.get("CPUModel",""))}</td>'
-            f'<td>{ho.get("Cores","?")}c</td><td>{ho.get("RAMgb","?")} GB</td>'
-            f'<td>{ho.get("NICs","?")}</td>'
-            f'<td>{ho.get("CPUUsagePct","?")}%</td><td>{ho.get("MemUsagePct","?")}%</td>'
-            f'<td>{h(ho.get("Hypervisor",""))}</td></tr>'
-            for ho in hosts if isinstance(ho, dict)
-        )
-
-        ds_rows = ''.join(
-            f'<tr><td><b>{h(ds.get("Name",""))}</b></td><td>{h(ds.get("Type",""))}</td>'
-            f'<td>{(ds.get("CapacityGB") or 0):,.0f} GB</td>'
-            f'<td>{(ds.get("FreeGB") or 0):,.0f} GB</td>'
-            f'<td>{(ds.get("ConsumedGB") or 0):,.0f} GB</td>'
-            f'<td><div class="bar"><div style="width:{min(100,float(ds.get("UsedPct") or 0))}%;'
-            f'background:{"#ef4444" if (ds.get("UsedPct") or 0)>=85 else "#22c55e"}"></div></div> {ds.get("UsedPct","?")}%</td></tr>'
-            for ds in ds_list if isinstance(ds, dict)
-        )
-
-        # VM table sorted by allocated vCPU desc
-        vms_sorted = sorted([v for v in vms if isinstance(v,dict)], key=lambda v: -(int(v.get('vCPUs') or 0)))
-        vm_rows = ''.join(
-            f'<tr><td><b>{h(v.get("Name",""))}</b></td><td>{h(v.get("PowerState",""))}</td>'
-            f'<td>{v.get("vCPUs","?")}</td><td>{(v.get("RAMgb") or 0):.0f} GB</td>'
-            f'<td>{(v.get("DiskConsumedGB") or 0):,.0f} / {(v.get("DiskCapGB") or 0):,.0f} GB</td>'
-            f'<td>{h(v.get("GuestOS",""))}</td>'
-            f'<td>{h(v.get("Datastore",""))}</td>'
-            f'<td>{h(v.get("ToolStatus",""))}</td></tr>'
-            for v in vms_sorted
-        )
-
-        lic_rows = ''.join(
-            f'<tr><td>{h(l.get("Name",""))}</td><td><code>{h(str(l.get("Key",""))[:24])}</code></td>'
-            f'<td>{l.get("Used","?")}</td><td>{l.get("Total","?")}</td><td>{h(l.get("Expiry",""))}</td></tr>'
-            for l in lic if isinstance(l, dict)
-        )
-
-        cluster_cap_gib = (cluster.get('CapacityMiB') or 0) / 1024
-        cluster_used_gib = (cluster.get('ConsumedMiB') or 0) / 1024
-        hv_tab_html = f'''
-<div class="hgrid">
-  <div class="hcell">
-    <h4>vCenter</h4>
-    <div class="stat-row"><b>Server:</b> <code>{h(vc.get("Server",""))}</code></div>
-    <div class="stat-row"><b>Version:</b> {h(vc.get("Version",""))}</div>
-    <div class="stat-row"><b>API:</b> {h(vc.get("APIVersion",""))}</div>
-    <div class="stat-row"><b>Collected:</b> {h(vc.get("CollectedAt",""))[:10]}</div>
-    <div class="stat-row"><b>Perf window:</b> {vc.get("DurationDays","?")} days</div>
-  </div>
-  <div class="hcell">
-    <h4>Cluster: {h(cluster.get("Name",""))}</h4>
-    <div class="stat-row"><b>Hosts in cluster:</b> {cluster.get("NumHosts","?")} ({len(hosts)} collected)</div>
-    <div class="stat-row"><b>Capacity:</b> {cluster_cap_gib/1024:.1f} TiB</div>
-    <div class="stat-row"><b>Consumed:</b> {cluster_used_gib/1024:.1f} TiB</div>
-    <div class="stat-row"><b>CPU usage (cluster):</b> {cluster.get("CPUUsagePct","?")}%</div>
-    <div class="stat-row"><b>Mem usage (cluster):</b> {cluster.get("MemUsagePct","?")}%</div>
-  </div>
-  <div class="hcell">
-    <h4>Workload Sizing</h4>
-    <div class="stat"><span class="snum">{len([v for v in vms if isinstance(v,dict) and str(v.get("PowerState","")).lower() in ("poweredon","on")])}</span><span class="slbl">VMs powered on</span></div>
-    <div class="stat"><span class="snum">{sum(int(v.get("vCPUs") or 0) for v in vms if isinstance(v,dict) and str(v.get("PowerState","")).lower() in ("poweredon","on"))}</span><span class="slbl">total vCPU allocated</span></div>
-    <div class="stat"><span class="snum">{sum(float(v.get("RAMgb") or 0) for v in vms if isinstance(v,dict) and str(v.get("PowerState","")).lower() in ("poweredon","on")):.0f}</span><span class="slbl">GB RAM allocated</span></div>
+    <span style="background:rgba(255,255,255,.22);color:#fff;font-size:10pt;font-weight:700;padding:6px 18px;border-radius:20px;border:1.5px solid rgba(255,255,255,.5);">{sbr_badge(crit,warn)}</span>
   </div>
 </div>
-
-<h3>ESX Hosts ({len(hosts)} of {cluster.get("NumHosts","?") if cluster.get("NumHosts") else len(hosts)})</h3>
-<table class="t"><thead><tr><th>Host</th><th>Hardware</th><th>Service Tag</th><th>CPU Model</th><th>Cores</th><th>RAM</th><th>NICs</th><th>CPU Use</th><th>Mem Use</th><th>Hypervisor</th></tr></thead><tbody>{host_rows or "<tr><td colspan=10 class=dim>No hosts.</td></tr>"}</tbody></table>
-
-<h3>Datastores ({len(ds_list)})</h3>
-<table class="t"><thead><tr><th>Datastore</th><th>Type</th><th>Capacity</th><th>Free</th><th>Consumed</th><th>Used %</th></tr></thead><tbody>{ds_rows}</tbody></table>
-
-<h3>Licenses</h3>
-<table class="t"><thead><tr><th>Product</th><th>Key (truncated)</th><th>Used</th><th>Total</th><th>Expiry</th></tr></thead><tbody>{lic_rows or "<tr><td colspan=5 class=dim>No license data.</td></tr>"}</tbody></table>
-
-<h3>All VMs ({len(vms)}) <span class="dim">sorted by vCPU allocated</span></h3>
-<table class="t"><thead><tr><th>VM</th><th>Power</th><th>vCPU</th><th>RAM</th><th>Disk (used/prov)</th><th>Guest OS</th><th>Datastore</th><th>VMware Tools</th></tr></thead><tbody>{vm_rows}</tbody></table>
+<div style="background:white;border-radius:0 0 10px 10px;border:1px solid #e8e4f0;border-top:none;box-shadow:0 4px 14px rgba(0,0,0,.07);padding:20px 24px;margin-bottom:16px;">
+{smb1_banner}<div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
+<div>{os_sys_mini}{ad_sbr_mini}{storage_mini}{sec_left_mini}</div>
+<div>{security_mini}{roles_mini}{shares_sbr_mini}</div>
+</div></div></div>
 '''
 
-    # =============== ACTIVE DIRECTORY TAB ==============
-    ad_tab_html = '<p class="dim">No Active Directory data captured (no domain controllers reachable via WinRM).</p>'
-    if ad_by_domain:
-        ad_sections = []
-        for dom, info in ad_by_domain.items():
-            a = info['raw']
-            fsmo = a.get('FSMORoles') or {}
-            if not isinstance(fsmo, dict): fsmo = {}
-            stale_users = a.get('StaleUsers') if isinstance(a.get('StaleUsers'), list) else []
-            stale_comps = a.get('StaleComputers') if isinstance(a.get('StaleComputers'), list) else []
-            su_rows = ''.join(
-                f'<tr><td>{h(u.get("SamAccountName",""))}</td><td>{h(u.get("Name",""))}</td><td>{h(u.get("LastLogon",""))}</td></tr>'
-                for u in stale_users if isinstance(u, dict)
-            )
-            sc_rows = ''.join(
-                f'<tr><td>{h(c.get("SamAccountName",""))}</td><td>{h(c.get("Name",""))}</td><td>{h(c.get("LastLogon",""))}</td></tr>'
-                for c in stale_comps if isinstance(c, dict)
-            )
-            fsmo_rows = ''.join(
-                f'<tr><td>{h(k)}</td><td>{h(v)}</td></tr>'
-                for k,v in fsmo.items() if isinstance(v,str)
-            )
-            fl_warn = 'warn' if '2016' in str(info['domain_fl']) or '2012' in str(info['domain_fl']) else ''
-            ad_sections.append(f'''
-<h3>Domain: {h(dom)}</h3>
-<div class="hgrid">
-  <div class="hcell">
-    <h4>Identity</h4>
-    <div class="stat-row"><b>Forest:</b> {h(info['forest'])}</div>
-    <div class="stat-row"><b>Domain FL:</b> <span class="badge {fl_warn}">{h(info['domain_fl'])}</span></div>
-    <div class="stat-row"><b>Forest FL:</b> {h(info['forest_fl'])}</div>
-    <div class="stat-row"><b>Discovered via:</b> {h(", ".join(info['servers']))}</div>
-  </div>
-  <div class="hcell">
-    <h4>Topology</h4>
-    <div class="stat"><span class="snum">{info['dcs']}</span><span class="slbl">domain controllers</span></div>
-    <div class="stat"><span class="snum">{info['users']:,}</span><span class="slbl">users</span></div>
-    <div class="stat"><span class="snum">{info['computers']:,}</span><span class="slbl">computers</span></div>
-    <div class="stat"><span class="snum">{info['ous']}</span><span class="slbl">OUs</span></div>
-  </div>
-  <div class="hcell">
-    <h4>Hygiene</h4>
-    <div class="stat"><span class="snum">{info['stale_users']}</span><span class="slbl">stale users (90+ days)</span></div>
-    <div class="stat"><span class="snum">{info['stale_comps']}</span><span class="slbl">stale computers</span></div>
-  </div>
-</div>
+    # -- NAV BAR ---------------------------------------------------------------
+    sect_links = [('Alerts', f'{sid}-alerts'), ('Overview', f'{sid}-overview'),
+                  ('Hardware', f'{sid}-hardware'), ('Applications', f'{sid}-apps'),
+                  ('Roles', f'{sid}-roles'), ('Role Config', f'{sid}-roleconfig')]
+    if real_shares:   sect_links.append(('File Shares', f'{sid}-shares'))
+    sect_links += [('Disks', f'{sid}-disks'), ('Network', f'{sid}-network'),
+                   ('Listening Ports', f'{sid}-lports'), ('Services', f'{sid}-services')]
+    if svc_anomalies: sect_links.append(('Svc Flags', f'{sid}-svc-anomalies'))
 
-<h4>FSMO Roles</h4>
-<table class="kv">
-  <tr><td>PDC Emulator</td><td>{h(info['pdc'])}</td></tr>
-  <tr><td>RID Master</td><td>{h(info['rid'])}</td></tr>
-  <tr><td>Schema Master</td><td>{h(info['schema'])}</td></tr>
-  {fsmo_rows}
-</table>
+    role_conf_links = {}
+    if has_adds:  role_conf_links['Active Directory'] = f'{sid}-roleconf-ad'
+    if has_dns:   role_conf_links['DNS Server'] = f'{sid}-roleconf-dns'
+    if has_dhcp:  role_conf_links['DHCP Server'] = f'{sid}-roleconf-dhcp'
+    if has_nps:   role_conf_links['NPS / RADIUS'] = f'{sid}-roleconf-nps'
+    if has_hv:    role_conf_links['Hyper-V'] = f'{sid}-roleconf-hyperv'
+    if has_files or real_shares: role_conf_links['File and Storage Services'] = f'{sid}-roleconf-files'
 
-{f'<h4>Stale Users ({len(stale_users)})</h4><details><summary class="dim">Show stale users</summary><table class="t"><thead><tr><th>SAM</th><th>Name</th><th>Last Logon</th></tr></thead><tbody>{su_rows}</tbody></table></details>' if su_rows else ''}
-
-{f'<h4>Stale Computers ({len(stale_comps)})</h4><details><summary class="dim">Show stale computers</summary><table class="t"><thead><tr><th>SAM</th><th>Name</th><th>Last Logon</th></tr></thead><tbody>{sc_rows}</tbody></table></details>' if sc_rows else ''}
-''')
-        ad_tab_html = ''.join(ad_sections)
-
-    # =============== SQL TAB (env-wide rollup) ==============
-    sql_global = []
-    for s in servers:
-        inst = s['sql'].get('Instances') if isinstance(s['sql'], dict) else None
-        if not (isinstance(inst, dict) and inst.get('InstanceName')): continue
-        dbs = inst.get('Databases', []) or []
-        if not isinstance(dbs, list): dbs = []
-        for db in dbs:
-            if not isinstance(db, dict): continue
-            sql_global.append({
-                'server': s['name'],
-                'instance': inst.get('InstanceName',''),
-                'db': db.get('Name',''),
-                'size': db.get('DataSizeMB', 0) or 0,
-                'recovery': db.get('RecoveryModel',''),
-                'compat': db.get('CompatLevel',''),
-                'last_full': db.get('LastFullBackup',''),
-            })
-    sql_global.sort(key=lambda x: -x['size'])
-    sql_rows = ''.join(
-        f'<tr><td>{h(r["server"])}</td><td>{h(r["instance"])}</td><td>{h(r["db"])}</td>'
-        f'<td>{r["size"]:,} MB</td><td>{h(r["recovery"])}</td><td>{r["compat"]}</td><td>{h(r["last_full"])}</td></tr>'
-        for r in sql_global
+    nav_html = (
+        f'<div id="top-{sid}" class="hide-sbr" style="background:white;border-radius:8px;'
+        f'border:1px solid #e8e4f0;padding:12px 16px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,0.04);">'
+        f'<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;'
+        f'margin-bottom:{"8px" if role_conf_links else "0"};">'
+        f'<span style="font-size:8pt;color:#6b6080;text-transform:uppercase;letter-spacing:0.5px;margin-right:4px;font-weight:700;">SECTIONS</span>'
+        + ''.join(nav_link(a, l) for l, a in sect_links)
+        + '</div>\n'
+        + (f'<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">'
+           f'<span style="font-size:8pt;color:#6b6080;text-transform:uppercase;letter-spacing:0.5px;margin-right:4px;font-weight:700;">ROLES</span>'
+           + ''.join(f'<a href="#{anch}" style="color:white;font-size:9pt;text-decoration:none;font-weight:600;padding:4px 12px;border-radius:4px;background:#5b1fa4;">{h(rl)} &#8595;</a>\n'
+                     for rl, anch in role_conf_links.items())
+           + '</div>\n' if role_conf_links else '')
+        + '</div>\n'
     )
-    sql_tab_html = f'''
-<h3>All SQL Databases ({len(sql_global)})</h3>
-<p class="dim">Sorted by data size desc. Compat &lt; 130 means legacy SQL 2016- behavior.</p>
-<table class="t"><thead><tr><th>Server</th><th>Instance</th><th>Database</th><th>Size</th><th>Recovery</th><th>Compat</th><th>Last Full</th></tr></thead><tbody>{sql_rows or "<tr><td colspan=7 class=dim>No SQL instances detected.</td></tr>"}</tbody></table>
+
+    # -- ALERTS CARD -----------------------------------------------------------
+    alerts_body = ''.join(flag_div(*f) for f in flags) or '<span class="pill pill-green">No critical alerts</span>\n'
+    alerts_body += top_link(sid)
+
+    # -- SYSTEM OVERVIEW CARD --------------------------------------------------
+    dom_short = domain.split('.')[0] if domain else 'WORKGROUP'
+    os_disp   = os_name.replace('Windows Server ', 'WS').replace(' Standard','').replace(' Datacenter','').strip() or os_short
+    def _ov_sec_row(icon, label, val, warn=True):
+        if val:
+            badge = f'<span class="pill pill-green">{h(val)}</span>'
+        elif warn:
+            badge = '<span class="pill pill-yellow">None detected</span>'
+        else:
+            badge = '<span style="color:#c4b5fd">&mdash;</span>'
+        return (f'<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;">'
+                f'<span style="font-size:9pt;color:#6b6080;">{icon}&nbsp;{label}</span>'
+                f'{badge}</div>\n')
+    sec_col = (
+        f'<div style="font-size:8pt;font-weight:700;text-transform:uppercase;letter-spacing:.8px;'
+        f'color:#5b1fa4;margin-bottom:10px;">Security &amp; Protection</div>'
+        + _ov_sec_row('🛡️', 'EDR / XDR',    edr, warn=True)
+        + _ov_sec_row('⚙️', 'RMM',           rmm, warn=True)
+        + _ov_sec_row('🔗', 'Remote Access', rmt, warn=False)
+        + _ov_sec_row('💾', 'Backup',        bdr, warn=False)
+        + _ov_sec_row('🔑', 'PAM',           pam, warn=False)
+    )
+    _eol_color = 'red' if eol_status == 'EOL' else ('yellow' if eol_status == 'Near EOL' else 'green')
+    _eol_label = 'EOL' if eol_status == 'EOL' else 'Supported'
+    _vm_badge  = f'&nbsp;<span class="pill pill-gray">VM · {h(vm_plat)}</span>' if is_vm and vm_plat else ''
+    sys_col = (
+        f'<div class="stat-grid" style="grid-template-columns:repeat(2,1fr);">'
+        f'<div class="stat-box"><div class="stat-num" style="font-size:14px">{h(os_disp)}</div><div class="stat-lbl">OS</div></div>'
+        f'<div class="stat-box"><div class="stat-num">{up:.1f}d</div><div class="stat-lbl">Uptime</div></div>'
+        f'<div class="stat-box"><div class="stat-num" style="font-size:13px">{h(last_boot[:10] if last_boot else "-")}</div><div class="stat-lbl">Last Boot</div></div>'
+        f'<div class="stat-box"><div class="stat-num" style="font-size:{"12" if len(dom_short) > 9 else "14"}px">{h(dom_short)}</div><div class="stat-lbl">Domain</div></div>'
+        f'</div>'
+        f'<div class="meta-line"><strong>OS:</strong> {h(sys_.get("OSName",""))} (Build {h(os_build)}){_vm_badge}</div>'
+        f'<div class="meta-line"><strong>EOL Date:</strong> {h(eol_date)} <span class="pill pill-{_eol_color}">{_eol_label}</span></div>'
+        f'<div class="meta-line"><strong>Installed:</strong> {h(install_dt[:10] if install_dt else "")}</div>'
+        f'<div class="meta-line"><strong>PowerShell:</strong> {h(ps_ver)}</div>'
+        f'<div class="meta-line"><strong>Run As:</strong> {h(run_as)}</div>'
+        f'<div class="meta-line"><strong>Collected:</strong> {h(collected)}</div>'
+    )
+    overview_body = (
+        f'<div style="display:grid;grid-template-columns:3fr 2fr;gap:32px;align-items:start;">'
+        f'<div>{sys_col}</div>'
+        f'<div style="border-left:2px solid #ede9fe;padding-left:24px;">{sec_col}</div>'
+        f'</div>'
+    ) + top_link(sid)
+
+    # -- HARDWARE CARD ---------------------------------------------------------
+    plat_pill = pill(vm_plat or 'Physical', 'gray' if not vm_plat else 'purple')
+    hw_body = f'''<div class="stat-grid">
+<div class="stat-box"><div class="stat-num">{cpu_c}</div><div class="stat-lbl">CPU Cores</div></div>
+<div class="stat-box"><div class="stat-num" style="font-size:16px">{ram_t:.1f} GB</div><div class="stat-lbl">RAM Total</div></div>
+<div class="stat-box"><div class="stat-num" style="font-size:16px">{ram_f:.1f} GB</div><div class="stat-lbl">RAM Available</div></div>
+<div class="stat-box"><div class="stat-num" style="font-size:14px">{plat_pill}</div><div class="stat-lbl">Platform</div></div>
+</div>
+<div class="meta-line"><strong>CPU:</strong> {h(cpu_n)}</div>
 '''
+    if mfr or model or serial:
+        hw_body += sub('Hardware Identity', 'margin-top:16px')
+        hw_body += '<table><tr><th style="width:160px">Property</th><th>Value</th></tr>\n'
+        rows = [('Manufacturer', mfr), ('Model', model)]
+        if serial:
+            dell_lnk = (f' &nbsp;<a href="https://www.dell.com/support/home/en-us/product-support/servicetag/{h(serial)}"'
+                       f' target="_blank" style="color:#5b1fa4;font-size:8.5pt">Look up warranty &#8599;</a>'
+                       if 'dell' in mfr.lower() else '')
+            rows.append(('Serial Number', f'{h(serial)}{dell_lnk}'))
+        rows += [('BIOS Version', bios_v), ('BIOS Date', bios_d), ('Board Product', board)]
+        for i, (k, v) in enumerate(rows):
+            if not v: continue
+            bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            safe_v = v if k == 'Serial Number' else h(v)
+            hw_body += f'<tr{bg}><td><strong>{k}</strong></td><td>{safe_v}</td></tr>\n'
+        hw_body += '</table>\n'
+    hw_body += top_link(sid)
 
-    # =============== PRIVATE CLOUD SIZING TAB ==============
-    # Uses 95th-percentile CPU/RAM from vsphere-perf JSON (SDT's own collector
-    # OR Nutanix Collector XLSX parsed via parse_ntnx_collector.py - same
-    # schema). Falls back to a banner if P95 data is null.
-    BUFFER = 1.20  # 20% growth buffer (M5 standard)
-    pc_tab_html = ''
-    sized_vms = []
-    have_p95 = False
-    if vc:
-        vc_vms = vc.get('VMs') or []
-        if not isinstance(vc_vms, list): vc_vms = []
-        for v in vc_vms:
-            if not isinstance(v, dict): continue
-            if str(v.get('PowerState','')).lower() not in ('poweredon','on'): continue
-            cpu_obj = v.get('CPU') or {}
-            mem_obj = v.get('Memory') or {}
-            cpu_p95 = cpu_obj.get('P95') if isinstance(cpu_obj, dict) else None
-            mem_p95 = mem_obj.get('P95') if isinstance(mem_obj, dict) else None
-            vcpus = int(v.get('vCPUs') or 0)
-            ram_gb = float(v.get('RAMgb') or 0)
-            disk_used = float(v.get('DiskConsumedGB') or 0)
-            disk_prov = float(v.get('DiskCapGB') or 0)
-            if cpu_p95 is not None and mem_p95 is not None:
-                have_p95 = True
-            # Sized = (utilization% / 100) * allocated * buffer
-            sized_cpu = (float(cpu_p95) / 100.0) * vcpus * BUFFER if cpu_p95 is not None else None
-            sized_ram = (float(mem_p95) / 100.0) * ram_gb * BUFFER if mem_p95 is not None else None
-            sized_disk = disk_used * BUFFER if disk_used else disk_prov * BUFFER
-            sized_vms.append({
-                'name': v.get('Name',''), 'os': v.get('GuestOS',''),
-                'vcpus': vcpus, 'ram_gb': ram_gb,
-                'cpu_p95': cpu_p95, 'mem_p95': mem_p95,
-                'sized_cpu': sized_cpu, 'sized_ram': sized_ram,
-                'disk_used': disk_used, 'disk_prov': disk_prov, 'sized_disk': sized_disk,
-                'datastore': v.get('Datastore',''),
-            })
+    # -- INSTALLED APPS CARD ---------------------------------------------------
+    apps_body = ''
+    cat_order = [('Security', 'Security &amp; EDR'), ('Management', 'Management &amp; RMM'),
+                 ('LOB', 'Line of Business / ERP / CRM'),
+                 ('Browser', 'Browser'), ('Other', 'Other')]
+    for cat_key, cat_lbl in cat_order:
+        ca = app_cats.get(cat_key, [])
+        if not ca: continue
+        apps_body += sub(cat_lbl)
+        if cat_key == 'LOB':
+            apps_body += '<table><tr><th>Application</th><th>Detected As</th><th>Version</th><th>Publisher</th><th>Install Date</th></tr>\n'
+            for i, ap in enumerate(ca):
+                bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                lob_lbl = ap.get('_lob_label', '')
+                apps_body += (f'<tr{bg}><td>{h(ap.get("Name",""))}</td>'
+                             f'<td style="color:#5b1fa4;font-weight:600;font-size:8.5pt">{h(lob_lbl)}</td>'
+                             f'<td style="font-family:monospace;font-size:8.5pt">{h(ap.get("Version",""))}</td>'
+                             f'<td>{h(ap.get("Publisher",""))}</td>'
+                             f'<td>{h(ap.get("InstallDate","") or "&mdash;")}</td></tr>\n')
+        else:
+            apps_body += '<table><tr><th>Application</th><th>Version</th><th>Publisher</th><th>Install Date</th></tr>\n'
+            for i, ap in enumerate(ca):
+                bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                apps_body += (f'<tr{bg}><td>{h(ap.get("Name",""))}</td>'
+                             f'<td style="font-family:monospace;font-size:8.5pt">{h(ap.get("Version",""))}</td>'
+                             f'<td>{h(ap.get("Publisher",""))}</td>'
+                             f'<td>{h(ap.get("InstallDate","") or "&mdash;")}</td></tr>\n')
+        apps_body += '</table>\n'
+    if not apps_body:
+        apps_body = ('<div class="flag-info"><div class="flag-label">No Data Collected</div>'
+                    '<div class="flag-detail">Application inventory returned no data. '
+                    'Collection may have failed on this server - re-run discovery to retry.</div></div>\n')
+    apps_body += top_link(sid)
 
-    if not vc:
-        pc_tab_html = '<p class="dim">No vCenter inventory collected — sizing requires hypervisor data.</p>'
-    elif not have_p95:
-        pc_tab_html = '''
-<div class="finding warn" style="background:#78350f33;border-left:4px solid #f59e0b;padding:14px 18px;border-radius:6px;margin-bottom:18px;">
-  <b>95th-percentile utilization data not available.</b>
-  <p>SDT's vSphere perf collector returned null values OR perf-counter collection wasn't enabled at the cluster.
-  To get accurate sizing, run the Nutanix Collector against this vCenter, then drop the resulting XLSX into
-  the session folder and run <code>parse_ntnx_collector.py</code> followed by report regeneration.</p>
-  <p>Showing <b>provisioned values only</b> below — these are <i>not</i> sizing inputs and will overestimate target cluster requirements.</p>
+    # -- ROLES & FEATURES CARD -------------------------------------------------
+    _role_anchor = {'AD-Domain-Services': f'{sid}-roleconf-ad', 'DHCP': f'{sid}-roleconf-dhcp',
+                    'DNS': f'{sid}-roleconf-dns', 'Hyper-V': f'{sid}-roleconf-hyperv',
+                    'FileAndStorage-Services': f'{sid}-roleconf-files', 'NPAS': f'{sid}-roleconf-nps'}
+    role_bdgs = ''
+    for rl in role_list:
+        rn = rl.get('Name', ''); rd = rl.get('DisplayName', rn)
+        anch = _role_anchor.get(rn)
+        if anch:
+            role_bdgs += (f'<a href="#{anch}" style="text-decoration:none;">'
+                         f'<span class="role-badge" style="font-size:11pt;padding:6px 16px;cursor:pointer;" '
+                         f'title="Jump to Role Configuration">{h(rd)} &#8595;</span></a>\n')
+        else:
+            role_bdgs += f'<span class="role-badge" style="font-size:11pt;padding:6px 16px;">{h(rd)}</span>\n'
+    roles_body = sub('INSTALLED ROLES')
+    roles_body += f'<div style="background:#f0ebff;border-radius:6px;padding:12px;margin-bottom:16px;"><div class="role-grid">{role_bdgs}</div></div>\n'
+    if feature_list:
+        roles_body += sub(f'Installed Features ({len(feature_list)})', 'margin-top:14px')
+        roles_body += '<table><tr><th>Name</th><th>Display Name</th></tr>\n'
+        for i, ft in enumerate(feature_list):
+            bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            roles_body += (f'<tr{bg}><td style="font-family:monospace;font-size:8.5pt">{h(ft.get("Name",""))}</td>'
+                          f'<td>{h(ft.get("DisplayName",""))}</td></tr>\n')
+        roles_body += '</table>\n'
+    roles_body += top_link(sid)
+
+    # -- ROLE CONFIGURATION CARD -----------------------------------------------
+    rc = ''
+
+    # Active Directory
+    if has_adds and isinstance(ad, dict) and ad.get('Installed'):
+        fl_d = str(ad.get('DomainFL', '')); fl_f = str(ad.get('ForestFL', ''))
+        fy_d = (re.search(r'20\d\d', fl_d) or type('', (), {'group': lambda s,n: ''})()).group(0)
+        fy_f = (re.search(r'20\d\d', fl_f) or type('', (), {'group': lambda s,n: ''})()).group(0)
+        uc = str(ad.get('UserCount', '') or '-')
+        cc = str(ad.get('ComputerCount', '') or '-')
+        ou = str(ad.get('OUCount', '') or '-')
+        pdce = ad.get('PDCEmulator', '')
+        ridf = ad.get('RIDMaster', '')
+        schema_m = ad.get('SchemaMaster', '')
+        fsmo_list = ad.get('FSMORoles', [])
+        if not isinstance(fsmo_list, list): fsmo_list = []
+        _stale_raw2 = ad.get('StaleUsers', '')
+        stale_u = len(_stale_raw2) if isinstance(_stale_raw2, list) else (int(_stale_raw2) if str(_stale_raw2).isdigit() else 0)
+        def _dn_to_fqdn(v):
+            if v and str(v).upper().startswith('DC='):
+                return '.'.join(p.split('=')[1] for p in str(v).split(',') if '=' in p)
+            return v or ''
+        _raw_domain = ad.get('DomainName', '') or ad.get('ForestName', '') or domain
+        domain_display = _dn_to_fqdn(_raw_domain)
+
+        rc += f'<div id="{sid}-roleconf-ad"></div>\n'
+        rc += sub('Active Directory', 'margin-top:20px')
+        rc += f'''<div class="stat-grid">
+<div class="stat-box"><div class="stat-num">{h(uc)}</div><div class="stat-lbl">Users</div></div>
+<div class="stat-box"><div class="stat-num">{h(cc)}</div><div class="stat-lbl">Computers</div></div>
+<div class="stat-box"><div class="stat-num">{h(ou)}</div><div class="stat-lbl">OUs</div></div>
+<div class="stat-box"><div class="stat-num">{len(fsmo_list) if fsmo_list else "&mdash;"}</div><div class="stat-lbl">FSMO Roles Here</div></div>
+</div>\n'''
+        # FSMO roles held by this server - use FSMORoles list directly
+        if fsmo_list:
+            rc += sub('FSMO Roles Held By This DC', 'margin-top:12px')
+            rc += '<div style="display:flex;flex-wrap:wrap;gap:10px;margin:10px 0;">\n'
+            rc += ''.join(f'<div style="background:#271e41;color:white;border-radius:6px;padding:8px 18px;font-weight:700;font-size:10.5pt;">{h(fm)}</div>\n' for fm in fsmo_list)
+            rc += '</div>\n'
+        elif name.upper() in FSMO_HOLDERS:
+            # Fallback: cross-ref from PDCEmulator/RIDMaster fields
+            my_fsmo_fb = []
+            if pdce   and _norm_host(pdce)    == name.upper(): my_fsmo_fb.append('PDC Emulator')
+            if ridf   and _norm_host(ridf)    == name.upper(): my_fsmo_fb.append('RID Master')
+            if schema_m and _norm_host(schema_m) == name.upper(): my_fsmo_fb.append('Schema Master')
+            if my_fsmo_fb:
+                rc += sub('FSMO Roles Held By This DC', 'margin-top:12px')
+                rc += '<div style="display:flex;flex-wrap:wrap;gap:10px;margin:10px 0;">\n'
+                rc += ''.join(f'<div style="background:#271e41;color:white;border-radius:6px;padding:8px 18px;font-weight:700;font-size:10.5pt;">{h(fm)}</div>\n' for fm in my_fsmo_fb)
+                rc += '</div>\n'
+            else:
+                rc += sub('FSMO Roles', 'margin-top:12px')
+                rc += '<div style="display:flex;flex-wrap:wrap;gap:10px;margin:10px 0;"><div style="background:#271e41;color:white;border-radius:6px;padding:8px 18px;font-weight:700;font-size:10.5pt;">FSMO Role Holder</div></div>\n'
+        # FL warnings
+        for yr, raw in ((fy_d, fl_d), (fy_f, fl_f)):
+            if yr and yr < '2016':
+                level_word = 'Domain' if raw == fl_d else 'Forest'
+                rc += (f'<div class="flag-warning" style="margin-bottom:12px;">'
+                      f'<div class="flag-label">&#9888; {level_word.upper()} FUNCTIONAL LEVEL UPGRADE RECOMMENDED</div>'
+                      f'<div class="flag-detail">{level_word} functional level is <strong>{h(raw)}</strong>. '
+                      f'Upgrading to Windows 2016+ enables PAM, improved Kerberos, and gMSA.</div></div>\n')
+        # Domain table
+        rc += sub('Domain &amp; Forest Details', 'margin-top:12px')
+        rc += '<table><tr><th style="width:220px">Property</th><th>Value</th></tr>\n'
+        dt_rows = [('Forest Root Domain', h(domain_display), ''),
+                   ('Domain Functional Level', f'<span class="pill pill-{"yellow" if fy_d and fy_d<"2016" else "green"}">{h(fl_d)}</span>' if fl_d else '', ' style="background:#f5f4f8"'),
+                   ('Forest Functional Level', f'<span class="pill pill-{"yellow" if fy_f and fy_f<"2016" else "green"}">{h(fl_f)}</span>' if fl_f else '', ''),
+                   ('PDC Emulator', h(pdce), ' style="background:#f5f4f8"'),
+                   ('RID Master', h(ridf), ''),
+                   ('Schema Master', h(schema_m), ' style="background:#f5f4f8"')]
+        for prop, val, bg in dt_rows:
+            if not val: continue
+            rc += f'<tr{bg}><td><strong>{prop}</strong></td><td>{val}</td></tr>\n'
+        if stale_u:
+            rc += f'<tr><td><strong>Stale User Accounts</strong></td><td><span class="pill pill-yellow">~{stale_u} accounts (90+ days inactive)</span></td></tr>\n'
+        rc += '</table>\n'
+
+    # DNS
+    if isinstance(dns, dict) and dns.get('Installed'):
+        zones = as_list(dns.get('Zones', []))
+        fwd   = extract_forwarders(dns.get('Forwarders', ''))
+        rc += f'<div id="{sid}-roleconf-dns"></div>\n'
+        rc += sub('DNS Server', 'margin-top:24px')
+        rc += '<table><tr><th style="width:160px">Property</th><th>Value</th></tr>\n'
+        rc += f'<tr><td><strong>DNS Zones</strong></td><td>{len(zones)}</td></tr>\n'
+        if fwd: rc += f'<tr style="background:#f5f4f8"><td><strong>Forwarders</strong></td><td><code>{h(fwd)}</code></td></tr>\n'
+        rc += '</table>\n'
+        if zones:
+            rc += sub(f'DNS Zones ({len(zones)})', 'margin-top:10px;font-size:10px')
+            rc += '<table><tr><th>Zone Name</th><th>Type</th><th>Dynamic Update</th></tr>\n'
+            for i, z in enumerate(zones[:20]):
+                if not isinstance(z, dict): continue
+                bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                rc += (f'<tr{bg}><td style="font-family:monospace;font-size:8.5pt">{h(z.get("ZoneName",""))}</td>'
+                      f'<td>{h(z.get("ZoneType",""))}</td><td>{h(str(z.get("DynamicUpdate","")))}</td></tr>\n')
+            rc += '</table>\n'
+
+    # DHCP
+    if isinstance(dhcp, dict) and dhcp.get('Installed'):
+        scopes = as_list(dhcp.get('Scopes', []))
+        rc += f'<div id="{sid}-roleconf-dhcp"></div>\n'
+        rc += sub('DHCP Server', 'margin-top:24px')
+        rc += '<table><tr><th>Scope</th><th>Name</th><th>State</th><th>In Use</th><th>Free</th><th>Start</th><th>End</th></tr>\n'
+        for i, sc in enumerate(scopes):
+            if not isinstance(sc, dict): continue
+            bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            st = sc.get('State', '')
+            rc += (f'<tr{bg}><td style="font-family:monospace;font-size:8.5pt">{h(sc.get("ScopeId",""))}</td>'
+                  f'<td>{h(sc.get("Name",""))}</td>'
+                  f'<td>{pill(st, "green" if st=="Active" else "gray")}</td>'
+                  f'<td>{h(str(sc.get("InUse", sc.get("AddressesInUse","?"))))}</td>'
+                  f'<td>{h(str(sc.get("Available", sc.get("AddressesFree","?"))))}</td>'
+                  f'<td style="font-family:monospace;font-size:8.5pt">{h(sc.get("StartRange",""))}</td>'
+                  f'<td style="font-family:monospace;font-size:8.5pt">{h(sc.get("EndRange",""))}</td></tr>\n')
+        if not scopes:
+            rc += '<tr><td colspan="7" style="color:#6b6080;font-style:italic">DHCP installed - no scope data collected</td></tr>\n'
+        rc += '</table>\n'
+
+    # NPS
+    if has_nps:
+        rc += f'<div id="{sid}-roleconf-nps"></div>\n'
+        rc += sub('NPS / RADIUS', 'margin-top:24px')
+        if isinstance(nps, dict) and nps.get('Installed'):
+            nps_clients  = as_list(nps.get('Clients', nps.get('RadiusClients', [])))
+            nps_policies = as_list(nps.get('Policies', nps.get('NetworkPolicies', [])))
+            rc += f'<div class="stat-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:14px;">'
+            rc += f'<div class="stat-box"><div class="stat-num">{len(nps_clients)}</div><div class="stat-lbl">RADIUS Clients</div></div>'
+            rc += f'<div class="stat-box"><div class="stat-num">{len(nps_policies)}</div><div class="stat-lbl">Network Policies</div></div>'
+            rc += '</div>\n'
+            if nps_clients:
+                rc += sub('RADIUS Clients (Authorized Devices)', 'margin-top:8px')
+                rc += '<table><tr><th>Client Name</th><th>IP Address</th><th>Status</th></tr>\n'
+                for i, cl in enumerate(nps_clients):
+                    if not isinstance(cl, dict): continue
+                    bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                    raw_val = cl.get('Raw', '')
+                    if raw_val:
+                        rc += f'<tr{bg}><td colspan="3" style="font-family:monospace;font-size:8.5pt">{h(raw_val)}</td></tr>\n'
+                    else:
+                        enabled = cl.get('Enabled', True)
+                        st = pill('Enabled', 'green') if enabled else pill('Disabled', 'gray')
+                        rc += (f'<tr{bg}><td style="font-weight:600">{h(cl.get("Name",""))}</td>'
+                               f'<td style="font-family:monospace;font-size:8.5pt">{h(cl.get("Address",""))}</td>'
+                               f'<td>{st}</td></tr>\n')
+                rc += '</table>\n'
+            if nps_policies:
+                rc += sub('Network Policies', 'margin-top:14px')
+                rc += '<table><tr><th style="width:40px">#</th><th>Policy Name</th><th>Status</th></tr>\n'
+                for i, pol in enumerate(sorted(nps_policies, key=lambda x: x.get('ProcessingOrder', 99) if isinstance(x, dict) else 99)):
+                    if not isinstance(pol, dict): continue
+                    bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                    enabled = pol.get('Enabled', True)
+                    st = pill('Active', 'green') if enabled else pill('Disabled', 'gray')
+                    order = pol.get('ProcessingOrder', '-')
+                    rc += (f'<tr{bg}><td style="text-align:center;color:#6b6080">{h(str(order))}</td>'
+                           f'<td style="font-weight:600">{h(pol.get("Name",""))}</td>'
+                           f'<td>{st}</td></tr>\n')
+                rc += '</table>\n'
+            if not nps_clients and not nps_policies and nps.get('Partial'):
+                rc += ('<div class="flag-info"><div class="flag-label">Partial NPS Data</div>'
+                      '<div class="flag-detail">NPS module unavailable - netsh fallback used. '
+                      'Export full config with: <code>netsh nps export filename=nps_config.xml exportPSK=YES</code></div></div>\n')
+        else:
+            rc += ('<div class="flag-info"><div class="flag-label">NPS Installed</div>'
+                  '<div class="flag-detail">Network Policy Server (RADIUS) is installed. '
+                  'Run discovery with an account that has NPS module access to collect client and policy details.</div></div>\n')
+
+    # Hyper-V
+    if has_hv:
+        hv_data = data.get('HyperV', {})
+        rc += f'<div id="{sid}-roleconf-hyperv"></div>\n'
+        rc += sub('Hyper-V Host', 'margin-top:24px')
+        hv_vms = as_list(hv_data.get('VMs', [])) if isinstance(hv_data, dict) else []
+        if hv_vms:
+            running_vms = [v for v in hv_vms if v.get('State', '') == 'Running']
+            rc += f'''<div class="stat-grid">
+<div class="stat-box"><div class="stat-num">{len(hv_vms)}</div><div class="stat-lbl">Total VMs</div></div>
+<div class="stat-box"><div class="stat-num" style="color:#20c800">{len(running_vms)}</div><div class="stat-lbl">Running</div></div>
+</div>\n'''
+            rc += sub('Hosted VMs', 'margin-top:12px')
+            rc += '<table><tr><th>VM Name</th><th>State</th><th>vCPU</th><th>RAM (GB)</th><th>Generation</th><th>Uptime</th></tr>\n'
+            for i, v in enumerate(hv_vms):
+                bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                rc += (f'<tr{bg}><td>{h(v.get("Name",""))}</td>'
+                      f'<td>{pill(v.get("State",""), "green" if v.get("State")=="Running" else "gray")}</td>'
+                      f'<td>{h(str(v.get("vCPU","")))}</td><td>{h(str(v.get("RAM","")))}</td>'
+                      f'<td>{h(str(v.get("Generation","")))}</td><td style="font-family:monospace;font-size:8.5pt">{h(str(v.get("Uptime","")))}</td></tr>\n')
+            rc += '</table>\n'
+        else:
+            rc += ('<div class="flag-info"><div class="flag-label">Hyper-V Role Installed</div>'
+                  '<div class="flag-detail">Hyper-V is installed on this server. VM inventory not collected in this run.</div></div>\n')
+
+    # File & Storage
+    if has_files or real_shares:
+        rc += f'<div id="{sid}-roleconf-files"></div>\n'
+        rc += sub('File and Storage Services', 'margin-top:24px')
+        if real_shares:
+            rc += (f'<div class="flag-info"><div class="flag-label">Shares</div>'
+                  f'<div class="flag-detail">{len(real_shares)} business shares detected. '
+                  f'See the <a href="#{sid}-shares" style="color:#5b1fa4;font-weight:700">File Shares section</a> below.</div></div>\n')
+        else:
+            rc += '<div class="flag-info"><div class="flag-label">File and Storage Services</div><div class="flag-detail">File and Storage Services is installed. No non-admin shares detected.</div></div>\n'
+
+    # Exchange
+    if isinstance(exch, dict) and exch.get('Installed'):
+        eol_c = 'red' if exch.get('EOLStatus') == 'EOL' else ('yellow' if exch.get('EOLStatus') == 'Near EOL' else 'green')
+        rc += sub('Exchange Server', 'margin-top:24px')
+        rc += '<table><tr><th style="width:160px">Property</th><th>Value</th></tr>\n'
+        rc += f'<tr><td><strong>Version</strong></td><td>{h(exch.get("VersionName",""))}</td></tr>\n'
+        rc += f'<tr style="background:#f5f4f8"><td><strong>EOL Status</strong></td><td>{pill(exch.get("EOLStatus","?"), eol_c)} &nbsp;{h(exch.get("EOLDate",""))}</td></tr>\n'
+        rc += f'<tr><td><strong>Transport</strong></td><td>{pill("Running","green") if exch.get("TransportServiceRunning") else pill("Stopped","red")}</td></tr>\n'
+        rc += '</table>\n'
+
+    # SQL
+    if isinstance(sql_inst, dict) and sql_inst.get('Edition'):
+        sql_eol_status = sql_inst.get('EOLStatus', '')
+        sql_eol_c = 'red' if sql_eol_status == 'EOL' else ('yellow' if sql_eol_status == 'Near EOL' else 'green')
+        sql_edition = sql_inst.get('Edition', '')
+        sql_ver = sql_inst.get('Version', '-')
+        sql_eol_date = sql_inst.get('EOLDate', '-')
+        sql_svc_acct = sql_inst.get('ServiceAccount', '-')
+        sql_inst_name = sql_inst.get('InstanceName', 'Default')
+        # Flag old editions
+        old_sql_flag = any(yr in sql_edition for yr in ('2016', '2014', '2012'))
+        rc += sub('SQL Server', 'margin-top:24px')
+        if old_sql_flag:
+            rc += (f'<div class="flag-critical" style="margin-bottom:12px;">'
+                   f'<div class="flag-label">&#9888; SQL Server EOL / Near-EOL - Upgrade Required</div>'
+                   f'<div class="flag-detail">{h(sql_edition)} reaches end of support {h(sql_eol_date)}. '
+                   f'<strong>Not supported on Windows Server 2022.</strong> Must upgrade SQL to 2017+ before OS upgrade.</div></div>\n')
+        rc += '<table><tr><th style="width:200px">Property</th><th>Value</th></tr>\n'
+        rc += f'<tr><td><strong>Edition</strong></td><td>{h(sql_edition)}</td></tr>\n'
+        rc += f'<tr style="background:#f5f4f8"><td><strong>Version</strong></td><td><code>{h(sql_ver)}</code></td></tr>\n'
+        rc += f'<tr><td><strong>Instance Name</strong></td><td><code>{h(sql_inst_name)}</code></td></tr>\n'
+        rc += f'<tr style="background:#f5f4f8"><td><strong>EOL Date</strong></td><td>{h(sql_eol_date)} &nbsp;{pill(sql_eol_status or "Unknown", sql_eol_c)}</td></tr>\n'
+        rc += f'<tr><td><strong>Service Account</strong></td><td><code>{h(sql_svc_acct)}</code></td></tr>\n'
+        rc += f'<tr style="background:#f5f4f8"><td><strong>WS2022 Compatibility</strong></td><td>{pill("NOT SUPPORTED","red") if sql_eol_status=="EOL" else pill("Check Version","yellow")}</td></tr>\n'
+        rc += f'<tr><td><strong>Database List</strong></td><td style="color:#6b6080;font-style:italic;">Database list unavailable - pull from SQL Management Studio</td></tr>\n'
+        rc += '</table>\n'
+
+    if not rc.strip():
+        rc = '<div class="flag-info"><div class="flag-label">No Role Configuration Data</div><div class="flag-detail">No configurable server roles were detected on this server.</div></div>\n'
+    rc += top_link(sid)
+
+    # -- DISK STORAGE CARD -----------------------------------------------------
+    disk_body = '<table><tr><th>Drive</th><th>Label</th><th>Filesystem</th><th>Total (GB)</th><th>Used (GB)</th><th>Free (GB)</th><th style="min-width:140px">Utilization</th></tr>\n'
+    for d in disks:
+        pct      = d.get('UsedPct', 0)
+        total_gb = d.get('TotalGB', 0)
+        free_gb  = d.get('FreeGB', 0)
+        used_gb  = round(total_gb - free_gb, 2)
+        pc  = 'red' if pct >= 85 else ('yellow' if pct >= 70 else 'green')
+        c   = '#d63638' if pct >= 85 else ('#f5a623' if pct >= 70 else '#20c800')
+        disk_body += (f'<tr><td><strong>{h(d.get("Drive","?"))}</strong></td>'
+                     f'<td>{h(d.get("Label","") or "")}</td>'
+                     f'<td>{h(d.get("Filesystem","NTFS"))}</td>'
+                     f'<td>{total_gb:.2f}</td><td>{used_gb:.2f}</td><td>{free_gb:.2f}</td>'
+                     f'<td><div class="disk-bar-bg"><div class="disk-bar-fill" '
+                     f'style="width:{min(pct,100)}%;background:{c}"></div></div>'
+                     f'<span style="font-size:8pt;color:#6b6080;">{pct}%</span></td></tr>\n')
+    disk_body += '</table>\n' + top_link(sid)
+
+    # -- NETWORK CARD ----------------------------------------------------------
+    net_body = sub('Network Adapters')
+    net_body += '<table><tr><th>Description</th><th>IP Address(es)</th><th>Gateway</th><th>DNS</th><th>MAC</th><th>DHCP</th></tr>\n'
+    if isinstance(adapters, dict):
+        ip_s = adapters.get('IPAddresses', adapters.get('IP', ''))
+        net_body += (f'<tr><td>{h(adapters.get("Description","Network Adapter"))}</td>'
+                    f'<td>{h(ip_s)}</td><td>{h(adapters.get("Gateway",""))}</td>'
+                    f'<td>{h(adapters.get("DNS",""))}</td>'
+                    f'<td style="font-family:monospace;font-size:8.5pt">{h(adapters.get("MAC",""))}</td>'
+                    f'<td>{pill("No","green")}</td></tr>\n')
+    else:
+        for i, a in enumerate(as_list(adapters)):
+            if not isinstance(a, dict): continue
+            bg  = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            ip_s = a.get('IPAddresses', a.get('IP', ''))
+            net_body += (f'<tr{bg}><td>{h(a.get("Description",""))}</td>'
+                        f'<td>{h(ip_s)}</td><td>{h(a.get("Gateway",""))}</td>'
+                        f'<td>{h(a.get("DNS",""))}</td>'
+                        f'<td style="font-family:monospace;font-size:8.5pt">{h(a.get("MAC",""))}</td>'
+                        f'<td>{pill("Yes","green") if a.get("DHCPEnabled") else pill("No","green")}</td></tr>\n')
+    net_body += '</table>\n'
+    ec = [c for c in est_conns if isinstance(c, dict) and c.get('State') == 'ESTABLISHED']
+    if ec:
+        show = ec[:15]
+        net_body += sub(f'Established Connections ({len(ec)} total{", showing top 15" if len(ec) > 15 else ""})',
+                        'margin-top:14px')
+        net_body += '<table><tr><th>Process</th><th>Local Port</th><th>Remote</th><th>Protocol</th><th>State</th><th>PID</th></tr>\n'
+        for i, c in enumerate(show):
+            bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            rem = c.get('Remote', '')
+            port = str(c.get('Port', ''))
+            if port and ':' not in rem: rem = f'{rem}:{port}'
+            net_body += (f'<tr{bg}><td>{h(c.get("Process",""))}</td>'
+                        f'<td>{h(str(c.get("LocalPort","")))}</td>'
+                        f'<td>{h(rem)}</td><td>{h(c.get("Proto","TCP"))}</td>'
+                        f'<td>{h(c.get("State",""))}</td><td>{h(str(c.get("PID","")))}</td></tr>\n')
+        net_body += '</table>\n'
+    net_body += top_link(sid)
+
+    # -- LISTENING PORTS CARD (collapsed) --------------------------------------
+    lp_body = sub(f'Listening Ports ({len(listen_ports)} unique)')
+    lp_body += '<table><tr><th>Port</th><th>Process</th><th>Protocol</th><th>Local IP</th><th>PID</th></tr>\n'
+    for i, lp in enumerate(listen_ports[:60]):
+        if not isinstance(lp, dict): continue
+        bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+        lp_body += (f'<tr{bg}><td>{h(str(lp.get("Port", lp.get("LocalPort",""))))}</td>'
+                   f'<td>{h(lp.get("Process",""))}</td><td>{h(lp.get("Proto","TCP"))}</td>'
+                   f'<td>{h(str(lp.get("LocalIP","")))}</td><td>{h(str(lp.get("PID","")))}</td></tr>\n')
+    if not listen_ports:
+        lp_body += '<tr><td colspan="5" style="color:#6b6080;font-style:italic">No listening port data collected</td></tr>\n'
+    lp_body += '</table>\n' + top_link(sid)
+
+    # -- SERVICES CARD ---------------------------------------------------------
+    svc_body = f'''<div class="stat-grid" style="grid-template-columns: repeat(2,1fr)">
+<div class="stat-box"><div class="stat-num" style="color:#20c800">{running_count}</div><div class="stat-lbl">Running</div></div>
+<div class="stat-box"><div class="stat-num" style="color:{"#d63638" if stopped_auto_cnt else "#6b6080"}">{stopped_auto_cnt}</div><div class="stat-lbl">Stopped (Auto-start)</div></div>
+</div>\n'''
+    if stopped_auto_cnt:
+        svc_body += ('<div class="flag-warning" style="margin:8px 0 12px;"><div class="flag-label">&#9888; Stopped Auto-Start Services</div>'
+                    '<div class="flag-detail">These services are set to auto-start but are currently stopped:</div></div>\n'
+                    '<table><tr><th>Display Name</th><th>Name</th><th>Account</th></tr>\n')
+        for i, s in enumerate(svc_cats['StoppedAuto'][:10]):
+            bg = ' style="background:#fff8e1"'
+            svc_body += (f'<tr{bg}><td>{h(s.get("DisplayName",""))}</td>'
+                        f'<td style="font-family:monospace;font-size:8.5pt">{h(s.get("Name",""))}</td>'
+                        f'<td style="font-size:8.5pt">{h(s.get("StartName",""))}</td></tr>\n')
+        svc_body += '</table>\n'
+    svc_body += f'<div class="sub-title" style="margin-top:10px">Running Services ({running_count})</div>\n'
+    _edr_lbl = f'EDR / Endpoint Protection - {edr}' if edr else 'EDR / Endpoint Protection'
+    cat_display = [('EDR', _edr_lbl), ('PAM', 'Privileged Access Management'),
+                   ('RMM', 'RMM / Managed Services'), ('HyperV', 'Virtualization (Hyper-V)'),
+                   ('Core', 'Windows Core Services'), ('Print', 'Print Services'), ('Other', 'Other')]
+    for cat_k, cat_lbl in cat_display:
+        svcs_c = svc_cats.get(cat_k, [])
+        if not svcs_c: continue
+        svc_body += f'<div class="sub-title" style="margin-top:12px;font-size:9.5px;color:#6b6080">{cat_lbl}</div>\n'
+        if cat_k == 'Other' and len(svcs_c) > 10:
+            svc_body += ('<div class="other-svc-wrapper" style="margin-bottom:8px">'
+                        '<div style="display:flex;justify-content:space-between;align-items:center;">'
+                        f'<span style="font-size:8.5pt;color:#6b6080">{len(svcs_c)} services</span>'
+                        '<button class="collapse-btn" onclick="var t=this.closest(\'.other-svc-wrapper\').querySelector(\'.other-svc-body\');'
+                        'if(t.style.display===\'none\'){t.style.display=\'\';this.textContent=\'&#9650; Collapse\';}else{t.style.display=\'none\';this.textContent=\'&#9660; Expand\';}">'
+                        '&#9660; Expand</button></div>'
+                        '<div class="other-svc-body" style="display:none">\n'
+                        '<table><tr><th>Display Name</th><th>Name</th><th>Start Mode</th><th>Account</th></tr>\n')
+            for i, s in enumerate(svcs_c):
+                bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                svc_body += (f'<tr{bg}><td>{h(s.get("DisplayName",""))}</td>'
+                            f'<td style="font-family:monospace;font-size:8.5pt">{h(s.get("Name",""))}</td>'
+                            f'<td>{h(s.get("StartMode",""))}</td>'
+                            f'<td style="font-size:8.5pt">{h(s.get("StartName",""))}</td></tr>\n')
+            svc_body += '</table>\n</div></div>\n'
+        else:
+            svc_body += '<table><tr><th>Display Name</th><th>Name</th><th>Start Mode</th><th>Account</th></tr>\n'
+            for i, s in enumerate(svcs_c):
+                bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+                svc_body += (f'<tr{bg}><td>{h(s.get("DisplayName",""))}</td>'
+                            f'<td style="font-family:monospace;font-size:8.5pt">{h(s.get("Name",""))}</td>'
+                            f'<td>{h(s.get("StartMode",""))}</td>'
+                            f'<td style="font-size:8.5pt">{h(s.get("StartName",""))}</td></tr>\n')
+            svc_body += '</table>\n'
+    svc_body += top_link(sid)
+
+    # -- SERVICE ANOMALIES CARD ------------------------------------------------
+    anom_body = ''
+    if svc_anomalies:
+        anom_body  = ('<div class="flag-info" style="margin-bottom:14px"><div class="flag-label">Service Security Flags</div>'
+                     '<div class="flag-detail">Services running from suspicious paths (temp/user dirs) or as custom domain accounts. '
+                     'Review with client - LOB app service accounts are often legitimate.</div></div>\n')
+        anom_body += ('<table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:8.5pt">'
+                     '<colgroup><col style="width:18%"><col style="width:22%"><col style="width:14%"><col style="width:46%"></colgroup>'
+                     '<tr><th style="padding:6px 8px;text-align:left">Name</th>'
+                     '<th style="padding:6px 8px;text-align:left">Display Name</th>'
+                     '<th style="padding:6px 8px;text-align:left">Account</th>'
+                     '<th style="padding:6px 8px;text-align:left">Why Flagged</th></tr>\n')
+        for i, sv in enumerate(svc_anomalies):
+            anom_body += (f'<tr style="background:#fff8e1" title="{h(sv.get("Path",""))}">'
+                         f'<td style="padding:5px 8px;font-family:monospace;word-break:break-all">{h(sv.get("Name",""))}</td>'
+                         f'<td style="padding:5px 8px;word-wrap:break-word">{h(sv.get("DisplayName",""))}</td>'
+                         f'<td style="padding:5px 8px;word-break:break-all">{h(sv.get("StartName",""))}</td>'
+                         f'<td style="padding:5px 8px;word-break:break-all;color:#555">{h(sv.get("_reason",""))}</td></tr>\n')
+        anom_body += '</table>\n' + top_link(sid)
+
+    # -- FILE SHARES CARD ------------------------------------------------------
+    shares_body = ''
+    if sl:
+        shares_body = '<table style="font-size:9pt;border-collapse:collapse;width:100%">\n'
+        shares_body += ('<tr style="background:#271e41">'
+                       '<th style="padding:7px 12px;color:#fff;text-align:left">Share</th>'
+                       '<th style="padding:7px 12px;color:#fff;text-align:left">Path</th>'
+                       '<th style="padding:7px 12px;color:#fff;text-align:left">Flag</th></tr>\n')
+        for i, s in enumerate(sl):
+            if not isinstance(s, dict): continue
+            perms_raw = s.get('Permissions', [])
+            # Handle both list and .NET-serialized dict (useless)
+            perms = as_list(perms_raw) if not isinstance(perms_raw, dict) else []
+            everyone_full = False
+            for p in perms:
+                if not isinstance(p, dict): continue
+                acct = (p.get('AccountName') or '').lower()
+                ar = p.get('AccessRight', '')
+                ar_val = ar.get('Value', '') if isinstance(ar, dict) else str(ar)
+                if acct == 'everyone' and ar_val.lower() in ('full', 'fullcontrol'):
+                    everyone_full = True
+                    break
+            flag_cell = ('<span style="background:#fee2e2;color:#991b1b;font-size:8pt;font-weight:700;'
+                         'padding:3px 10px;border-radius:10px;border:1px solid #fca5a5;">&#9888; Everyone: Full</span>'
+                         if everyone_full else
+                         '<span style="color:#065f46;font-size:9pt;">&#10003;</span>')
+            bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            shares_body += (f'<tr{bg}><td style="padding:5px 8px;font-weight:600">{h(s.get("Name",""))}</td>'
+                           f'<td style="padding:5px 8px;font-family:monospace;font-size:8.5pt">{h(s.get("Path",""))}</td>'
+                           f'<td style="padding:5px 8px">{flag_cell}</td></tr>\n')
+        shares_body += '</table>\n' + top_link(sid)
+
+    # -- ASSEMBLE --------------------------------------------------------------
+    tab_html  = sbr_html + nav_html
+    tab_html += card(f'{sid}-alerts',     'Alerts',                  alerts_body)
+    tab_html += card(f'{sid}-overview',   'System Overview',         overview_body)
+    tab_html += card(f'{sid}-hardware',   'Hardware',                hw_body)
+    tab_html += card(f'{sid}-apps',       'Installed Applications',  apps_body)
+    tab_html += card(f'{sid}-roles',      'Roles &amp; Features',    roles_body)
+    tab_html += card(f'{sid}-roleconfig', 'Role Configuration',      rc)
+    if shares_body:
+        tab_html += card(f'{sid}-shares', f'File Shares ({len(sl)})', shares_body)
+    tab_html += card(f'{sid}-disks',      'Disk Storage',            disk_body)
+    tab_html += card(f'{sid}-network',    'Network',                 net_body)
+    tab_html += card(f'{sid}-lports',     'Listening Ports',         lp_body, collapsed=True)
+    tab_html += card(f'{sid}-services',   'Services',                svc_body)
+    if anom_body:
+        tab_html += card(f'{sid}-svc-anomalies', 'Service Security Flags', anom_body)
+
+    return {'id': sid, 'name': name, 'role_label': rlabel,
+            'in_scope': in_sc, 'crit': crit, 'warn': warn, 'tab_html': tab_html}
+
+# -- HYPER-V HOSTS TAB ---------------------------------------------------------
+def build_hv_tab():
+    if not hv_inventories:
+        return '<div style="padding:24px;color:#6b6080;font-style:italic;">No Hyper-V inventory data collected.</div>'
+
+    total_vcpu = 0; total_ram = 0; total_vms = 0; total_running = 0
+    all_html = ''
+
+    for hvi in hv_inventories:
+        is_vsphere = hvi.get('_type') == 'vSphereInventory'
+
+        if is_vsphere:
+            # vSphere inventory field mapping
+            esx_hosts  = hvi.get('ESXHosts', []) or []
+            first_host = esx_hosts[0] if esx_hosts else {}
+            hv_name    = first_host.get('Name') or hvi.get('Server', 'Unknown Host')
+            host_ip    = hvi.get('Server', '')
+            esxi_ver   = hvi.get('Version') or hvi.get('APIVersion', '')
+            host_type  = 'ESXi'
+            hs         = hvi.get('HostSummary', {}) or {}
+            model      = hs.get('Model', first_host.get('Model', '-'))
+            mfg        = hs.get('Manufacturer', first_host.get('Manufacturer', ''))
+            cpu_model  = hs.get('CPUModel', first_host.get('CPUModel', '-'))
+            cpu_cores  = hs.get('CPUCores', first_host.get('CPUCores', '?'))
+            cpu_log    = hs.get('CPULogical', cpu_cores)
+            ram_gb     = float(hs.get('TotalRAMgb', first_host.get('RAMgb', 0)) or 0)
+            vols       = []
+        else:
+            hs         = hvi.get('HostSummary', {})
+            hv_name    = hvi.get('HVHost', 'Unknown Host')
+            host_ip    = hvi.get('HostIP', '')
+            esxi_ver   = hvi.get('ESXiVersion', '')
+            host_type  = hvi.get('HostType', 'Hyper-V')
+            model      = hs.get('Model', '-')
+            mfg        = hs.get('Manufacturer', '')
+            cpu_model  = hs.get('CPUModel', '-')
+            cpu_cores  = hs.get('CPUCores', '?')
+            cpu_log    = hs.get('CPULogical', cpu_cores)
+            ram_gb     = float(hs.get('TotalRAMgb', 0) or 0)
+            vols       = hs.get('Volumes', [])
+
+        datastores = hvi.get('Datastores', [])
+        vms        = hvi.get('VMs', [])
+
+        # Aggregate totals
+        host_vcpu = sum(v.get('vCPU', 0) or 0 for v in vms)
+        host_ram  = sum(float(v.get('RAMgb', 0) or 0) for v in vms)
+        running   = sum(1 for v in vms if v.get('State', '') in ('Running', 'POWERED_ON'))
+        total_vcpu += host_vcpu; total_ram += host_ram
+        total_vms += len(vms); total_running += running
+
+        # VM table
+        vm_rows = ''
+        for i, vm in enumerate(vms):
+            disks     = [d for d in (vm.get('Disks', []) or []) if isinstance(d, dict)]
+            # vSphere uses CapacityGB; Hyper-V uses SizeGB
+            disk_gb   = sum(float(d.get('CapacityGB', d.get('SizeGB', 0)) or 0) for d in disks)
+            disk_used = sum(float(d.get('UsedGB', 0) or 0) for d in disks)
+            disk_str  = f'{disk_gb:.0f} GB' + (f' / {disk_used:.0f} GB used' if disk_used else '')
+            # vSphere uses PowerState; Hyper-V uses State
+            state     = vm.get('PowerState', vm.get('State', '?'))
+            sc        = 'green' if state in ('Running', 'POWERED_ON') else 'gray'
+            snaps     = vm.get('Snapshots', 0) or 0
+            ip_val    = vm.get('IP', '') or vm.get('IPs', '') or '-'
+            guest_os  = vm.get('GuestOS', '')
+            bg        = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            last_col  = (f'<td style="padding:6px 10px;font-size:8pt;color:#6b6080">{h(guest_os)}</td>'
+                         if is_vsphere else
+                         f'<td style="padding:6px 10px;text-align:center">{pill(str(snaps), "yellow" if snaps else "green")}</td>')
+            vm_rows += (f'<tr{bg}>'
+                       f'<td style="font-weight:600;padding:6px 10px">{h(vm.get("Name",""))}</td>'
+                       f'<td style="padding:6px 10px">{pill(state, sc)}</td>'
+                       f'<td style="padding:6px 10px;text-align:center">{vm.get("vCPU","?")}</td>'
+                       f'<td style="padding:6px 10px;text-align:center">{float(vm.get("RAMgb",0) or 0):.0f} GB</td>'
+                       f'<td style="padding:6px 10px;font-family:monospace;font-size:8.5pt">{h(str(ip_val))}</td>'
+                       f'<td style="padding:6px 10px;text-align:center">{disk_str}</td>'
+                       f'{last_col}'
+                       f'</tr>\n')
+
+        last_col_hdr = '<th style="padding:7px 10px;color:#fff">Guest OS</th>' if is_vsphere else '<th style="padding:7px 10px;color:#fff">Snaps</th>'
+
+        # Storage volumes (HyperV) or Datastores (vSphere)
+        vol_rows = ''
+        if is_vsphere:
+            for ds in datastores:
+                cap  = float(ds.get('CapacityGB', 0) or 0)
+                free = float(ds.get('FreeGB', 0) or 0)
+                prov = float(ds.get('ProvisionedGB', 0) or 0)
+                pct  = round((cap - free) / cap * 100, 1) if cap else 0
+                pc   = 'red' if pct >= 85 else ('yellow' if pct >= 70 else 'green')
+                vol_rows += (f'<tr><td style="padding:5px 10px;font-weight:600">{h(ds.get("Name",""))}</td>'
+                            f'<td style="padding:5px 10px;font-size:8.5pt;color:#6b6080">{h(ds.get("Type",""))} &middot; {h(ds.get("DriveType",""))}</td>'
+                            f'<td style="padding:5px 10px">{cap:.0f} GB</td>'
+                            f'<td style="padding:5px 10px">{prov:.0f} GB</td>'
+                            f'<td style="padding:5px 10px">{free:.0f} GB free</td>'
+                            f'<td style="padding:5px 10px">{pill(f"{pct:.0f}%", pc)}{disk_bar(pct)}</td></tr>\n')
+        else:
+            for vol in vols:
+                pct = float(vol.get('UsedPct', 0) or 0)
+                pc  = 'red' if pct >= 85 else ('yellow' if pct >= 70 else 'green')
+                vol_rows += (f'<tr><td style="padding:5px 10px;font-family:monospace">{h(vol.get("Drive",""))}</td>'
+                            f'<td style="padding:5px 10px;font-size:8.5pt;color:#6b6080">{h(vol.get("Label",""))}</td>'
+                            f'<td style="padding:5px 10px">{float(vol.get("TotalGB",0)):.0f} GB</td>'
+                            f'<td style="padding:5px 10px">{float(vol.get("FreeGB",0)):.0f} GB free</td>'
+                            f'<td style="padding:5px 10px">{pill(f"{pct:.0f}%", pc)}{disk_bar(pct)}</td></tr>\n')
+
+        hv_anchor   = hv_name.lower().replace('.', '').replace('-', '')
+        host_badge  = f'ESXi {esxi_ver}' if is_vsphere else 'Hyper-V'
+        host_sub    = (f'{h(mfg)} {h(model)} &middot; {h(cpu_model)} &middot; {cpu_cores} cores &middot; {h(host_ip)}'
+                       if is_vsphere else
+                       f'{h(mfg)} {h(model)} &middot; {h(cpu_model)} &middot; {cpu_cores} cores / {cpu_log} logical &middot; {ram_gb:.0f} GB RAM')
+        storage_label = 'Datastores' if is_vsphere else 'Host Storage Volumes'
+        storage_hdr   = ('''<tr style="background:#ede9fe"><th style="padding:5px 10px;text-align:left;font-size:8pt">Datastore</th><th style="padding:5px 10px;font-size:8pt">Type</th><th style="padding:5px 10px;font-size:8pt">Capacity</th><th style="padding:5px 10px;font-size:8pt">Provisioned</th><th style="padding:5px 10px;font-size:8pt">Free</th><th style="padding:5px 10px;font-size:8pt">Usage</th></tr>'''
+                         if is_vsphere else
+                         '''<tr style="background:#ede9fe"><th style="padding:5px 10px;text-align:left;font-size:8pt">Drive</th><th style="padding:5px 10px;font-size:8pt">Label</th><th style="padding:5px 10px;font-size:8pt">Total</th><th style="padding:5px 10px;font-size:8pt">Free</th><th style="padding:5px 10px;font-size:8pt">Usage</th></tr>''')
+        host_html = f'''
+<div id="hv-host-{hv_anchor}" style="background:#f5f4f8;border-radius:8px;padding:16px 20px;margin-bottom:20px;border:1px solid #e0daf0;">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+  <div>
+    <div style="font-size:13pt;font-weight:700;color:#271e41;">{h(hv_name)} <span style="font-size:8.5pt;font-weight:400;background:#ede9fe;color:#5b1fa4;padding:2px 8px;border-radius:10px;vertical-align:middle">{host_badge}</span></div>
+    <div style="font-size:9pt;color:#6b6080;margin-top:2px;">{host_sub}</div>
+  </div>
+  <div style="text-align:right;">
+    <div style="font-size:9pt;font-weight:700;color:#5b1fa4;">{len(vms)} VMs &middot; {running} running</div>
+    <div style="font-size:8.5pt;color:#6b6080">{host_vcpu} vCPU allocated &middot; {host_ram:.0f} GB RAM allocated</div>
+  </div>
+</div>
+<table style="width:100%;font-size:9pt;border-collapse:collapse;margin-bottom:14px;">
+<tr style="background:#271e41">
+  <th style="padding:7px 10px;color:#fff;text-align:left">VM Name</th>
+  <th style="padding:7px 10px;color:#fff">State</th>
+  <th style="padding:7px 10px;color:#fff">vCPU</th>
+  <th style="padding:7px 10px;color:#fff">RAM</th>
+  <th style="padding:7px 10px;color:#fff">IP</th>
+  <th style="padding:7px 10px;color:#fff">Disk (Size)</th>
+  {last_col_hdr}
+</tr>
+{vm_rows if vm_rows else '<tr><td colspan="7" style="padding:10px;color:#6b6080;font-style:italic;">No VMs found on this host</td></tr>'}
+</table>
+''' + (f'''<div style="font-size:8.5pt;font-weight:700;color:#5b1fa4;margin-bottom:6px;text-transform:uppercase;letter-spacing:.4px;">{storage_label}</div>
+<table style="width:100%;font-size:9pt;border-collapse:collapse;">
+{storage_hdr}
+{vol_rows}
+</table>''' if vol_rows else '') + \
+'<div style="text-align:right;margin-top:10px;padding-top:8px;border-top:1px solid #e0daf0;">' \
+'<a href="#top-virt" style="color:#5b1fa4;font-size:8.5pt;text-decoration:none;font-weight:600;">&#8593; Top</a>' \
+'</div>\n</div>\n'
+
+        all_html += host_html
+
+    # Summary stats card
+    summary_card = f'''<div class="stat-grid" style="margin-bottom:18px;">
+<div class="stat-box"><div class="stat-num">{len(hv_inventories)}</div><div class="stat-lbl">Virtualization Hosts</div></div>
+<div class="stat-box"><div class="stat-num">{total_vms}</div><div class="stat-lbl">Total VMs</div></div>
+<div class="stat-box"><div class="stat-num">{total_vcpu}</div><div class="stat-lbl">vCPUs Allocated</div></div>
+<div class="stat-box"><div class="stat-num">{total_ram:.0f} GB</div><div class="stat-lbl">RAM Allocated</div></div>
+</div>
+<div class="flag-info" style="margin-bottom:18px;">
+  <div class="flag-label">Cloud Sizing Inputs</div>
+  <div class="flag-detail">Total across all Hyper-V hosts: <strong>{total_vcpu} vCPU</strong> allocated &middot; <strong>{total_ram:.0f} GB RAM</strong> allocated &middot; <strong>{total_running} of {total_vms} VMs</strong> running. These are allocated figures - right-size based on actual utilization before quoting.</div>
 </div>'''
-    if sized_vms:
-        # Totals
-        sum_alloc_cpu = sum(v['vcpus'] for v in sized_vms)
-        sum_alloc_ram = sum(v['ram_gb'] for v in sized_vms)
-        sum_sized_cpu = sum((v['sized_cpu'] or 0) for v in sized_vms)
-        sum_sized_ram = sum((v['sized_ram'] or 0) for v in sized_vms)
-        sum_disk_used = sum(v['disk_used'] for v in sized_vms)
-        sum_sized_disk = sum(v['sized_disk'] for v in sized_vms)
 
-        sized_rows = ''.join(
-            f'<tr><td><b>{h(v["name"])}</b></td>'
-            f'<td>{h((v["os"] or "")[:40])}</td>'
-            f'<td>{v["vcpus"]}</td>'
-            f'<td>{("{:.1f}%".format(v["cpu_p95"]) if v["cpu_p95"] is not None else "—")}</td>'
-            f'<td>{("{:.1f}".format(v["sized_cpu"]) if v["sized_cpu"] is not None else "—")}</td>'
-            f'<td>{v["ram_gb"]:.0f}</td>'
-            f'<td>{("{:.1f}%".format(v["mem_p95"]) if v["mem_p95"] is not None else "—")}</td>'
-            f'<td>{("{:.1f}".format(v["sized_ram"]) if v["sized_ram"] is not None else "—")}</td>'
-            f'<td>{v["disk_used"]:,.0f}</td>'
-            f'<td>{v["sized_disk"]:,.0f}</td></tr>'
-            for v in sorted(sized_vms, key=lambda x:-(x['sized_cpu'] or 0))
-        )
-        pc_tab_html += f'''
-<h3>Sizing Methodology</h3>
-<p class="dim">Sized resource = (95th-percentile utilization &times; allocated) &times; 1.20 (20% growth buffer). Powered-off VMs excluded.</p>
-
-<div class="hgrid">
-  <div class="hcell">
-    <h4>Allocated (current)</h4>
-    <div class="stat"><span class="snum">{sum_alloc_cpu}</span><span class="slbl">vCPU allocated</span></div>
-    <div class="stat"><span class="snum">{sum_alloc_ram:.0f}</span><span class="slbl">GB RAM allocated</span></div>
-    <div class="stat"><span class="snum">{sum_disk_used:,.0f}</span><span class="slbl">GB disk consumed</span></div>
+    sbr_html = f'''<div class="sbr-only">
+<div style="background:linear-gradient(135deg,#5b1fa4,#3d1270);border-radius:10px 10px 0 0;padding:16px 24px;display:flex;justify-content:space-between;align-items:center;margin-bottom:0;">
+  <div>
+    <div style="font-size:18px;font-weight:700;color:#fff;letter-spacing:.3px;">{('Hyper-V / ESX' if any(x.get('_type')=='HyperVInventory' for x in hv_inventories) and any(x.get('_type')=='vSphereInventory' for x in hv_inventories) else 'ESX Host Inventory' if any(x.get('_type')=='vSphereInventory' for x in hv_inventories) else 'Hyper-V Host Inventory')} </div>
+    <div style="font-size:9pt;color:rgba(255,255,255,.85);margin-top:3px;">{len(hv_inventories)} hosts &middot; {total_vms} VMs &middot; {total_vcpu} vCPU &middot; {total_ram:.0f} GB RAM allocated</div>
   </div>
-  <div class="hcell">
-    <h4>Right-Sized (P95 + 20%)</h4>
-    <div class="stat"><span class="snum">{sum_sized_cpu:.0f}</span><span class="slbl">vCPU needed</span></div>
-    <div class="stat"><span class="snum">{sum_sized_ram:.0f}</span><span class="slbl">GB RAM needed</span></div>
-    <div class="stat"><span class="snum">{sum_sized_disk:,.0f}</span><span class="slbl">GB disk needed</span></div>
-  </div>
-  <div class="hcell">
-    <h4>Savings vs Provisioned</h4>
-    <div class="stat"><span class="snum">{int((sum_alloc_cpu - sum_sized_cpu)*100/sum_alloc_cpu) if sum_alloc_cpu else 0}%</span><span class="slbl">vCPU reduction</span></div>
-    <div class="stat"><span class="snum">{int((sum_alloc_ram - sum_sized_ram)*100/sum_alloc_ram) if sum_alloc_ram else 0}%</span><span class="slbl">RAM reduction</span></div>
-  </div>
+  <span style="background:rgba(255,255,255,.22);color:#fff;font-size:10pt;font-weight:700;padding:6px 18px;border-radius:20px;border:1.5px solid rgba(255,255,255,.5);">{len(hv_inventories)} Host(s)</span>
 </div>
+<div style="background:white;border-radius:0 0 10px 10px;border:1px solid #e8e4f0;border-top:none;box-shadow:0 4px 14px rgba(0,0,0,.07);padding:20px 24px;margin-bottom:16px;">
+{summary_card}
+</div></div>'''
 
-<h3>Per-VM Sizing ({len(sized_vms)} VMs)</h3>
-<table class="t"><thead><tr>
-  <th rowspan=2>VM</th><th rowspan=2>Guest OS</th>
-  <th colspan=3 style="text-align:center;">CPU</th>
-  <th colspan=3 style="text-align:center;">RAM (GB)</th>
-  <th colspan=2 style="text-align:center;">Disk (GB)</th>
-</tr><tr>
-  <th>Allocated</th><th>P95</th><th>Sized</th>
-  <th>Allocated</th><th>P95</th><th>Sized</th>
-  <th>Used</th><th>Sized</th>
-</tr></thead><tbody>{sized_rows}</tbody></table>
-'''
+    # Build host anchor nav pills
+    hv_nav = '<div id="hv-top-nav" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;">\n'
+    for hvi2 in hv_inventories:
+        hv2_name = hvi2.get('HVHost', 'Unknown Host')
+        hv2_anchor = hv2_name.lower().replace('.', '').replace('-', '')
+        hv_nav += (f'<a href="#hv-host-{hv2_anchor}" onclick="document.getElementById(\'hv-host-{hv2_anchor}\').scrollIntoView({{behavior:\'smooth\',block:\'start\'}});return false;" style="color:#5b1fa4;font-size:9pt;text-decoration:none;'
+                   f'font-weight:700;padding:5px 16px;border-radius:20px;background:#ede9fe;'
+                   f'border:1.5px solid #c4b5fd;">{h(hv2_name)}</a>\n')
+    hv_nav += '</div>\n'
 
-    # =============== COMMVAULT SIZING TAB ==============
-    # Front-end backup target sizing: 1:1 consumed match + 20% growth (M5 BDR rule).
-    # Excludes AS/400, Linux appliances, vCenter/VCSA management VMs by default.
-    EXCLUDE_NAMES = ('vcsa', 'vcenter', 'vrops', 'vrli', 'vmcl', 'qeagle', 'haeagle',
-                     'image-hpe-bnservices', 'esxi', 'vxrail-manager')
-    cv_vms = []
-    cv_excluded = []
-    cv_warnings = []
-    if vc:
-        vc_vms = vc.get('VMs') or []
-        if not isinstance(vc_vms, list): vc_vms = []
-        for v in vc_vms:
-            if not isinstance(v, dict): continue
-            nm = (v.get('Name','') or '').lower()
-            os_str = (v.get('GuestOS','') or '').lower()
-            disk_used = float(v.get('DiskConsumedGB') or 0)
-            if any(x in nm for x in EXCLUDE_NAMES) or 'photon' in os_str:
-                cv_excluded.append({'name': v.get('Name',''), 'reason': 'mgmt/appliance', 'disk': disk_used})
-                continue
-            if v.get('IsLinux'):
-                # Linux is in scope but flag — file-system backup may need agent
-                pass
-            if disk_used <= 0:
-                cv_warnings.append(v.get('Name',''))
-            cv_vms.append({'name': v.get('Name',''), 'os': v.get('GuestOS',''),
-                          'disk_used': disk_used, 'disk_prov': float(v.get('DiskCapGB') or 0),
-                          'is_linux': v.get('IsLinux', False)})
+    top_anchor = '<div id="top-virt"></div>\n'
+    _has_hv2 = any(x.get('_type') == 'HyperVInventory'  for x in hv_inventories)
+    _has_vs2 = any(x.get('_type') == 'vSphereInventory' for x in hv_inventories)
+    _card_title = ('Hyper-V / ESX Summary' if _has_hv2 and _has_vs2
+                   else 'ESX Host Summary'    if _has_vs2
+                   else 'Hyper-V Host Summary')
+    return top_anchor + sbr_html + card('hv-summary', f'{_card_title} ({len(hv_inventories)} Hosts)', hv_nav + summary_card + all_html)
 
-    cv_total_used = sum(v['disk_used'] for v in cv_vms)
-    cv_sized = cv_total_used * BUFFER
+# -- SQL TAB -------------------------------------------------------------------
+_DB_VENDORS = [
+    ('solarwinds',   'SolarWinds'),
+    ('wsus',         'Windows Server Update Services (WSUS)'),
+    ('sharepoint',   'Microsoft SharePoint'),
+    ('reportserver', 'SQL Reporting Services (SSRS)'),
+    ('kiwi',         'Kiwiplan ERP'),
+    ('amtech',       'AmTech ERP'),
+    ('advantage',    'Advantage Software'),
+    ('netsuite',     'NetSuite'),
+    ('quickbooks',   'QuickBooks'),
+    ('sage',         'Sage'),
+    ('dynamics',     'Microsoft Dynamics'),
+    ('navision',     'Dynamics NAV'),
+    ('greatplains',  'Dynamics GP'),
+    ('connectwise',  'ConnectWise'),
+    ('labtech',      'ConnectWise Automate'),
+    ('autotask',     'Autotask / Datto'),
+    ('veeam',        'Veeam Backup'),
+    ('kaseya',       'Kaseya'),
+    ('halo',         'HaloPSA'),
+    ('servicenow',   'ServiceNow'),
+    ('adlumin',      'Adlumin MDR'),
+    ('huntress',     'Huntress'),
+    ('sccm',         'Microsoft SCCM'),
+    ('configmgr',    'Microsoft SCCM'),
+    ('wordpress',    'WordPress'),
+    ('gitlab',       'GitLab'),
+]
 
-    cv_rows = ''.join(
-        f'<tr><td><b>{h(v["name"])}</b></td><td>{h((v["os"] or "")[:40])}</td>'
-        f'<td>{"Linux" if v["is_linux"] else "Windows"}</td>'
-        f'<td>{v["disk_used"]:,.0f}</td><td>{v["disk_prov"]:,.0f}</td>'
-        f'<td>{v["disk_used"]*BUFFER:,.0f}</td></tr>'
-        for v in sorted(cv_vms, key=lambda x:-x['disk_used'])
+def _db_vendor(name):
+    n = name.lower()
+    for k, v in _DB_VENDORS:
+        if k in n: return v
+    return ''
+
+def build_sql_tab():
+    # Collect SQL data from all servers
+    sql_servers = []
+    for srv in servers:
+        data = srv['data']
+        sql_raw = data.get('SQL', {})
+        if isinstance(sql_raw, list): sql_raw = sql_raw[0] if sql_raw else {}
+        if not isinstance(sql_raw, dict): continue
+        inst = sql_raw.get('Instances', {})
+        if not isinstance(inst, dict) or not inst.get('InstanceName'): continue
+        sql_servers.append({'server': srv['name'], 'ip': srv.get('ip',''), 'sql': sql_raw, 'inst': inst})
+
+    if not sql_servers:
+        return None
+
+    total_dbs   = sum(len(s['inst'].get('Databases', []) or []) for s in sql_servers if isinstance(s['inst'].get('Databases'), list))
+    total_data  = sum(
+        sum(float(d.get('DataSizeMB', 0) or 0) for d in (s['inst'].get('Databases') or []) if isinstance(d, dict))
+        for s in sql_servers
     )
-    cv_excl_rows = ''.join(
-        f'<tr><td>{h(v["name"])}</td><td>{h(v["reason"])}</td><td>{v["disk"]:,.0f} GB (excluded)</td></tr>'
-        for v in cv_excluded
+
+    summary = (f'<div class="stat-grid" style="margin-bottom:20px;">'
+               f'<div class="stat-box"><div class="stat-num">{len(sql_servers)}</div><div class="stat-lbl">SQL Servers</div></div>'
+               f'<div class="stat-box"><div class="stat-num">{total_dbs}</div><div class="stat-lbl">Databases</div></div>'
+               f'<div class="stat-box"><div class="stat-num">{total_data/1024:.1f} GB</div><div class="stat-lbl">Total Data Size</div></div>'
+               f'</div>')
+
+    body = '<div id="top-sql"></div>\n'
+
+    # Nav pills
+    nav = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;">\n'
+    for s in sql_servers:
+        anc = s['server'].lower().replace('-','').replace('.','')
+        nav += (f'<a href="#sql-{anc}" onclick="document.getElementById(\'sql-{anc}\').scrollIntoView({{behavior:\'smooth\',block:\'start\'}});return false;" '
+                f'style="color:#5b1fa4;font-size:9pt;text-decoration:none;font-weight:700;padding:5px 16px;'
+                f'border-radius:20px;background:#ede9fe;border:1.5px solid #c4b5fd;">{h(s["server"])}</a>\n')
+    nav += '</div>\n'
+
+    for s in sql_servers:
+        inst = s['inst']
+        anc  = s['server'].lower().replace('-','').replace('.','')
+        ver  = inst.get('Version','-'); ed = inst.get('Edition','-')
+        eol  = inst.get('EOLDate','-'); eol_s = inst.get('EOLStatus','')
+        svc  = inst.get('ServiceAccount','-')
+        conn = inst.get('Connected', False)
+        eol_color = 'red' if eol_s == 'EOL' else ('yellow' if eol_s and 'near' in eol_s.lower() else 'green')
+
+        dbs = [d for d in (inst.get('Databases') or []) if isinstance(d, dict)]
+
+        db_rows = ''
+        for i, db in enumerate(dbs):
+            name    = db.get('Name','')
+            vendor  = _db_vendor(name)
+            data_mb = float(db.get('DataSizeMB', 0) or 0)
+            log_mb  = float(db.get('LogSizeMB', 0) or 0)
+            state   = db.get('State','-')
+            recov   = db.get('RecoveryModel','-')
+            compat  = db.get('CompatLevel','-')
+            backup  = db.get('LastFullBackup','-') or '-'
+            sc      = 'green' if state == 'ONLINE' else 'yellow'
+            bg      = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
+            data_disp = f'{data_mb/1024:.2f} GB' if data_mb >= 1024 else f'{data_mb:.0f} MB'
+            log_disp  = f'{log_mb/1024:.2f} GB'  if log_mb  >= 1024 else f'{log_mb:.0f} MB'
+            db_rows += (f'<tr{bg}>'
+                        f'<td style="padding:6px 10px;font-weight:600;font-family:monospace;font-size:9pt">{h(name)}</td>'
+                        f'<td style="padding:6px 10px;font-size:8.5pt;color:#5b1fa4">{h(vendor) if vendor else "<span style=\'color:#c4b5fd\'>-</span>"}</td>'
+                        f'<td style="padding:6px 10px;text-align:right">{data_disp}</td>'
+                        f'<td style="padding:6px 10px;text-align:right;color:#6b6080">{log_disp}</td>'
+                        f'<td style="padding:6px 10px">{pill(state, sc)}</td>'
+                        f'<td style="padding:6px 10px;font-size:8.5pt">{h(recov)}</td>'
+                        f'<td style="padding:6px 10px;text-align:center;font-size:8.5pt">{h(str(compat))}</td>'
+                        f'<td style="padding:6px 10px;font-size:8.5pt;color:#6b6080">{h(backup)}</td>'
+                        f'</tr>\n')
+
+        db_section = ''
+        if not conn:
+            db_section = '<div class="flag-warning"><div class="flag-label">Deep connect failed</div><div class="flag-detail">Could not connect to SQL instance - database list unavailable. Verify the discovery account has SQL login permissions.</div></div>\n'
+        elif dbs:
+            db_section = (f'<table style="width:100%;font-size:9pt;border-collapse:collapse;margin-top:14px;">'
+                          f'<tr style="background:#271e41">'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:left">Database</th>'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:left">Purpose / Vendor</th>'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:right">Data</th>'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:right">Log</th>'
+                          f'<th style="padding:7px 10px;color:#fff">State</th>'
+                          f'<th style="padding:7px 10px;color:#fff">Recovery</th>'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:center">Compat</th>'
+                          f'<th style="padding:7px 10px;color:#fff">Last Full Backup</th>'
+                          f'</tr>\n{db_rows}</table>\n')
+        else:
+            db_section = '<div style="color:#6b6080;font-style:italic;margin-top:10px;">No user databases found.</div>\n'
+
+        top_lnk = '<div style="text-align:right;margin-top:10px;"><a href="#top-sql" style="color:#5b1fa4;font-size:8.5pt;text-decoration:none;font-weight:600;">&#8593; Top</a></div>\n'
+
+        body += (f'<div id="sql-{anc}" style="background:#f5f4f8;border-radius:8px;padding:16px 20px;'
+                 f'margin-bottom:20px;border:1px solid #e0daf0;">\n'
+                 f'<div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:12px;">\n'
+                 f'<div><div style="font-size:13pt;font-weight:700;color:#271e41;">{h(s["server"])}</div>'
+                 f'<div style="font-size:9pt;color:#6b6080;margin-top:2px;">{h(s["ip"])}</div></div>\n'
+                 f'<div style="text-align:right;">'
+                 f'<div style="font-size:9pt;font-weight:700;color:#5b1fa4;">{h(ed)}</div>'
+                 f'<div style="font-size:8.5pt;color:#6b6080;">v{h(ver)} &middot; EOL {h(eol)} '
+                 f'<span class="pill pill-{eol_color}" style="font-size:7.5pt;">{h(eol_s) or "-"}</span></div>'
+                 f'<div style="font-size:8.5pt;color:#6b6080;margin-top:4px;">Service: {h(svc)}</div>'
+                 f'</div></div>\n'
+                 f'{db_section}{top_lnk}</div>\n')
+
+    return card('sql-all', f'SQL Server Inventory ({len(sql_servers)} Instance{"s" if len(sql_servers)>1 else ""})',
+                nav + summary + body)
+
+def build_eol_tab():
+    """EOL Summary - OS, SQL, Exchange, ESXi/vCenter across all servers."""
+    today = datetime.date.today()
+    rows  = []
+
+    def _eol_row(srv_name, component, version, eol_raw, status):
+        if not eol_raw and not status and not version: return
+        try:
+            eol_dt = datetime.date.fromisoformat(str(eol_raw)[:10]) if eol_raw else None
+        except Exception:
+            eol_dt = None
+        days_left = (eol_dt - today).days if eol_dt else None
+        if status in ('EOL', 'Near EOL') or (days_left is not None and days_left < 365):
+            sev = 'critical' if status == 'EOL' or (days_left is not None and days_left < 0) else 'warning'
+        elif days_left is not None and days_left < 730:
+            sev = 'warning'
+        else:
+            sev = 'ok'
+        rows.append((sev, srv_name, component, h(version or ''), h(eol_raw or status or ''), days_left))
+
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d    = srv.get('data', {})
+        name = srv.get('name', '')
+        sys_ = d.get('System', {})
+        # OS
+        _eol_row(name, 'Windows OS',
+                 sys_.get('OSName', ''),
+                 sys_.get('OSEOLDate', sys_.get('EOLDate', '')),
+                 sys_.get('OSEOLStatus', sys_.get('EOLStatus', '')))
+        # SQL
+        sql_inst = d.get('SQL', {})
+        if isinstance(sql_inst, list) and sql_inst: sql_inst = sql_inst[0]
+        if isinstance(sql_inst, dict) and sql_inst.get('Edition'):
+            _eol_row(name, 'SQL Server',
+                     f'{sql_inst.get("Edition","")} {sql_inst.get("Version","")}',
+                     sql_inst.get('EOLDate', ''), sql_inst.get('EOLStatus', ''))
+        # Exchange
+        exch = d.get('Exchange', {})
+        if isinstance(exch, dict) and exch.get('Installed'):
+            _eol_row(name, 'Exchange',
+                     exch.get('VersionName', ''),
+                     exch.get('EOLDate', ''), exch.get('EOLStatus', ''))
+
+    # Installed app scan - detect EOL-trackable MS products from detection_rules.json
+    _eol_scan = [r for r in RULES.get('eol_product_scan', []) if 'keyword' in r]
+    _seen_per_server = {}  # avoid dupes: (server, slug) pairs
+
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d    = srv.get('data', {})
+        name = srv.get('name', '')
+        apps = as_list(d.get('Apps', d.get('Applications', [])))
+        if not apps: continue
+        for app in apps:
+            if not isinstance(app, dict): continue
+            app_nm  = (app.get('Name', '') or '').lower()
+            app_pub = (app.get('Publisher', '') or '').lower()
+            combined = app_nm + ' ' + app_pub
+            for rule in _eol_scan:
+                kw   = rule['keyword'].lower()
+                slug = rule['slug']
+                if kw not in combined: continue
+                key = (name, slug)
+                if key in _seen_per_server: break
+
+                # Extract version from app record
+                ver_raw = app.get('Version', '')
+
+                if not ver_raw:
+                    _seen_per_server[key] = True; break
+
+                eol_date, eol_status, src = get_product_eol(slug, ver_raw)
+                if src == 'unavailable':
+                    _seen_per_server[key] = True; break  # skip if API down
+                if eol_date or eol_status:
+                    _eol_row(name, rule['label'], ver_raw, eol_date, eol_status)
+                _seen_per_server[key] = True
+                break  # only match first rule per app
+
+    # vSphere (vCenter + ESXi ship together on same version) - live lookup
+    for inv in hv_inventories:
+        if inv.get('_type') not in ('vSphereInventory',): continue
+        hname = inv.get('Hostname', inv.get('Name', 'vSphere'))
+        ver   = str(inv.get('Version', '') or '')
+        if not ver: continue
+        major_minor = '.'.join(ver.split('.')[:2])
+        eol_date, eol_status, src = get_product_eol('vmware-esxi', ver)
+        if not eol_date and src == 'unavailable':
+            eol_status = 'EOL data unavailable - check vmware.com/support/lifecycle'
+        elif not eol_date and src == 'no-match':
+            eol_status = f'Unknown version {major_minor} - check VMware lifecycle'
+        _eol_row(hname, f'vSphere {major_minor} (vCenter + ESXi)', ver, eol_date, eol_status)
+
+    if not rows:
+        return '<div style="padding:32px;text-align:center;color:#6b6080;">No EOL data detected across discovered servers.</div>'
+
+    SEV_ORDER = {'critical': 0, 'warning': 1, 'ok': 2}
+    rows.sort(key=lambda r: (SEV_ORDER.get(r[0], 3), r[4]))
+
+    SEV_COLOR  = {'critical': '#fee2e2', 'warning': '#fef3c7', 'ok': '#f0fdf4'}
+    SEV_BADGE  = {'critical': ('#d63638', 'EOL'),  'warning': ('#b07a00', 'NEAR EOL'), 'ok': ('#065f46', 'OK')}
+    SEV_ICON   = {'critical': '!', 'warning': '~', 'ok': 'v'}
+
+    body  = '<div style="margin-bottom:16px;font-size:9pt;color:#6b6080;">All servers with EOL or near-EOL components. Click a server tab for full detail.</div>\n'
+    body += ('<table style="width:100%;border-collapse:collapse;font-size:9pt;">'
+             '<tr><th style="width:20px"></th><th>Server</th><th>Component</th>'
+             '<th>Version</th><th>EOL Date / Status</th><th>Days Left</th></tr>\n')
+    for sev, srv_name, comp, ver, eol, days_left in rows:
+        bg   = SEV_COLOR.get(sev, '#fff')
+        bc, bl = SEV_BADGE.get(sev, ('#666', ''))
+        badge = f'<span style="background:{bc};color:#fff;border-radius:3px;padding:1px 7px;font-size:7.5pt;font-weight:700;">{bl}</span>'
+        dl_str = (f'{days_left}d' if days_left is not None and days_left >= 0
+                  else f'<span style="color:#d63638;font-weight:700;">{abs(days_left)}d ago</span>' if days_left is not None
+                  else '-')
+        body += (f'<tr style="background:{bg}">'
+                 f'<td style="text-align:center;font-weight:700;color:{bc}">{SEV_ICON[sev]}</td>'
+                 f'<td style="font-weight:600">{h(srv_name)}</td>'
+                 f'<td>{h(comp)}</td><td style="font-size:8.5pt">{ver}</td>'
+                 f'<td>{eol} {badge}</td><td style="font-family:monospace">{dl_str}</td></tr>\n')
+    body += '</table>\n'
+
+    crit_cnt = sum(1 for r in rows if r[0] == 'critical')
+    warn_cnt = sum(1 for r in rows if r[0] == 'warning')
+    summary  = (f'<div style="display:flex;gap:16px;margin-bottom:16px;">'
+                f'<span class="pill pill-red">{crit_cnt} EOL</span>'
+                f'<span class="pill pill-yellow">{warn_cnt} Near EOL</span>'
+                f'</div>')
+    return summary + body
+
+
+def build_private_cloud_tab():
+    """Private cloud + Commvault sizing. Merged view: WinRM data first, hypervisor fills gaps."""
+
+    merged = {}  # keyed by uppercase name -> (name, cpu, ram, total_disk, used_disk, source)
+
+    # Primary: WinRM-discovered servers (best data - real disk usage)
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d    = srv.get('data', {})
+        name = srv.get('name', '')
+        hw   = d.get('Hardware', {})
+        if not hw: continue
+        cores = int(hw.get('CPUCores', hw.get('CPULogicalCount', 0)) or 0)
+        ram   = round(float(hw.get('RAMTotalGB', 0) or 0), 1)
+        disks_raw = as_list(d.get('Disks', []))
+        total_disk = round(sum(float(dk.get('TotalGB', 0) or 0) for dk in disks_raw if isinstance(dk, dict)), 1)
+        used_disk  = round(sum(float(dk.get('TotalGB', 0) or 0) - float(dk.get('FreeGB', 0) or 0)
+                               for dk in disks_raw if isinstance(dk, dict)
+                               and dk.get('TotalGB') is not None and dk.get('FreeGB') is not None), 1)
+        vm_type = 'Virtual' if hw.get('IsVM') else 'Physical'
+        if cores or ram or total_disk:
+            merged[name.upper()] = (name, cores, ram, total_disk, used_disk, 'WinRM', vm_type)
+
+    # Fill gaps: hypervisor inventory (VMs not WinRM-discovered - ODNS, vCenter, etc.)
+    _excluded = {v.upper() for v in CFG.get('exclude_vms', [])}
+    for inv in hv_inventories:
+        for vm in (inv.get('VMs', []) or []):
+            if not isinstance(vm, dict): continue
+            nm = vm.get('Name', '')
+            if nm.upper() in _excluded: continue  # explicitly excluded from scope
+            if nm.upper() in merged: continue  # already have better WinRM data
+            cores = int(vm.get('vCPU', 0) or 0)
+            ram   = round(float(vm.get('RAMgb', vm.get('RAMAllocatedGB', 0)) or 0), 1)
+            vm_disks = as_list(vm.get('Disks', []))
+            # vSphere uses CapacityGB; Hyper-V uses TotalGB
+            total_disk = round(sum(float(dk.get('CapacityGB', dk.get('TotalGB', 0)) or 0)
+                                   for dk in vm_disks if isinstance(dk, dict)), 1)
+            merged[nm.upper()] = (nm, cores, ram, total_disk, 0.0, 'Hypervisor', 'Virtual')
+
+    if not merged:
+        return '<div style="padding:32px;text-align:center;color:#6b6080;">No hardware data collected.</div>'
+
+    all_rows = sorted(merged.values(), key=lambda r: r[0])
+    # Exclude hypervisor management infrastructure from sizing totals.
+    # vCenter/VCSA/ESXi management VMs are not workloads to migrate.
+    # Everything else (including Linux appliances like ODNS) IS a workload.
+    _HV_MGMT = re.compile(r'vcenter|vcsa|vmware.{0,5}center', re.I)
+    def _is_hv_mgmt(name): return bool(_HV_MGMT.search(name))
+    sizing_rows = [r for r in all_rows if not _is_hv_mgmt(r[0])]
+    excl_rows   = [r for r in all_rows if _is_hv_mgmt(r[0])]
+    tot_cpu   = sum(r[1] for r in sizing_rows)
+    tot_ram   = round(sum(r[2] for r in sizing_rows), 1)
+    tot_disk  = round(sum(r[3] for r in sizing_rows), 1)
+    tot_used  = round(sum(r[4] for r in sizing_rows), 1)
+
+    # Commvault sizing
+    cv_src    = tot_used if tot_used > 0 else tot_disk
+    cv_growth = round(cv_src * 1.2, 1)    # +20% growth buffer
+    cv_repos  = max(1, round(cv_growth / 2000, 1))  # repo count at 2TB each
+
+    # Header note
+    out = ('<div class="flag-info" style="margin-bottom:16px;">'
+           '<div class="flag-label">Private Cloud + Commvault Sizing</div>'
+           '<div class="flag-detail">WinRM-discovered servers show actual used disk. '
+           'Hypervisor-only entries show allocated disk (no usage data). '
+           'Add 20% headroom for growth.</div></div>\n')
+
+    # Main sizing table
+    out += ('<div class="sub-title">Server Inventory</div>\n'
+            '<table style="width:100%;border-collapse:collapse;font-size:9pt;">'
+            '<tr><th>Server</th><th>Type</th><th>Source</th><th>vCPU / Cores</th>'
+            '<th>RAM (GB)</th><th>Total Disk (GB)</th><th>Used Disk (GB)</th></tr>\n')
+    for i, (nm, cpu, ram, disk, used, src, vm_type) in enumerate(all_rows):
+        is_excl = _is_hv_mgmt(nm)
+        if is_excl:
+            row_style = 'background:#f9f9f9;opacity:0.55;'
+            name_style = 'color:#9ca3af;'
+            src_cl = 'color:#9ca3af;font-size:8pt;font-style:italic;'
+            dim = 'color:#9ca3af;'
+        else:
+            row_style = 'background:#f5f4f8;' if i % 2 else ''
+            name_style = 'font-weight:600;'
+            src_cl = 'color:#065f46;font-size:8pt;' if src == 'WinRM' else 'color:#6b6080;font-size:8pt;'
+            dim = ''
+        type_color = '#6b6080' if vm_type == 'Virtual' else '#271e41'
+        excl_note = ' <span style="font-size:7.5pt;color:#9ca3af;">(HV mgmt)</span>' if is_excl else ''
+        out += (f'<tr style="{row_style}"><td style="{name_style}">{h(nm)}{excl_note}</td>'
+                f'<td style="font-size:8.5pt;{dim}color:{type_color};">{h(vm_type)}</td>'
+                f'<td style="font-size:8pt;{dim}">{h(src)}</td>'
+                f'<td style="{dim}">{cpu}</td>'
+                f'<td style="{dim}">{ram}</td>'
+                f'<td style="{dim}">{disk}</td>'
+                f'<td style="{dim}">{"-" if not used else used}</td></tr>\n')
+    excl_note_str = (f' <span style="font-size:8pt;font-weight:400;color:rgba(255,255,255,.6);">'
+                     f'({len(excl_rows)} infrastructure/appliance excluded)</span>') if excl_rows else ''
+    out += (f'<tr style="background:#271e41;color:#fff;font-weight:700;">'
+            f'<td colspan="3">WORKLOAD TOTAL ({len(sizing_rows)} servers){excl_note_str}</td>'
+            f'<td>{tot_cpu}</td><td>{tot_ram}</td><td>{tot_disk}</td><td>{tot_used if tot_used else "-"}</td></tr>\n'
+            '</table>\n')
+
+    # Commvault sizing card
+    out += ('<div class="sub-title" style="margin-top:24px;">Commvault Sizing Estimate</div>\n'
+            '<table style="width:60%;border-collapse:collapse;font-size:9pt;">'
+            '<tr><th style="width:55%">Parameter</th><th>Value</th></tr>\n'
+            f'<tr><td>Front-end source data (used disk)</td><td><strong>{cv_src} GB</strong></td></tr>\n'
+            f'<tr style="background:#f5f4f8"><td>CV repository size (match front end)</td><td><strong>{cv_src} GB</strong></td></tr>\n'
+            f'<tr><td>With 20% growth buffer</td><td><strong>{cv_growth} GB</strong></td></tr>\n'
+            f'<tr style="background:#f5f4f8"><td>Est. repository count (2TB ea.)</td><td><strong>{cv_repos}</strong></td></tr>\n'
+            f'<tr><td>Servers to protect</td><td><strong>{len(sizing_rows)}</strong></td></tr>\n'
+            '</table>\n'
+            '<div style="font-size:8pt;color:#9ca3af;margin-top:8px;">'
+            'Sizing per M5 BDR team rule of thumb: CV repository = front-end source data (1:1). Add 20% for growth.</div>\n')
+    return out
+
+
+# -- BUILD ALL TABS -------------------------------------------------------------
+tabs = [(build_linux_tab(s) if s.get('os_type') == 'linux' else build_server_tab(s)) for s in servers]
+virt_tab_html = build_hv_tab()
+sql_tab_html  = build_sql_tab()
+eol_tab_html  = build_eol_tab()
+cloud_tab_html = build_private_cloud_tab()
+
+# -- LOGO ----------------------------------------------------------------------
+if LOGO_B64:
+    src = LOGO_B64 if LOGO_B64.startswith('data:') else f'data:image/png;base64,{LOGO_B64}'
+    logo_html = f'<img src="{src}" style="height:32px;" alt="Magna5" class="logo-img">'
+else:
+    logo_html = '<span style="font-size:14pt;font-weight:700;color:white;letter-spacing:1px;">MAGNA5</span>'
+
+# -- TABS HTML -----------------------------------------------------------------
+# v4.2 layout: environment tabs at top (Hypervisor / SQL / EOL / Private Cloud),
+# per-server tabs in left sidebar with search filter.
+server_tab_buttons = ''  # goes into left sidebar
+for t in tabs:
+    is_linux = servers[[s['id'] for s in servers].index(t['id'])].get('os_type') == 'linux' if t['id'] in [s['id'] for s in servers] else False
+    cls = 'srv-rail-btn' + (' is-linux' if is_linux else tab_cls(t['crit'], t['warn']))
+    scope_ind = '' if t['in_scope'] else ' &#9702;'
+    lx_icon = ' 🐧' if is_linux else ''
+    server_tab_buttons += (
+        f'<button class="{cls}" data-tab="tab-{t["id"]}" '
+        f'data-name="{h(t["name"]).lower()}" '
+        f'onclick="showTab(\'{t["id"]}\')">{h(t["name"])}{lx_icon}{scope_ind}</button>\n'
     )
-    cv_tab_html = f'''
-<h3>Commvault Sizing Methodology</h3>
-<p class="dim">Front-end backup target = 1:1 match of consumed disk on in-scope VMs &times; 1.20 (20% growth buffer).
-Excludes hypervisor management appliances (vCenter/VCSA, vROps, Photon-based VMs) and AS/400 systems by default.</p>
 
-<div class="hgrid">
-  <div class="hcell">
-    <h4>In Scope</h4>
-    <div class="stat"><span class="snum">{len(cv_vms)}</span><span class="slbl">VMs in scope</span></div>
-    <div class="stat"><span class="snum">{cv_total_used:,.0f}</span><span class="slbl">GB consumed (1:1)</span></div>
-  </div>
-  <div class="hcell">
-    <h4>Sized Target</h4>
-    <div class="stat"><span class="snum">{cv_sized:,.0f}</span><span class="slbl">GB front-end (P95+20%)</span></div>
-    <div class="stat"><span class="snum">{cv_sized/1024:.1f}</span><span class="slbl">TiB front-end</span></div>
-  </div>
-  <div class="hcell">
-    <h4>Excluded</h4>
-    <div class="stat"><span class="snum">{len(cv_excluded)}</span><span class="slbl">excluded VMs</span></div>
-    <div class="stat"><span class="snum">{sum(v["disk"] for v in cv_excluded):,.0f}</span><span class="slbl">GB excluded</span></div>
-  </div>
-</div>
+env_tab_buttons = ''  # goes into top tab-nav
+_has_hyperv  = any(h.get('_type') == 'HyperVInventory'   for h in hv_inventories)
+_has_vsphere = any(h.get('_type') == 'vSphereInventory'  for h in hv_inventories)
+_virt_label  = ('Hyper-V / ESX' if _has_hyperv and _has_vsphere
+                else 'ESX Hosts'    if _has_vsphere
+                else 'Hyper-V Hosts')
+env_tab_buttons += f'<button class="tab-btn" data-tab="tab-virt" onclick="showTab(\'virt\')">{_virt_label}</button>\n'
+if sql_tab_html:
+    env_tab_buttons += '<button class="tab-btn" data-tab="tab-sql" onclick="showTab(\'sql\')">SQL</button>\n'
+env_tab_buttons += '<button class="tab-btn" data-tab="tab-eol" onclick="showTab(\'eol\')" style="border-top:3px solid #d63638;">EOL</button>\n'
+env_tab_buttons += '<button class="tab-btn" data-tab="tab-cloud" onclick="showTab(\'cloud\')" style="border-top:3px solid #5b1fa4;">Private Cloud</button>\n'
 
-<h3>In-Scope VMs ({len(cv_vms)})</h3>
-<table class="t"><thead><tr><th>VM</th><th>Guest OS</th><th>Type</th><th>Consumed (GB)</th><th>Provisioned (GB)</th><th>Sized (GB)</th></tr></thead><tbody>{cv_rows or "<tr><td colspan=6 class=dim>No in-scope VMs.</td></tr>"}</tbody></table>
+tab_contents = ''
+for i, t in enumerate(tabs):
+    active = ' active' if i == 0 else ''
+    tab_contents += f'<div id="tab-{t["id"]}" class="tab-content{active}">\n{t["tab_html"]}\n</div>\n'
+tab_contents += f'<div id="tab-virt" class="tab-content">\n{virt_tab_html}\n</div>\n'
+if sql_tab_html:
+    tab_contents += f'<div id="tab-sql" class="tab-content">\n{sql_tab_html}\n</div>\n'
+tab_contents += f'<div id="tab-eol" class="tab-content"><div style="padding:24px;">{eol_tab_html}</div></div>\n'
+tab_contents += f'<div id="tab-cloud" class="tab-content"><div style="padding:24px;">{cloud_tab_html}</div></div>\n'
 
-{f'<h3>Excluded ({len(cv_excluded)})</h3><table class="t"><thead><tr><th>VM</th><th>Reason</th><th>Size</th></tr></thead><tbody>{cv_excl_rows}</tbody></table>' if cv_excluded else ''}
-
-{f'<p class="dim" style="margin-top:14px;">Warning: {len(cv_warnings)} VM(s) had 0 GB consumed (Tools missing or powered off). Review before quoting.</p>' if cv_warnings else ''}
-'''
-
-    # =============== EOL TAB ==============
-    def _eol_class(status_text):
-        t = str(status_text or '').lower()
-        if 'eol' in t or 'unsupported' in t or 'past' in t: return 'eol'
-        if 'near' in t or 'extended' in t or 'approaching' in t: return 'near'
-        if 'supported' in t: return 'ok'
-        # Heuristic on OS names if status is blank
-        if '2008' in t or '2012' in t: return 'eol'
-        if '2016' in t: return 'near'
-        return ''
-    eol_rows = []
-    for s in servers:
-        os_eol = s.get('os_eol','')
-        cls = _eol_class(os_eol) or _eol_class(s['os'])
-        eol_rows.append(f'<tr class="eol-row {cls}"><td>{h(s["name"])}</td><td>OS</td><td>{h(s["os"])}</td><td>{h(os_eol)}</td></tr>')
-        inst = s['sql'].get('Instances') if isinstance(s['sql'], dict) else None
-        if isinstance(inst, dict) and inst.get('InstanceName'):
-            sql_status = inst.get('EOLStatus','')
-            sql_cls = _eol_class(sql_status)
-            # SQL 2016 EOL = 2026-07-14 - flag as near-EOL
-            if '2016' in str(inst.get('Edition','')) and sql_cls == 'ok': sql_cls = 'near'
-            eol_rows.append(f'<tr class="eol-row {sql_cls}"><td>{h(s["name"])}</td><td>SQL</td><td>{h(inst.get("Edition",""))} ({h(inst.get("Version",""))})</td><td>{h(sql_status)} — {h(inst.get("EOLDate",""))}</td></tr>')
-    eol_html = f'''
-<h3>End-of-Life / Lifecycle Status ({len(eol_rows)} rows)</h3>
-<p class="dim">Row color: <span style="background:rgba(127,29,29,0.4);padding:1px 6px;">EOL/unsupported</span> · <span style="background:rgba(120,53,15,0.4);padding:1px 6px;">near-EOL</span> · <span style="background:rgba(20,83,45,0.3);padding:1px 6px;">supported</span></p>
-<table class="t"><thead><tr><th>Server</th><th>Component</th><th>Detail</th><th>EOL Status</th></tr></thead><tbody>{''.join(eol_rows)}</tbody></table>
-'''
-
-    os_breakdown = ', '.join(f'{k or "?"}: {v}' for k,v in env.get('os_counts',{}).items())
-
-    return f'''<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>{h(client)} - Server Discovery</title>
+# -- FULL HTML -----------------------------------------------------------------
+html_out = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{h(CLIENT_FULL)} Server Discovery Report &mdash; {DATE}</title>
 <style>
-*{{box-sizing:border-box;}}body{{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f0;font-size:13.5px;}}
-.hdr{{padding:14px 24px;background:#1e293b;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;}}
-.hdr h1{{margin:0;font-size:18px;}}
-.hdr .meta{{color:#94a3b8;font-size:12.5px;}}
-.topnav{{background:#1e293b;border-bottom:1px solid #334155;padding:0 24px;display:flex;gap:4px;}}
-.tab-btn{{padding:12px 22px;background:transparent;border:none;color:#94a3b8;font-weight:600;font-size:13px;cursor:pointer;border-bottom:2px solid transparent;font-family:inherit;}}
-.tab-btn:hover{{color:#e2e8f0;}}
-.tab-btn.active{{color:#60a5fa;border-bottom-color:#60a5fa;}}
-.view{{display:none;}}
-.view.active{{display:block;}}
-.pad{{padding:24px;}}
-.container{{display:flex;height:calc(100vh - 105px);}}
-.rail{{width:260px;background:#1e293b;border-right:1px solid #334155;overflow-y:auto;flex-shrink:0;}}
-.rail input{{width:calc(100% - 24px);margin:12px;padding:8px 12px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:12.5px;}}
-.rail ul{{margin:0;padding:0;list-style:none;}}
-.rail li{{padding:9px 16px;cursor:pointer;border-bottom:1px solid #1e293b;}}
-.rail li:hover{{background:#334155;}}
-.rail li.active{{background:#1e40af;}}
-.rail-name{{font-weight:600;font-size:12.5px;display:flex;align-items:center;gap:8px;}}
-.rail-meta{{font-size:11px;color:#94a3b8;margin-top:2px;}}
-.dot{{width:8px;height:8px;border-radius:50%;display:inline-block;}}
-.dot.crit{{background:#ef4444;}}
-.main{{flex:1;overflow-y:auto;padding:20px 28px;}}
-.panel{{display:none;}}
-.panel.active{{display:block;}}
-.phead h2{{margin:0;font-size:22px;}}
-.phead .meta{{color:#94a3b8;font-size:12.5px;margin:4px 0 10px;}}
-.badges{{display:flex;gap:6px;margin-bottom:18px;flex-wrap:wrap;}}
-.badge{{padding:3px 10px;border-radius:99px;font-size:11px;background:#334155;color:#cbd5e1;font-weight:600;}}
-.badge.crit{{background:#7f1d1d;color:#fecaca;}}
-.badge.warn{{background:#78350f;color:#fed7aa;}}
-.grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px;}}
-.cell{{background:#1e293b;border:1px solid #334155;padding:14px 18px;border-radius:8px;}}
-.cell h4{{margin:0 0 8px;font-size:11px;color:#93c5fd;text-transform:uppercase;letter-spacing:.5px;}}
-.cell div{{font-size:12.5px;margin:3px 0;}}
-h3{{margin:20px 0 8px;font-size:13px;color:#93c5fd;text-transform:uppercase;letter-spacing:.5px;}}
-h4{{margin:14px 0 6px;font-size:12px;color:#93c5fd;text-transform:uppercase;letter-spacing:.5px;}}
-table.t, table.kv{{width:100%;border-collapse:collapse;font-size:12.5px;margin-bottom:8px;}}
-table.t th, table.kv th{{text-align:left;padding:6px 10px;background:#1e293b;color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #334155;}}
-table.t td, table.kv td{{padding:6px 10px;border-bottom:1px solid #1e293b;vertical-align:top;}}
-table.kv td:first-child{{color:#94a3b8;width:200px;}}
-.sev{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;}}
-.sev.red,.sev.critical{{background:#7f1d1d;color:#fecaca;}}
-.sev.warn,.sev.warning{{background:#78350f;color:#fed7aa;}}
-.sev.info{{background:#1e3a8a;color:#bfdbfe;}}
-.bar{{display:inline-block;width:140px;height:8px;background:#334155;border-radius:3px;overflow:hidden;vertical-align:middle;}}
-.bar div{{height:100%;}}
-.chip{{display:inline-block;padding:3px 9px;border-radius:99px;font-size:11px;background:#334155;color:#cbd5e1;margin:2px;}}
-.crit{{color:#fecaca;}} .warn{{color:#fed7aa;}} .info{{color:#bfdbfe;}}
-.dim{{color:#64748b;font-style:italic;}}
-.hgrid{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:18px;margin-bottom:18px;}}
-.hcell{{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:16px 20px;}}
-.hcell h3{{margin:0 0 10px;}}
-.stat{{display:flex;align-items:baseline;gap:10px;margin:6px 0;}}
-.snum{{font-size:24px;font-weight:700;color:#60a5fa;}}
-.slbl{{font-size:12px;color:#94a3b8;}}
-.findings-list .f-row{{padding:10px 14px;border-radius:6px;background:#1e293b;border-left:4px solid #38bdf8;margin:6px 0;}}
-.findings-list .f-row.crit{{border-color:#ef4444;}}
-.findings-list .f-row.warn{{border-color:#f59e0b;}}
-.findings-list .f-row b{{display:block;color:#e2e8f0;margin-bottom:3px;}}
-.findings-list .f-row div{{color:#94a3b8;font-size:12.5px;}}
-.findings-list .f-row[onclick]{{cursor:pointer;}}
-.findings-list .f-row[onclick]:hover{{background:#334155;}}
-.jump{{font-size:12px;color:#60a5fa;cursor:pointer;text-decoration:none;font-weight:600;margin-left:8px;}}
-.jump:hover{{text-decoration:underline;}}
-.stat-row{{font-size:12.5px;margin:4px 0;color:#cbd5e1;}}
-.stat-row b{{color:#94a3b8;font-weight:600;}}
-.clickable tbody tr{{cursor:pointer;}}
-.clickable tbody tr:hover{{background:#334155;}}
-.cnt{{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;font-weight:700;}}
-.cnt.crit{{background:#7f1d1d;color:#fecaca;}}
-.cnt.warn{{background:#78350f;color:#fed7aa;}}
-.tools-grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px;}}
-.tools-grid > div{{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:14px 18px;}}
-.tools-grid h5{{margin:0 0 8px;font-size:11px;color:#93c5fd;text-transform:uppercase;letter-spacing:.5px;}}
-.eol-row.eol{{background:rgba(127,29,29,0.18);}}
-.eol-row.near{{background:rgba(120,53,15,0.18);}}
-.eol-row.ok{{background:rgba(20,83,45,0.12);}}
-details summary{{cursor:pointer;list-style:none;}}
-details summary::-webkit-details-marker{{display:none;}}
-details summary::before{{content:'▶ ';color:#94a3b8;font-size:10px;}}
-details[open] summary::before{{content:'▼ ';}}
-code{{background:#0f172a;padding:1px 6px;border-radius:3px;font-family:'Cascadia Mono',Consolas,monospace;font-size:12px;}}
-</style></head><body>
-<div class="hdr">
-  <h1>{h(client)} — Server Discovery</h1>
-  <div class="meta">{session['date']} · {env['total']} servers · {os_breakdown}</div>
-</div>
-<div class="topnav">
-  <button class="tab-btn active" onclick="setView(this,'overview')">Overview</button>
-  <button class="tab-btn" onclick="setView(this,'servers')">Servers ({env['total']})</button>
-  <button class="tab-btn" onclick="setView(this,'hypervisor')">Hypervisor</button>
-  <button class="tab-btn" onclick="setView(this,'ad')">Active Directory</button>
-  <button class="tab-btn" onclick="setView(this,'sql')">SQL</button>
-  <button class="tab-btn" onclick="setView(this,'pcsizing')">Private Cloud Sizing</button>
-  <button class="tab-btn" onclick="setView(this,'cvsizing')">Commvault Sizing</button>
-  <button class="tab-btn" onclick="setView(this,'eol')">EOL Risks</button>
-</div>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+html {{ scroll-padding-top: 100px; }}
+body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f5f4f8; color: #271e41; font-size: 10pt; }}
+.wrap {{ max-width: 1040px; margin: 0 auto; padding: 20px; }}
+.tab-nav {{ display: flex; gap: 4px; margin-bottom: -1px; flex-wrap: wrap; }}
+.tab-btn {{ padding: 8px 18px; background: #ddd9ee; border: 1px solid #c0b8d8; border-bottom: none; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 9.5pt; color: #271e41; font-weight: 600; }}
+.tab-btn.active {{ background: white; border-bottom: 1px solid white; color: #5b1fa4; }}
+.tab-btn.has-critical {{ border-top: 3px solid #d63638; }}
+.tab-btn.has-warning  {{ border-top: 3px solid #f5a623; }}
+.tab-btn.is-linux     {{ border-top: 3px solid #0d9488; color: #0f4c5c; }}
+.tab-content {{ display: none; }}
+.tab-content.active {{ display: block; }}
+.card {{ background: white; border-radius: 0 8px 8px 8px; padding: 24px; margin-bottom: 18px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); border: 1px solid #e8e4f0; }}
+.card-title {{ font-size: 15px; font-weight: 700; color: #271e41; text-transform: uppercase; letter-spacing: 1px; border-bottom: 2px solid #5b1fa4; padding-bottom: 8px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }}
+.collapse-btn {{ background: none; border: 1px solid #c4b5fd; border-radius: 4px; color: #5b1fa4; font-size: 8pt; padding: 2px 8px; cursor: pointer; font-weight: 600; flex-shrink: 0; }}
+.card-body {{ }}
+.card-body.collapsed {{ display: none; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 9.5pt; }}
+th {{ background: #271e41; color: #fff; font-weight: 600; padding: 7px 12px; text-align: left; }}
+td {{ padding: 6px 12px; border: 1px solid #d0cce0; vertical-align: top; }}
+tr:nth-child(even) td {{ background: #f5f4f8; }}
+.flag-critical {{ background: #fff0f0; border-left: 4px solid #d63638; border-radius: 0 6px 6px 0; padding: 12px 16px; margin-bottom: 8px; }}
+.flag-warning  {{ background: #fff8e1; border-left: 4px solid #f5a623; border-radius: 0 6px 6px 0; padding: 12px 16px; margin-bottom: 8px; }}
+.flag-info     {{ background: #f0f4ff; border-left: 4px solid #5b1fa4; border-radius: 0 6px 6px 0; padding: 12px 16px; margin-bottom: 8px; }}
+.flag-ok       {{ background: #f0fdf0; border-left: 4px solid #20c800; border-radius: 0 6px 6px 0; padding: 12px 16px; margin-bottom: 8px; }}
+.flag-label    {{ font-size: 8.5pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }}
+.flag-critical .flag-label {{ color: #d63638; }}
+.flag-warning  .flag-label {{ color: #b07a00; }}
+.flag-info     .flag-label {{ color: #5b1fa4; }}
+.flag-ok       .flag-label {{ color: #20c800; }}
+.flag-detail   {{ font-size: 9.5pt; color: #271e41; margin-top: 4px; }}
+.pill {{ display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: 8pt; font-weight: 700; }}
+.pill-red    {{ background: #fee2e2; color: #991b1b; }}
+.pill-yellow {{ background: #fef3c7; color: #92400e; }}
+.pill-green  {{ background: #d1fae5; color: #065f46; }}
+.pill-gray   {{ background: #f3f4f6; color: #374151; }}
+.pill-purple {{ background: #ede9fe; color: #5b1fa4; }}
+.stat-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }}
+.stat-box {{ background: #f5f4f8; border-radius: 6px; padding: 12px; text-align: center; }}
+.stat-num  {{ font-size: 22px; font-weight: 700; color: #5b1fa4; }}
+.stat-lbl  {{ font-size: 8pt; color: #6b6080; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }}
+.role-grid {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+.role-badge {{ background: #ede9fe; color: #5b1fa4; border-radius: 4px; padding: 4px 12px; font-size: 9pt; font-weight: 600; border: 1px solid #c4b5fd; }}
+.disk-bar-bg  {{ background: #e9e4f5; border-radius: 4px; height: 10px; width: 100%; margin-top: 4px; }}
+.disk-bar-fill {{ height: 10px; border-radius: 4px; }}
+.sub-title {{ font-size: 13px; font-weight: 700; color: #5b1fa4; text-transform: uppercase; letter-spacing: 0.8px; margin: 16px 0 8px; }}
+.meta-line {{ font-size: 8.5pt; color: #6b6080; margin-bottom: 2px; }}
+.sbr-only  {{ display: none !important; }}
+body.view-sbr .sbr-only {{ display: block !important; }}
+body.view-sbr .hide-sbr {{ display: none !important; }}
+.view-bar  {{ background: #1a1432; padding: 8px 28px; display: flex; align-items: center; gap: 10px; position: sticky; top: 52px; z-index: 199; border-radius: 0 0 6px 6px; border-top: 1px solid rgba(255,255,255,.08); }}
+.view-lbl  {{ font-size: 8pt; color: #a89bc8; text-transform: uppercase; letter-spacing: .5px; font-weight: 700; }}
+.view-btn  {{ background: transparent; border: 1px solid #4a3a6a; border-radius: 4px; color: #c4b5fd; font-size: 9pt; padding: 4px 14px; cursor: pointer; font-weight: 600; transition: all .15s; }}
+.view-btn:hover {{ background: #2d2060; }}
+.view-btn.v-active {{ background: #5b1fa4; color: white; border-color: #5b1fa4; }}
+.view-desc {{ font-size: 8.5pt; color: #7c6b9e; margin-left: 6px; }}
+details summary {{ cursor: pointer; font-weight: 600; color: #5b1fa4; padding: 6px 0; list-style: none; }}
+details summary::before {{ content: '\\25B6  '; font-size: 9pt; }}
+details[open] summary::before {{ content: '\\25BC  '; }}
 
-<div class="view active" id="v-overview"><div class="pad">{overview_html}</div></div>
-
-<div class="view" id="v-servers">
-  <div class="container">
-    <div class="rail">
-      <input type="text" placeholder="Filter servers..." oninput="filterRail(this.value)">
-      <ul id="rail-list">{rail_html}</ul>
-    </div>
-    <div class="main" id="main">{''.join(panels)}</div>
+/* v4.2 layout: wider wrap, environment tabs at top, server list in left sidebar */
+.wrap-v42 {{ max-width: 1400px; margin: 0 auto; padding: 18px 24px; }}
+.layout-v42 {{ display: flex; gap: 0; align-items: flex-start; }}
+.server-rail {{ width: 240px; flex-shrink: 0; background: white; border: 1px solid #e8e4f0; border-radius: 0 0 8px 8px; max-height: calc(100vh - 220px); overflow-y: auto; position: sticky; top: 110px; }}
+.rail-head {{ padding: 14px 16px 10px; border-bottom: 1px solid #e8e4f0; background: #f7f5fb; border-radius: 0 0 0 0; }}
+.rail-title {{ font-size: 11pt; font-weight: 700; color: #271e41; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 8px; }}
+.rail-search {{ width: 100%; padding: 6px 10px; border: 1px solid #c0b8d8; border-radius: 4px; font-size: 9pt; font-family: inherit; }}
+.rail-list {{ padding: 6px 0; }}
+.srv-rail-btn {{ width: 100%; text-align: left; padding: 8px 16px; background: transparent; border: none; border-left: 3px solid transparent; cursor: pointer; font-size: 9.5pt; color: #271e41; font-weight: 600; font-family: inherit; display: block; }}
+.srv-rail-btn:hover {{ background: #f5f4f8; }}
+.srv-rail-btn.active {{ background: #ede7fa; border-left-color: #5b1fa4; color: #5b1fa4; }}
+.srv-rail-btn.has-critical {{ border-left-color: #d63638; }}
+.srv-rail-btn.has-critical.active {{ background: #fff0f0; }}
+.srv-rail-btn.has-warning  {{ border-left-color: #f5a623; }}
+.srv-rail-btn.has-warning.active {{ background: #fff8e1; }}
+.srv-rail-btn.is-linux     {{ border-left-color: #0d9488; color: #0f4c5c; }}
+.tab-content-area {{ flex: 1; background: white; border: 1px solid #e8e4f0; border-left: none; border-radius: 0 8px 8px 8px; padding: 0; min-width: 0; }}
+.tab-content-area .tab-content {{ padding: 0; }}
+</style>
+</head>
+<body class="view-adv">
+<div style="background:#1a1432;padding:12px 28px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:200;">
+  <div style="display:flex;align-items:center;gap:16px;">
+    {logo_html}
+    <div style="color:rgba(255,255,255,.5);font-size:10pt;">|</div>
+    <div style="color:white;font-size:10pt;font-weight:600;">{h(CLIENT_FULL)}</div>
+    <div style="color:rgba(255,255,255,.5);font-size:10pt;">|</div>
+    <div style="color:rgba(255,255,255,.7);font-size:9pt;">Server Discovery Report &middot; {DATE}</div>
   </div>
+  <div style="color:rgba(255,255,255,.5);font-size:8.5pt;">Collected by Magna5 SE Team</div>
 </div>
-
-<div class="view" id="v-hypervisor"><div class="pad">{hv_tab_html}</div></div>
-<div class="view" id="v-ad"><div class="pad">{ad_tab_html}</div></div>
-<div class="view" id="v-sql"><div class="pad">{sql_tab_html}</div></div>
-<div class="view" id="v-pcsizing"><div class="pad">{pc_tab_html}</div></div>
-<div class="view" id="v-cvsizing"><div class="pad">{cv_tab_html}</div></div>
-<div class="view" id="v-eol"><div class="pad">{eol_html}</div></div>
-
+<div class="view-bar">
+  <span class="view-lbl">View:</span>
+  <button class="view-btn v-active" id="vbtn-adv" onclick="setView('adv')">Advanced</button>
+  <button class="view-btn" id="vbtn-sbr" onclick="setView('sbr')">SBR</button>
+  <span class="view-desc" id="view-desc">Full technical detail &mdash; SE view</span>
+</div>
+<div class="wrap-v42">
+<div class="tab-nav">
+{env_tab_buttons}
+</div>
+<div class="layout-v42">
+  <aside class="server-rail">
+    <div class="rail-head">
+      <div class="rail-title">Servers ({len(servers)})</div>
+      <input type="text" class="rail-search" placeholder="Filter..." oninput="filterServerRail(this.value)">
+    </div>
+    <div class="rail-list">
+{server_tab_buttons}
+    </div>
+  </aside>
+  <main class="tab-content-area">
+{tab_contents}
+  </main>
+</div>
+</div>
+<div style="text-align:center;padding:24px 0 32px;color:#a89bc8;font-size:8pt;letter-spacing:.3px;">
+  Generated {DATE} ET &middot; Magna5 Solutions Engineering &middot; SDT v3.0
+</div>
 <script>
-function setView(btn, name) {{
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById('v-'+name).classList.add('active');
-  if (name === 'servers' && !document.querySelector('.panel.active')) {{
-    const first = document.querySelector('.rail li');
-    if (first) first.click();
-  }}
+var VIEW_DESCS = {{
+  basic: "Simplified view &mdash; SE &amp; CSM",
+  adv:   "Full technical detail &mdash; SE view",
+  sbr:   "Executive health dashboard &mdash; client &amp; leadership"
+}};
+function setView(v) {{
+  document.body.classList.remove("view-adv","view-sbr");
+  document.body.classList.add("view-" + v);
+  document.querySelectorAll(".view-btn").forEach(function(b){{ b.classList.remove("v-active"); }});
+  var btn = document.getElementById("vbtn-" + v);
+  if (btn) btn.classList.add("v-active");
+  var desc = document.getElementById("view-desc");
+  if (desc) desc.innerHTML = VIEW_DESCS[v] || "";
+  try {{ localStorage.setItem("sdView", v); }} catch(e) {{}}
 }}
-function showServer(li, id) {{
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.getElementById('p-'+id).classList.add('active');
-  document.querySelectorAll('.rail li').forEach(x => x.classList.remove('active'));
-  li.classList.add('active');
-  document.getElementById('main').scrollTop = 0;
+function showTab(id) {{
+  document.querySelectorAll('.tab-content').forEach(function(el){{ el.classList.remove('active'); }});
+  document.querySelectorAll('.tab-btn').forEach(function(el){{ el.classList.remove('active'); }});
+  document.querySelectorAll('.srv-rail-btn').forEach(function(el){{ el.classList.remove('active'); }});
+  var tc = document.getElementById('tab-' + id);
+  if (tc) tc.classList.add('active');
+  document.querySelectorAll('[data-tab="tab-' + id + '"]').forEach(function(el){{ el.classList.add('active'); }});
+  window.scrollTo(0, 0);
 }}
-function filterRail(q) {{
-  q = q.toLowerCase();
-  document.querySelectorAll('.rail li').forEach(li => {{
-    li.style.display = (li.dataset.name.includes(q) || li.dataset.os.includes(q)) ? '' : 'none';
+function filterServerRail(q) {{
+  q = (q || '').toLowerCase();
+  document.querySelectorAll('.srv-rail-btn').forEach(function(b){{
+    var match = !q || (b.dataset.name || '').includes(q);
+    b.style.display = match ? '' : 'none';
   }});
 }}
-function setViewByName(name) {{
-  const btn = document.querySelector(`.tab-btn[onclick*="'${{name}}'"]`);
-  if (btn) btn.click();
+function toggleCard(btn) {{
+  var body = btn.closest('.card').querySelector('.card-body');
+  if (!body) return;
+  body.classList.toggle('collapsed');
+  btn.textContent = body.classList.contains('collapsed') ? '\u25bc Expand' : '\u25b2 Collapse';
 }}
-function jumpToServer(id) {{
-  setViewByName('servers');
-  const li = document.querySelector(`.rail li[onclick*="'${{id}}'"]`);
-  if (li) li.click();
-}}
+window.addEventListener('DOMContentLoaded', function() {{
+  var saved = 'adv';
+  try {{ saved = localStorage.getItem('sdView') || 'adv'; }} catch(e) {{}}
+  setView(saved);
+  // Default to first server tab (sidebar) so the user lands on a populated view
+  var firstSrv = document.querySelector('.srv-rail-btn');
+  if (firstSrv) {{ firstSrv.click(); }}
+  else {{
+    var firstEnv = document.querySelector('.tab-btn');
+    if (firstEnv) firstEnv.click();
+  }}
+}});
 </script>
-</body></html>'''
+</body>
+</html>
+'''
 
-if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print('usage: python gen_report.py <manifest.json | session_dir> [out_html]'); sys.exit(1)
-    arg = Path(sys.argv[1])
-    if arg.is_dir():
-        session_dir = arg
-    elif arg.is_file() and arg.name.endswith('.json'):
-        session_dir = arg.parent
-    else:
-        print(f'error: not a manifest or directory: {arg}'); sys.exit(2)
-    session = load_session(session_dir)
-    out = render(session)
-    if len(sys.argv) >= 3:
-        out_path = Path(sys.argv[2])
-    else:
-        client_slug = (session['client'] or 'Client').replace(' ','_').replace('/','_')
-        date = session['date'] or 'undated'
-        out_path = session_dir / f'{client_slug}-DiscoveryReport-{date}.html'
-    out_path.write_text(out, encoding='utf-8')
-    print(f'Wrote {out_path} ({len(out):,} bytes, {len(session["servers"])} servers)')
+with open(OUTPUT, 'w', encoding='utf-8') as f:
+    f.write(html_out)
+
+print(f"Report written to: {OUTPUT}")
+total_crit = sum(t['crit'] for t in tabs)
+total_warn = sum(t['warn'] for t in tabs)
+print(f"Summary: {total_crit} critical flags, {total_warn} warnings across {len(tabs)} servers")
