@@ -1221,6 +1221,10 @@ function startPolling(){
         if (s.Status === 'complete') {
           document.getElementById('tb-report').disabled = false;
           renderReport(s);
+          // Auto-jump to Results tab once the run finishes so the user
+          // lands directly on the report. Setup/Run tabs remain navigable
+          // with their last state preserved.
+          setTab('report');
         }
       }
     } catch(e) { /* transient network error; keep polling */ }
