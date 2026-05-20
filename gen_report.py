@@ -982,13 +982,14 @@ def build_server_tab(srv):
 '''
 
     # -- NAV BAR ---------------------------------------------------------------
-    sect_links = [('Alerts', f'{sid}-alerts'), ('Overview', f'{sid}-overview'),
+    sect_links = [('Overview', f'{sid}-overview'),
                   ('Hardware', f'{sid}-hardware'), ('Applications', f'{sid}-apps'),
                   ('Roles', f'{sid}-roles'), ('Role Config', f'{sid}-roleconfig')]
     if real_shares:   sect_links.append(('File Shares', f'{sid}-shares'))
     sect_links += [('Disks', f'{sid}-disks'), ('Network', f'{sid}-network'),
                    ('Listening Ports', f'{sid}-lports'), ('Services', f'{sid}-services')]
     if svc_anomalies: sect_links.append(('Svc Flags', f'{sid}-svc-anomalies'))
+    sect_links.append(('Alerts', f'{sid}-alerts'))
 
     role_conf_links = {}
     if has_adds:  role_conf_links['Active Directory'] = f'{sid}-roleconf-ad'
@@ -1571,7 +1572,6 @@ def build_server_tab(srv):
 
     # -- ASSEMBLE --------------------------------------------------------------
     tab_html  = sbr_html + nav_html
-    tab_html += card(f'{sid}-alerts',     'Alerts',                  alerts_body)
     tab_html += card(f'{sid}-overview',   'System Overview',         overview_body)
     tab_html += card(f'{sid}-hardware',   'Hardware',                hw_body)
     tab_html += card(f'{sid}-apps',       'Installed Applications',  apps_body)
@@ -1585,6 +1585,7 @@ def build_server_tab(srv):
     tab_html += card(f'{sid}-services',   'Services',                svc_body)
     if anom_body:
         tab_html += card(f'{sid}-svc-anomalies', 'Service Security Flags', anom_body)
+    tab_html += card(f'{sid}-alerts',     'Alerts',                  alerts_body, collapsed=True)
 
     return {'id': sid, 'name': name, 'role_label': rlabel,
             'in_scope': in_sc, 'crit': crit, 'warn': warn, 'tab_html': tab_html}
@@ -2121,15 +2122,16 @@ def build_private_cloud_tab():
     # Header note
     out = ('<div class="flag-info" style="margin-bottom:16px;">'
            '<div class="flag-label">Private Cloud + Commvault Sizing</div>'
-           '<div class="flag-detail">WinRM-discovered servers show actual used disk. '
-           'Hypervisor-only entries show allocated disk (no usage data). '
+           '<div class="flag-detail">Disk sizing is based on <strong>CONSUMED</strong> (actual used) capacity, '
+           'not provisioned/allocated. WinRM-discovered servers report consumed disk directly. '
+           'Hypervisor-only entries fall back to allocated disk when usage data is unavailable. '
            'Add 20% headroom for growth.</div></div>\n')
 
     # Main sizing table
     out += ('<div class="sub-title">Server Inventory</div>\n'
             '<table style="width:100%;border-collapse:collapse;font-size:9pt;">'
             '<tr><th>Server</th><th>Type</th><th>Source</th><th>vCPU / Cores</th>'
-            '<th>RAM (GB)</th><th>Total Disk (GB)</th><th>Used Disk (GB)</th></tr>\n')
+            '<th>RAM (GB)</th><th>Allocated Disk (GB)</th><th>Consumed Disk (GB)</th></tr>\n')
     for i, (nm, cpu, ram, disk, used, src, vm_type) in enumerate(all_rows):
         is_excl = _is_hv_mgmt(nm)
         if is_excl:
@@ -2151,22 +2153,23 @@ def build_private_cloud_tab():
                 f'<td style="{dim}">{ram}</td>'
                 f'<td style="{dim}">{disk}</td>'
                 f'<td style="{dim}">{"-" if not used else used}</td></tr>\n')
-    excl_note_str = (f' <span style="font-size:8pt;font-weight:400;color:rgba(255,255,255,.6);">'
+    excl_note_str = (f' <span style="font-size:8pt;font-weight:400;color:rgba(255,255,255,.7);">'
                      f'({len(excl_rows)} infrastructure/appliance excluded)</span>') if excl_rows else ''
-    out += (f'<tr style="background:#271e41;color:#fff;font-weight:700;">'
-            f'<td colspan="3">WORKLOAD TOTAL ({len(sizing_rows)} servers){excl_note_str}</td>'
-            f'<td>{tot_cpu}</td><td>{tot_ram}</td><td>{tot_disk}</td><td>{tot_used if tot_used else "-"}</td></tr>\n'
+    _tot_td = 'background:#271e41 !important;color:#fff !important;font-weight:700;'
+    out += (f'<tr>'
+            f'<td colspan="3" style="{_tot_td}">WORKLOAD TOTAL ({len(sizing_rows)} servers){excl_note_str}</td>'
+            f'<td style="{_tot_td}">{tot_cpu}</td><td style="{_tot_td}">{tot_ram}</td>'
+            f'<td style="{_tot_td}">{tot_disk}</td><td style="{_tot_td}">{tot_used if tot_used else "-"}</td></tr>\n'
             '</table>\n')
 
     # Commvault sizing card
     out += ('<div class="sub-title" style="margin-top:24px;">Commvault Sizing Estimate</div>\n'
             '<table style="width:60%;border-collapse:collapse;font-size:9pt;">'
             '<tr><th style="width:55%">Parameter</th><th>Value</th></tr>\n'
-            f'<tr><td>Front-end source data (used disk)</td><td><strong>{cv_src} GB</strong></td></tr>\n'
-            f'<tr style="background:#f5f4f8"><td>CV repository size (match front end)</td><td><strong>{cv_src} GB</strong></td></tr>\n'
-            f'<tr><td>With 20% growth buffer</td><td><strong>{cv_growth} GB</strong></td></tr>\n'
-            f'<tr style="background:#f5f4f8"><td>Est. repository count (2TB ea.)</td><td><strong>{cv_repos}</strong></td></tr>\n'
-            f'<tr><td>Servers to protect</td><td><strong>{len(sizing_rows)}</strong></td></tr>\n'
+            f'<tr><td>Front-end source data (consumed disk, 1:1 CV repo)</td><td><strong>{cv_src} GB</strong></td></tr>\n'
+            f'<tr style="background:#f5f4f8"><td>With 20% growth buffer</td><td><strong>{cv_growth} GB</strong></td></tr>\n'
+            f'<tr><td>Est. repository count (2TB ea.)</td><td><strong>{cv_repos}</strong></td></tr>\n'
+            f'<tr style="background:#f5f4f8"><td>Servers to protect</td><td><strong>{len(sizing_rows)}</strong></td></tr>\n'
             '</table>\n'
             '<div style="font-size:8pt;color:#9ca3af;margin-top:8px;">'
             'Sizing per M5 BDR team rule of thumb: CV repository = front-end source data (1:1). Add 20% for growth.</div>\n')
@@ -2290,16 +2293,16 @@ table {{ width: 100%; border-collapse: collapse; font-size: 9.5pt; }}
 th {{ background: #271e41; color: #fff; font-weight: 600; padding: 7px 12px; text-align: left; }}
 td {{ padding: 6px 12px; border: 1px solid #d0cce0; vertical-align: top; }}
 tr:nth-child(even) td {{ background: #f5f4f8; }}
-.flag-critical {{ background: #fff0f0; border-left: 3px solid #d63638; border-radius: 0 4px 4px 0; padding: 6px 12px; margin-bottom: 4px; font-size: 9pt; }}
-.flag-warning  {{ background: #fff8e1; border-left: 3px solid #f5a623; border-radius: 0 4px 4px 0; padding: 6px 12px; margin-bottom: 4px; font-size: 9pt; }}
-.flag-info     {{ background: #f0f4ff; border-left: 3px solid #5b1fa4; border-radius: 0 4px 4px 0; padding: 6px 12px; margin-bottom: 4px; font-size: 9pt; }}
-.flag-ok       {{ background: #f0fdf0; border-left: 3px solid #20c800; border-radius: 0 4px 4px 0; padding: 6px 12px; margin-bottom: 4px; font-size: 9pt; }}
-.flag-label    {{ font-size: 8.5pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }}
+.flag-critical {{ background: #fff0f0; border-left: 2px solid #d63638; border-radius: 0 3px 3px 0; padding: 4px 10px; margin-bottom: 3px; font-size: 8.5pt; }}
+.flag-warning  {{ background: #fff8e1; border-left: 2px solid #f5a623; border-radius: 0 3px 3px 0; padding: 4px 10px; margin-bottom: 3px; font-size: 8.5pt; }}
+.flag-info     {{ background: #f0f4ff; border-left: 2px solid #5b1fa4; border-radius: 0 3px 3px 0; padding: 4px 10px; margin-bottom: 3px; font-size: 8.5pt; }}
+.flag-ok       {{ background: #f0fdf0; border-left: 2px solid #20c800; border-radius: 0 3px 3px 0; padding: 4px 10px; margin-bottom: 3px; font-size: 8.5pt; }}
+.flag-label    {{ font-size: 8pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; }}
 .flag-critical .flag-label {{ color: #d63638; }}
 .flag-warning  .flag-label {{ color: #b07a00; }}
 .flag-info     .flag-label {{ color: #5b1fa4; }}
 .flag-ok       .flag-label {{ color: #20c800; }}
-.flag-detail   {{ font-size: 9.5pt; color: #271e41; margin-top: 4px; }}
+.flag-detail   {{ font-size: 8.5pt; color: #271e41; margin-top: 2px; line-height: 1.35; }}
 .pill {{ display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: 8pt; font-weight: 700; }}
 .pill-red    {{ background: #fee2e2; color: #991b1b; }}
 .pill-yellow {{ background: #fef3c7; color: #92400e; }}

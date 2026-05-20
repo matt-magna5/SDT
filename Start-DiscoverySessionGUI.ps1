@@ -830,7 +830,6 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 <div class="field"></div>
 </div>
 </div>
-</div>
 
 <div class="card">
 <div class="card-title">Admin credentials <span class="hint" data-tip="Used to remotely sign in to every ticked VM + every manual target. Needs WinRM remoting permissions (domain admin works; local admin works for workgroup hosts).">i</span></div>
