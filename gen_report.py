@@ -2176,12 +2176,308 @@ def build_private_cloud_tab():
     return out
 
 
+# -- ACTIVE DIRECTORY TAB ------------------------------------------------------
+def build_ad_tab():
+    """Environment-wide AD view: DCs + FSMO + functional levels, file shares,
+    file servers, privileged group membership."""
+    dcs = []           # [(name, ad_dict)]
+    fsmo_holders = {}  # role -> server name
+    domain_info = None # first DC we find sets the canonical domain/forest
+    file_servers = []  # [(name, [shares])]
+    priv_groups  = {}  # group name -> [members]
+
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d = srv.get('data', {}) or {}
+        name = srv.get('name', '')
+        ad = d.get('AD') if isinstance(d.get('AD'), dict) else None
+        if ad and ad.get('Installed'):
+            dcs.append((name, ad))
+            if domain_info is None:
+                domain_info = ad
+            fsmo = ad.get('FSMORoles', [])
+            if isinstance(fsmo, list):
+                for r in fsmo:
+                    fsmo_holders[str(r)] = name
+            # Privileged groups can live in ad['PrivilegedGroups'] or ad['Groups']
+            pg = ad.get('PrivilegedGroups') or ad.get('Groups') or {}
+            if isinstance(pg, dict):
+                for grp_name, members in pg.items():
+                    if not members: continue
+                    mem_list = members if isinstance(members, list) else [members]
+                    if grp_name not in priv_groups:
+                        priv_groups[grp_name] = []
+                    for m in mem_list:
+                        if m not in priv_groups[grp_name]:
+                            priv_groups[grp_name].append(m)
+        # File shares (non-admin) - tag this server as a file server if it has any
+        shares_raw = d.get('FileShares') or d.get('Shares') or {}
+        share_list = shares_raw.get('Shares') if isinstance(shares_raw, dict) else shares_raw
+        if isinstance(share_list, list):
+            real = [s for s in share_list if isinstance(s, dict)
+                    and s.get('Name','') not in ('ADMIN$','IPC$','C$','D$','E$','F$','print$','NETLOGON','SYSVOL')
+                    and not str(s.get('Name','')).endswith('$')]
+            if real:
+                file_servers.append((name, real))
+
+    if not dcs:
+        return '<div style="padding:32px;text-align:center;color:#6b6080;">No Active Directory data collected. AD tab requires at least one Domain Controller in scope.</div>'
+
+    def _dn_to_fqdn(v):
+        if v and str(v).upper().startswith('DC='):
+            return '.'.join(p.split('=')[1] for p in str(v).split(',') if '=' in p)
+        return v or ''
+    forest = _dn_to_fqdn(domain_info.get('ForestName', '') or domain_info.get('DomainName', ''))
+    fl_d   = str(domain_info.get('DomainFL', '') or '')
+    fl_f   = str(domain_info.get('ForestFL', '') or '')
+    uc     = domain_info.get('UserCount', '-')
+    cc     = domain_info.get('ComputerCount', '-')
+    ou     = domain_info.get('OUCount', '-')
+
+    out  = '<div style="padding:24px;">'
+    # Headline stats
+    out += (f'<div class="stat-grid">'
+            f'<div class="stat-box"><div class="stat-num">{len(dcs)}</div><div class="stat-lbl">Domain Controllers</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{h(uc)}</div><div class="stat-lbl">User Accounts</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{h(cc)}</div><div class="stat-lbl">Computers</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{h(ou)}</div><div class="stat-lbl">Organizational Units</div></div>'
+            f'</div>\n')
+
+    # Forest / Domain table
+    out += '<div class="sub-title">Forest &amp; Domain</div>\n'
+    fl_d_year = (re.search(r'20\d\d', fl_d) or type('',(),{'group':lambda *_:'' })()).group(0)
+    fl_f_year = (re.search(r'20\d\d', fl_f) or type('',(),{'group':lambda *_:'' })()).group(0)
+    fl_d_pill = f'<span class="pill pill-{"yellow" if fl_d_year and fl_d_year<"2016" else "green"}">{h(fl_d)}</span>' if fl_d else '-'
+    fl_f_pill = f'<span class="pill pill-{"yellow" if fl_f_year and fl_f_year<"2016" else "green"}">{h(fl_f)}</span>' if fl_f else '-'
+    out += ('<table style="width:100%;">'
+            f'<tr><th style="width:240px">Property</th><th>Value</th></tr>'
+            f'<tr><td><strong>Forest Root</strong></td><td><code>{h(forest)}</code></td></tr>'
+            f'<tr><td><strong>Domain Functional Level</strong></td><td>{fl_d_pill}</td></tr>'
+            f'<tr><td><strong>Forest Functional Level</strong></td><td>{fl_f_pill}</td></tr>'
+            '</table>\n')
+
+    # FSMO + DC list (two columns)
+    out += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px;">'
+    out += '<div><div class="sub-title">FSMO Role Holders</div>\n<table style="width:100%;">'
+    out += '<tr><th>Role</th><th>Held By</th></tr>'
+    fsmo_order = ['Schema Master', 'Domain Naming Master', 'PDC Emulator', 'RID Master', 'Infrastructure Master',
+                  'SchemaMaster', 'DomainNamingMaster', 'PDCEmulator', 'RIDMaster', 'InfrastructureMaster']
+    fsmo_label = {'SchemaMaster':'Schema Master', 'DomainNamingMaster':'Domain Naming Master',
+                  'PDCEmulator':'PDC Emulator', 'RIDMaster':'RID Master',
+                  'InfrastructureMaster':'Infrastructure Master'}
+    seen_roles = set()
+    for r in fsmo_order:
+        if r in fsmo_holders and r not in seen_roles:
+            label = fsmo_label.get(r, r); seen_roles.add(r); seen_roles.add(label)
+            out += f'<tr><td>{h(label)}</td><td><strong>{h(fsmo_holders[r])}</strong></td></tr>'
+    # any unrecognized roles
+    for r, holder in fsmo_holders.items():
+        if r in seen_roles: continue
+        out += f'<tr><td>{h(r)}</td><td><strong>{h(holder)}</strong></td></tr>'
+    out += '</table></div>\n'
+
+    out += '<div><div class="sub-title">Domain Controllers</div>\n<table style="width:100%;">'
+    out += '<tr><th>Server</th><th>FSMO Roles</th></tr>'
+    for nm, ad_d in dcs:
+        roles_here = ad_d.get('FSMORoles', []) if isinstance(ad_d.get('FSMORoles', []), list) else []
+        role_pills = ''.join(f'<span class="pill pill-purple" style="margin-right:4px;">{h(fsmo_label.get(r,r))}</span>' for r in roles_here) or '<span style="color:#6b6080;font-size:8.5pt;">none</span>'
+        out += f'<tr><td><strong>{h(nm)}</strong></td><td>{role_pills}</td></tr>'
+    out += '</table></div></div>\n'
+
+    # Privileged Groups
+    if priv_groups:
+        out += '<div class="sub-title" style="margin-top:24px;">Privileged Group Membership</div>\n'
+        out += '<div style="font-size:8.5pt;color:#6b6080;margin-bottom:8px;">Tier-0 access. Membership in these groups grants full domain or forest control.</div>'
+        for grp in ('Enterprise Admins', 'Domain Admins', 'Schema Admins', 'Administrators', 'Account Operators', 'Server Operators', 'Backup Operators'):
+            members = priv_groups.get(grp)
+            if not members: continue
+            sev_cls = 'pill-red' if grp in ('Enterprise Admins','Domain Admins','Schema Admins') else 'pill-yellow'
+            out += f'<div style="margin-bottom:12px;"><span class="pill {sev_cls}">{h(grp)}</span> <span style="color:#6b6080;font-size:8.5pt;">({len(members)} members)</span><div style="margin-top:4px;padding-left:8px;font-family:monospace;font-size:8.5pt;color:#271e41;">'
+            out += ', '.join(h(str(m)) for m in members[:50])
+            if len(members) > 50: out += f' &hellip; +{len(members)-50} more'
+            out += '</div></div>'
+        # Any unrecognized privileged groups
+        leftover = [g for g in priv_groups if g not in ('Enterprise Admins','Domain Admins','Schema Admins','Administrators','Account Operators','Server Operators','Backup Operators')]
+        for grp in leftover:
+            members = priv_groups[grp]
+            out += f'<div style="margin-bottom:12px;"><span class="pill pill-gray">{h(grp)}</span> <span style="color:#6b6080;font-size:8.5pt;">({len(members)} members)</span><div style="margin-top:4px;padding-left:8px;font-family:monospace;font-size:8.5pt;color:#271e41;">'
+            out += ', '.join(h(str(m)) for m in members[:50])
+            if len(members) > 50: out += f' &hellip; +{len(members)-50} more'
+            out += '</div></div>'
+    else:
+        out += '<div class="sub-title" style="margin-top:24px;">Privileged Group Membership</div>\n'
+        out += '<div class="flag-info"><div class="flag-label">No Data</div><div class="flag-detail">Privileged group membership not collected. Run discovery with an account that has AD Read on the Builtin / Users containers.</div></div>'
+
+    # File Servers + Shares
+    out += '<div class="sub-title" style="margin-top:24px;">File Servers &amp; Shares</div>\n'
+    if file_servers:
+        total_shares = sum(len(sh) for _, sh in file_servers)
+        out += f'<div style="font-size:8.5pt;color:#6b6080;margin-bottom:8px;">{len(file_servers)} server(s) hosting {total_shares} business share(s) (admin and default shares excluded).</div>'
+        out += '<table style="width:100%;"><tr><th>Server</th><th>Share Name</th><th>Path</th><th>Description</th></tr>'
+        ridx = 0
+        for nm, sh_list in file_servers:
+            for sh in sh_list:
+                bg = ' style="background:#f5f4f8"' if ridx % 2 else ''
+                out += (f'<tr{bg}><td><strong>{h(nm)}</strong></td>'
+                        f'<td>{h(sh.get("Name",""))}</td>'
+                        f'<td style="font-family:monospace;font-size:8.5pt">{h(sh.get("Path",""))}</td>'
+                        f'<td style="font-size:8.5pt;color:#6b6080;">{h(sh.get("Description","") or "")}</td></tr>')
+                ridx += 1
+        out += '</table>'
+    else:
+        out += '<div class="flag-info"><div class="flag-label">No business shares detected</div><div class="flag-detail">No non-admin SMB shares were detected on any in-scope server.</div></div>'
+
+    out += '</div>'  # close padding wrapper
+    return out
+
+
+# -- SUMMARY TAB ---------------------------------------------------------------
+def build_summary_tab():
+    """Environment-wide summary: counts, OS mix, EOL exposure, security tools,
+    backup detected, top findings."""
+    total      = len([s for s in servers if s.get('os_type') != 'linux'])
+    linux_n    = len([s for s in servers if s.get('os_type') == 'linux'])
+    os_counts  = {}
+    eol_servers = []
+    no_edr      = []
+    edr_seen    = set()
+    rmm_seen    = set()
+    backup_seen = set()
+    sql_count   = 0
+    dc_count    = 0
+    file_srv_count = 0
+    physical_n  = 0
+    virtual_n   = 0
+    high_disk   = []
+
+    edr_kw = {'sentinelone','crowdstrike','huntress','sophos','cylance','trellix','mcafee',
+              'eset','kaspersky','webroot','bitdefender','malwarebytes','cortex xdr',
+              'carbon black','cybereason','defender for endpoint','adlumin','arctic wolf'}
+    edr_label = {'sentinelone':'SentinelOne','crowdstrike':'CrowdStrike','huntress':'Huntress',
+                 'sophos':'Sophos','defender for endpoint':'Defender for Endpoint',
+                 'adlumin':'Adlumin','arctic wolf':'Arctic Wolf'}
+    rmm_kw = {'n-able':'N-able','solarwinds':'N-able (SolarWinds)','kaseya':'Kaseya',
+              'connectwise':'ConnectWise','labtech':'ConnectWise Automate','ninjarmm':'NinjaOne',
+              'ninjaone':'NinjaOne','datto rmm':'Datto RMM','syncro':'Syncro','atera':'Atera'}
+    backup_kw = {'veeam':'Veeam','commvault':'Commvault','acronis':'Acronis','datto bcdr':'Datto BCDR',
+                 'axcient':'Axcient','arcserve':'Arcserve','backup exec':'Veritas Backup Exec',
+                 'cohesity':'Cohesity','rubrik':'Rubrik','azure backup':'Azure Backup'}
+
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d = srv.get('data', {}) or {}
+        sys_ = d.get('System', {}) or {}
+        hw_  = d.get('Hardware', {}) or {}
+        nm   = srv.get('name','')
+        os_name = sys_.get('OSName','')
+        os_short = re.sub(r'Microsoft\s+', '', os_name).replace('Standard','').replace('Datacenter','').strip()
+        os_counts[os_short] = os_counts.get(os_short, 0) + 1
+        if str(sys_.get('OSEOLStatus','')).upper() in ('EOL','NEAR EOL') or 'Server 2008' in os_name or 'Server 2012' in os_name:
+            eol_servers.append(nm)
+        if hw_.get('IsVM') or hw_.get('VMPlatform'):
+            virtual_n += 1
+        else:
+            physical_n += 1
+        ad = d.get('AD');
+        if isinstance(ad, dict) and ad.get('Installed'): dc_count += 1
+        sql_ = d.get('SQL')
+        if isinstance(sql_, list) and sql_: sql_ = sql_[0]
+        if isinstance(sql_, dict) and sql_.get('Edition'): sql_count += 1
+        shares_raw = d.get('FileShares') or d.get('Shares') or {}
+        sh_list = shares_raw.get('Shares') if isinstance(shares_raw, dict) else shares_raw
+        if isinstance(sh_list, list):
+            real = [s for s in sh_list if isinstance(s, dict)
+                    and not str(s.get('Name','')).endswith('$')
+                    and str(s.get('Name','')) not in ('NETLOGON','SYSVOL','print$')]
+            if real: file_srv_count += 1
+        # apps scan
+        apps = d.get('Apps') or d.get('Applications') or []
+        if not isinstance(apps, list): apps = []
+        app_blob = ' '.join((str(a.get('Name',''))+' '+str(a.get('Publisher',''))).lower() for a in apps if isinstance(a, dict))
+        srv_has_edr = False
+        for k in edr_kw:
+            if k in app_blob:
+                edr_seen.add(edr_label.get(k, k.title())); srv_has_edr = True
+        if not srv_has_edr: no_edr.append(nm)
+        for k, lbl in rmm_kw.items():
+            if k in app_blob: rmm_seen.add(lbl)
+        for k, lbl in backup_kw.items():
+            if k in app_blob: backup_seen.add(lbl)
+        # high disk
+        for dk in d.get('Disks', []) or []:
+            if not isinstance(dk, dict): continue
+            if dk.get('UsedPct', 0) >= 85:
+                high_disk.append(f'{nm}:{dk.get("Drive","?")} ({dk.get("UsedPct")}%)')
+
+    out  = '<div style="padding:24px;">'
+    # Top-line stats
+    out += (f'<div class="stat-grid">'
+            f'<div class="stat-box"><div class="stat-num">{total}</div><div class="stat-lbl">Windows Servers</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{linux_n}</div><div class="stat-lbl">Linux / Appliance</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{virtual_n}</div><div class="stat-lbl">Virtual</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{physical_n}</div><div class="stat-lbl">Physical</div></div>'
+            f'</div>\n')
+
+    # Two-column: roles + OS mix
+    out += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:8px;">'
+    out += '<div><div class="sub-title">Role Inventory</div><table style="width:100%;">'
+    out += '<tr><th>Role</th><th style="width:80px">Count</th></tr>'
+    out += f'<tr><td>Domain Controllers</td><td><strong>{dc_count}</strong></td></tr>'
+    out += f'<tr style="background:#f5f4f8"><td>SQL Servers</td><td><strong>{sql_count}</strong></td></tr>'
+    out += f'<tr><td>File Servers (business shares)</td><td><strong>{file_srv_count}</strong></td></tr>'
+    out += f'<tr style="background:#f5f4f8"><td>Hypervisor Hosts</td><td><strong>{len(hv_inventories)}</strong></td></tr>'
+    out += '</table></div>'
+
+    out += '<div><div class="sub-title">Operating Systems</div><table style="width:100%;">'
+    out += '<tr><th>OS</th><th style="width:80px">Count</th></tr>'
+    for i, (os_n, cnt) in enumerate(sorted(os_counts.items(), key=lambda x: -x[1])):
+        bg = ' style="background:#f5f4f8"' if i % 2 else ''
+        out += f'<tr{bg}><td>{h(os_n) or "<em>unknown</em>"}</td><td><strong>{cnt}</strong></td></tr>'
+    out += '</table></div></div>\n'
+
+    # Security tools detected
+    out += '<div class="sub-title" style="margin-top:20px;">Security &amp; Operational Tooling Detected</div>'
+    def _tool_row(label, found_set, sev_pill='pill-green'):
+        if found_set:
+            tools = ' &middot; '.join(sorted(found_set))
+            return f'<tr><td><strong>{label}</strong></td><td><span class="pill {sev_pill}">{h(tools)}</span></td></tr>'
+        return f'<tr><td><strong>{label}</strong></td><td><span class="pill pill-red">None detected</span></td></tr>'
+    out += '<table style="width:100%;">'
+    out += '<tr><th style="width:200px">Category</th><th>Detected</th></tr>'
+    out += _tool_row('EDR / XDR', edr_seen)
+    out += _tool_row('RMM', rmm_seen, 'pill-purple')
+    out += _tool_row('Backup', backup_seen)
+    out += '</table>'
+
+    # Risk callouts
+    callouts = []
+    if eol_servers:
+        callouts.append(('critical', f'{len(eol_servers)} server(s) on EOL or near-EOL Windows',
+                         ', '.join(eol_servers[:8]) + (f' &hellip; +{len(eol_servers)-8} more' if len(eol_servers) > 8 else '')))
+    if no_edr and total:
+        callouts.append(('warning' if edr_seen else 'critical',
+                         f'{len(no_edr)} of {total} server(s) without third-party EDR detected',
+                         ', '.join(no_edr[:8]) + (f' &hellip; +{len(no_edr)-8} more' if len(no_edr) > 8 else '')))
+    if high_disk:
+        callouts.append(('critical', f'{len(high_disk)} disk(s) above 85% utilization',
+                         ', '.join(high_disk[:8]) + (f' &hellip; +{len(high_disk)-8} more' if len(high_disk) > 8 else '')))
+    if callouts:
+        out += '<div class="sub-title" style="margin-top:20px;">Top Risk Callouts</div>'
+        for sev, title, det in callouts:
+            out += f'<div class="flag-{sev}" style="margin-bottom:6px;"><div class="flag-label">{title}</div><div class="flag-detail">{det}</div></div>'
+
+    out += '</div>'
+    return out
+
+
 # -- BUILD ALL TABS -------------------------------------------------------------
 tabs = [(build_linux_tab(s) if s.get('os_type') == 'linux' else build_server_tab(s)) for s in servers]
 virt_tab_html = build_hv_tab()
 sql_tab_html  = build_sql_tab()
 eol_tab_html  = build_eol_tab()
 cloud_tab_html = build_private_cloud_tab()
+summary_tab_html = build_summary_tab()
+ad_tab_html    = build_ad_tab()
 
 # -- LOGO ----------------------------------------------------------------------
 if LOGO_B64:
@@ -2248,17 +2544,22 @@ _has_vsphere = any(h.get('_type') == 'vSphereInventory'  for h in hv_inventories
 _virt_label  = ('Hyper-V / ESX' if _has_hyperv and _has_vsphere
                 else 'ESX Hosts'    if _has_vsphere
                 else 'Hyper-V Hosts')
+# Order: Summary | Virt (ESX/Hyper-V) | AD | SQL | EOL | Sizing
+env_tab_buttons += '<button class="tab-btn active" data-tab="tab-summary" onclick="showTab(\'summary\')">Summary</button>\n'
 env_tab_buttons += f'<button class="tab-btn" data-tab="tab-virt" onclick="showTab(\'virt\')">{_virt_label}</button>\n'
+env_tab_buttons += '<button class="tab-btn" data-tab="tab-ad" onclick="showTab(\'ad\')">Active Directory</button>\n'
 if sql_tab_html:
     env_tab_buttons += '<button class="tab-btn" data-tab="tab-sql" onclick="showTab(\'sql\')">SQL</button>\n'
 env_tab_buttons += '<button class="tab-btn" data-tab="tab-eol" onclick="showTab(\'eol\')" style="border-top:3px solid #d63638;">EOL</button>\n'
 env_tab_buttons += '<button class="tab-btn" data-tab="tab-cloud" onclick="showTab(\'cloud\')" style="border-top:3px solid #5b1fa4;">Sizing (PC + Commvault)</button>\n'
 
 tab_contents = ''
-for i, t in enumerate(tabs):
-    active = ' active' if i == 0 else ''
-    tab_contents += f'<div id="tab-{t["id"]}" class="tab-content{active}">\n{t["tab_html"]}\n</div>\n'
+# Summary first (and active by default)
+tab_contents += f'<div id="tab-summary" class="tab-content active">\n{summary_tab_html}\n</div>\n'
+for t in tabs:
+    tab_contents += f'<div id="tab-{t["id"]}" class="tab-content">\n{t["tab_html"]}\n</div>\n'
 tab_contents += f'<div id="tab-virt" class="tab-content">\n{virt_tab_html}\n</div>\n'
+tab_contents += f'<div id="tab-ad" class="tab-content">\n{ad_tab_html}\n</div>\n'
 if sql_tab_html:
     tab_contents += f'<div id="tab-sql" class="tab-content">\n{sql_tab_html}\n</div>\n'
 tab_contents += f'<div id="tab-eol" class="tab-content"><div style="padding:24px;">{eol_tab_html}</div></div>\n'
@@ -2320,20 +2621,12 @@ tr:nth-child(even) td {{ background: #f5f4f8; }}
 .sub-title {{ font-size: 13px; font-weight: 700; color: #5b1fa4; text-transform: uppercase; letter-spacing: 0.8px; margin: 16px 0 8px; }}
 .meta-line {{ font-size: 8.5pt; color: #6b6080; margin-bottom: 2px; }}
 .sbr-only  {{ display: none !important; }}
-body.view-sbr .sbr-only {{ display: block !important; }}
-body.view-sbr .hide-sbr {{ display: none !important; }}
-.view-bar  {{ background: #1a1432; padding: 8px 28px; display: flex; align-items: center; gap: 10px; position: sticky; top: 52px; z-index: 199; border-radius: 0 0 6px 6px; border-top: 1px solid rgba(255,255,255,.08); }}
-.view-lbl  {{ font-size: 8pt; color: #a89bc8; text-transform: uppercase; letter-spacing: .5px; font-weight: 700; }}
-.view-btn  {{ background: transparent; border: 1px solid #4a3a6a; border-radius: 4px; color: #c4b5fd; font-size: 9pt; padding: 4px 14px; cursor: pointer; font-weight: 600; transition: all .15s; }}
-.view-btn:hover {{ background: #2d2060; }}
-.view-btn.v-active {{ background: #5b1fa4; color: white; border-color: #5b1fa4; }}
-.view-desc {{ font-size: 8.5pt; color: #7c6b9e; margin-left: 6px; }}
 details summary {{ cursor: pointer; font-weight: 600; color: #5b1fa4; padding: 6px 0; list-style: none; }}
 details summary::before {{ content: '\\25B6  '; font-size: 9pt; }}
 details[open] summary::before {{ content: '\\25BC  '; }}
 
 /* v4.2 layout: wider wrap, environment tabs at top, server list in left sidebar */
-.wrap-v42 {{ max-width: 1400px; margin: 0 auto; padding: 18px 24px; }}
+.wrap-v42 {{ max-width: 1400px; margin: 0 auto; padding: 16px 12px; }}
 .layout-v42 {{ display: flex; gap: 0; align-items: flex-start; }}
 .server-rail {{ width: 240px; flex-shrink: 0; background: white; border: 1px solid #e8e4f0; border-radius: 0 0 8px 8px; max-height: calc(100vh - 220px); overflow-y: auto; position: sticky; top: 110px; }}
 .rail-head {{ padding: 14px 16px 10px; border-bottom: 1px solid #e8e4f0; background: #f7f5fb; border-radius: 0 0 0 0; }}
@@ -2361,12 +2654,6 @@ details[open] summary::before {{ content: '\\25BC  '; }}
   </div>
   <div style="color:rgba(255,255,255,.5);font-size:8.5pt;">Collected by Magna5 SE Team</div>
 </div>
-<div class="view-bar">
-  <span class="view-lbl">View:</span>
-  <button class="view-btn v-active" id="vbtn-adv" onclick="setView('adv')">Advanced</button>
-  <button class="view-btn" id="vbtn-sbr" onclick="setView('sbr')">SBR</button>
-  <span class="view-desc" id="view-desc">Full technical detail &mdash; SE view</span>
-</div>
 <div class="wrap-v42">
 <div class="tab-nav">
 {env_tab_buttons}
@@ -2390,21 +2677,6 @@ details[open] summary::before {{ content: '\\25BC  '; }}
   Generated {DATE} ET &middot; Magna5 Solutions Engineering &middot; SDT v3.0
 </div>
 <script>
-var VIEW_DESCS = {{
-  basic: "Simplified view &mdash; SE &amp; CSM",
-  adv:   "Full technical detail &mdash; SE view",
-  sbr:   "Executive health dashboard &mdash; client &amp; leadership"
-}};
-function setView(v) {{
-  document.body.classList.remove("view-adv","view-sbr");
-  document.body.classList.add("view-" + v);
-  document.querySelectorAll(".view-btn").forEach(function(b){{ b.classList.remove("v-active"); }});
-  var btn = document.getElementById("vbtn-" + v);
-  if (btn) btn.classList.add("v-active");
-  var desc = document.getElementById("view-desc");
-  if (desc) desc.innerHTML = VIEW_DESCS[v] || "";
-  try {{ localStorage.setItem("sdView", v); }} catch(e) {{}}
-}}
 function showTab(id) {{
   document.querySelectorAll('.tab-content').forEach(function(el){{ el.classList.remove('active'); }});
   document.querySelectorAll('.tab-btn').forEach(function(el){{ el.classList.remove('active'); }});
@@ -2428,16 +2700,8 @@ function toggleCard(btn) {{
   btn.textContent = body.classList.contains('collapsed') ? '\u25bc Expand' : '\u25b2 Collapse';
 }}
 window.addEventListener('DOMContentLoaded', function() {{
-  var saved = 'adv';
-  try {{ saved = localStorage.getItem('sdView') || 'adv'; }} catch(e) {{}}
-  setView(saved);
-  // Default to first server tab (sidebar) so the user lands on a populated view
-  var firstSrv = document.querySelector('.srv-rail-btn');
-  if (firstSrv) {{ firstSrv.click(); }}
-  else {{
-    var firstEnv = document.querySelector('.tab-btn');
-    if (firstEnv) firstEnv.click();
-  }}
+  // Default landing: Summary tab (already marked active in markup, this is a no-op safeguard).
+  showTab('summary');
 }});
 </script>
 </body>
