@@ -2190,17 +2190,54 @@ else:
 # -- TABS HTML -----------------------------------------------------------------
 # v4.2 layout: environment tabs at top (Hypervisor / SQL / EOL / Private Cloud),
 # per-server tabs in left sidebar with search filter.
-server_tab_buttons = ''  # goes into left sidebar
+server_tab_buttons = ''  # goes into left sidebar, grouped by role
+# Group tabs by role_label bucket. derive_role_label already produces strings
+# like "Domain Controller (FSMO)", "Exchange Server", "SQL Server",
+# "File & Print Server", "Web Server (IIS)", etc. Reduce to broad buckets:
+def _bucket(label, is_linux):
+    if is_linux: return 'Linux / Appliance'
+    l = (label or '').lower()
+    if 'exchange' in l:           return 'Exchange'
+    if 'domain controller' in l:  return 'Domain Controllers'
+    if 'hyper-v' in l or 'vmware' in l or 'hypervisor' in l: return 'Hypervisor Hosts'
+    if 'sql' in l:                return 'SQL Servers'
+    if 'file' in l or 'print' in l: return 'File / Print'
+    if 'web' in l or 'iis' in l:  return 'Web / IIS'
+    if 'remote desktop' in l or 'rds' in l: return 'RDS / Terminal'
+    if 'cert' in l:               return 'Certificate / PKI'
+    if 'dns' in l or 'dhcp' in l: return 'DNS / DHCP'
+    return 'Application / Other'
+
+# Display order of buckets
+BUCKET_ORDER = ['Domain Controllers','Exchange','SQL Servers','Hypervisor Hosts',
+                'Web / IIS','File / Print','RDS / Terminal','Certificate / PKI',
+                'DNS / DHCP','Application / Other','Linux / Appliance']
+
+# Index tabs by bucket
+_by_bucket = {}
+_srv_by_id = {s['id']: s for s in servers}
 for t in tabs:
-    is_linux = servers[[s['id'] for s in servers].index(t['id'])].get('os_type') == 'linux' if t['id'] in [s['id'] for s in servers] else False
-    cls = 'srv-rail-btn' + (' is-linux' if is_linux else tab_cls(t['crit'], t['warn']))
-    scope_ind = '' if t['in_scope'] else ' &#9702;'
-    lx_icon = ' 🐧' if is_linux else ''
-    server_tab_buttons += (
-        f'<button class="{cls}" data-tab="tab-{t["id"]}" '
-        f'data-name="{h(t["name"]).lower()}" '
-        f'onclick="showTab(\'{t["id"]}\')">{h(t["name"])}{lx_icon}{scope_ind}</button>\n'
-    )
+    s = _srv_by_id.get(t['id'], {})
+    is_linux = s.get('os_type') == 'linux'
+    b = _bucket(t.get('role_label',''), is_linux)
+    _by_bucket.setdefault(b, []).append((t, is_linux))
+
+for bucket in BUCKET_ORDER:
+    items = _by_bucket.get(bucket, [])
+    if not items: continue
+    # Sort within bucket by name
+    items.sort(key=lambda x: x[0]['name'].lower())
+    server_tab_buttons += f'<div class="rail-group"><div class="rail-group-label">{h(bucket)} ({len(items)})</div>\n'
+    for t, is_linux in items:
+        cls = 'srv-rail-btn' + (' is-linux' if is_linux else '')
+        scope_ind = '' if t['in_scope'] else ' &#9702;'
+        lx_icon = ' 🐧' if is_linux else ''
+        server_tab_buttons += (
+            f'<button class="{cls}" data-tab="tab-{t["id"]}" '
+            f'data-name="{h(t["name"]).lower()}" '
+            f'onclick="showTab(\'{t["id"]}\')">{h(t["name"])}{lx_icon}{scope_ind}</button>\n'
+        )
+    server_tab_buttons += '</div>\n'
 
 env_tab_buttons = ''  # goes into top tab-nav
 _has_hyperv  = any(h.get('_type') == 'HyperVInventory'   for h in hv_inventories)
@@ -2212,7 +2249,7 @@ env_tab_buttons += f'<button class="tab-btn" data-tab="tab-virt" onclick="showTa
 if sql_tab_html:
     env_tab_buttons += '<button class="tab-btn" data-tab="tab-sql" onclick="showTab(\'sql\')">SQL</button>\n'
 env_tab_buttons += '<button class="tab-btn" data-tab="tab-eol" onclick="showTab(\'eol\')" style="border-top:3px solid #d63638;">EOL</button>\n'
-env_tab_buttons += '<button class="tab-btn" data-tab="tab-cloud" onclick="showTab(\'cloud\')" style="border-top:3px solid #5b1fa4;">Private Cloud</button>\n'
+env_tab_buttons += '<button class="tab-btn" data-tab="tab-cloud" onclick="showTab(\'cloud\')" style="border-top:3px solid #5b1fa4;">Sizing (PC + Commvault)</button>\n'
 
 tab_contents = ''
 for i, t in enumerate(tabs):
@@ -2253,10 +2290,10 @@ table {{ width: 100%; border-collapse: collapse; font-size: 9.5pt; }}
 th {{ background: #271e41; color: #fff; font-weight: 600; padding: 7px 12px; text-align: left; }}
 td {{ padding: 6px 12px; border: 1px solid #d0cce0; vertical-align: top; }}
 tr:nth-child(even) td {{ background: #f5f4f8; }}
-.flag-critical {{ background: #fff0f0; border-left: 4px solid #d63638; border-radius: 0 6px 6px 0; padding: 12px 16px; margin-bottom: 8px; }}
-.flag-warning  {{ background: #fff8e1; border-left: 4px solid #f5a623; border-radius: 0 6px 6px 0; padding: 12px 16px; margin-bottom: 8px; }}
-.flag-info     {{ background: #f0f4ff; border-left: 4px solid #5b1fa4; border-radius: 0 6px 6px 0; padding: 12px 16px; margin-bottom: 8px; }}
-.flag-ok       {{ background: #f0fdf0; border-left: 4px solid #20c800; border-radius: 0 6px 6px 0; padding: 12px 16px; margin-bottom: 8px; }}
+.flag-critical {{ background: #fff0f0; border-left: 3px solid #d63638; border-radius: 0 4px 4px 0; padding: 6px 12px; margin-bottom: 4px; font-size: 9pt; }}
+.flag-warning  {{ background: #fff8e1; border-left: 3px solid #f5a623; border-radius: 0 4px 4px 0; padding: 6px 12px; margin-bottom: 4px; font-size: 9pt; }}
+.flag-info     {{ background: #f0f4ff; border-left: 3px solid #5b1fa4; border-radius: 0 4px 4px 0; padding: 6px 12px; margin-bottom: 4px; font-size: 9pt; }}
+.flag-ok       {{ background: #f0fdf0; border-left: 3px solid #20c800; border-radius: 0 4px 4px 0; padding: 6px 12px; margin-bottom: 4px; font-size: 9pt; }}
 .flag-label    {{ font-size: 8.5pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }}
 .flag-critical .flag-label {{ color: #d63638; }}
 .flag-warning  .flag-label {{ color: #b07a00; }}
@@ -2300,14 +2337,12 @@ details[open] summary::before {{ content: '\\25BC  '; }}
 .rail-title {{ font-size: 11pt; font-weight: 700; color: #271e41; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 8px; }}
 .rail-search {{ width: 100%; padding: 6px 10px; border: 1px solid #c0b8d8; border-radius: 4px; font-size: 9pt; font-family: inherit; }}
 .rail-list {{ padding: 6px 0; }}
-.srv-rail-btn {{ width: 100%; text-align: left; padding: 8px 16px; background: transparent; border: none; border-left: 3px solid transparent; cursor: pointer; font-size: 9.5pt; color: #271e41; font-weight: 600; font-family: inherit; display: block; }}
+.srv-rail-btn {{ width: 100%; text-align: left; padding: 7px 16px; background: transparent; border: none; border-left: 3px solid transparent; cursor: pointer; font-size: 9.5pt; color: #271e41; font-weight: 600; font-family: inherit; display: block; }}
 .srv-rail-btn:hover {{ background: #f5f4f8; }}
 .srv-rail-btn.active {{ background: #ede7fa; border-left-color: #5b1fa4; color: #5b1fa4; }}
-.srv-rail-btn.has-critical {{ border-left-color: #d63638; }}
-.srv-rail-btn.has-critical.active {{ background: #fff0f0; }}
-.srv-rail-btn.has-warning  {{ border-left-color: #f5a623; }}
-.srv-rail-btn.has-warning.active {{ background: #fff8e1; }}
-.srv-rail-btn.is-linux     {{ border-left-color: #0d9488; color: #0f4c5c; }}
+.srv-rail-btn.is-linux     {{ color: #0f4c5c; }}
+.rail-group-label {{ font-size: 8pt; font-weight: 700; color: #6b6080; text-transform: uppercase; letter-spacing: 0.6px; padding: 10px 16px 4px; border-top: 1px solid #ede7fa; }}
+.rail-group:first-child .rail-group-label {{ border-top: none; }}
 .tab-content-area {{ flex: 1; background: white; border: 1px solid #e8e4f0; border-left: none; border-radius: 0 8px 8px 8px; padding: 0; min-width: 0; }}
 .tab-content-area .tab-content {{ padding: 0; }}
 </style>
