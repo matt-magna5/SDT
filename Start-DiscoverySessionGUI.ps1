@@ -2153,34 +2153,35 @@ function Start-DiscoveryRun {
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# ThreadJob availability + serial fallback
+# ThreadJob availability + ASYNC RUNSPACE fallback (v4.2.10+)
 # -----------------------------------------------------------------------------
 # ThreadJob 2.1.0+ depends on netstandard 2.0; some Windows PowerShell 5.1 hosts
 # fail Import-Module with "Could not load file or assembly 'netstandard, Version=2.0.0.0'".
 #
-# Resolution ladder:
-#   1. Preload netstandard if .NET Framework 4.7.2+ provides it (Add-Type belt).
+# Resolution ladder (each step wrapped in try/catch; never throws):
+#   1. Preload netstandard if .NET Framework 4.7.2+ provides it.
 #   2. Try Import-Module ThreadJob.
-#   3. If that fails, install pinned ThreadJob 2.0.3 (last PS 5.1-friendly version)
-#      after uninstalling any broken 2.1.0+ copy.
-#   4. If installation also fails (no network, gallery blocked, etc.), DON'T THROW.
-#      Fall back to SERIAL discovery: shim Start-ThreadJob so jobs run inline,
-#      one server at a time, in the current runspace. Slower but never blocks the
-#      user. Wait-Job / Receive-Job / Stop-Job / Remove-Job are proxied to handle
-#      the synthetic job objects.
+#   3. If that fails, install pinned ThreadJob 2.0.3 after removing any
+#      broken 2.1.0+ copy.
+#   4. If installation also fails (offline, gallery blocked, ThreatLocker),
+#      install runspace-based ASYNC shims. Same shape as ThreadJob:
+#      Start-ThreadJob spawns a fresh runspace in this AppDomain (so $Session
+#      stays shared-by-reference with the HTTP listener) and returns IMMEDIATELY.
+#      Wait-Job / Receive-Job / Stop-Job / Remove-Job proxy synthetic jobs and
+#      delegate real jobs back to Microsoft.PowerShell.Core.
+#
+# CRITICAL: shim MUST be async. A synchronous shim blocks the HTTP listener
+# thread and the GUI stalls at "Waiting for discovery to start...".
 # -----------------------------------------------------------------------------
 $Global:SDT_ThreadJobMode = 'unknown'
 
 if (-not (Get-Command Start-ThreadJob -EA 0)) {
-    # Belt: pre-load netstandard if the host has it.
     try { Add-Type -AssemblyName 'netstandard' -EA SilentlyContinue } catch {}
 
-    $tjPinned = '2.0.3'
-
-    # Quiet by default - one summary line at the end. Set $env:SDT_VERBOSE_THREADJOB=1
-    # for the legacy 3-line warning if needed for debugging.
+    $tjPinned  = '2.0.3'
     $verboseTJ = ($env:SDT_VERBOSE_THREADJOB -eq '1')
     $threadJobOk = $false
+
     try {
         Import-Module ThreadJob -EA Stop
         $threadJobOk = $true
@@ -2188,7 +2189,7 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
         if ($verboseTJ) {
             $firstLine = ($_.Exception.Message -split "`r?`n")[0]
             Write-Host "  [warn] ThreadJob import failed ($firstLine)." -ForegroundColor Yellow
-            Write-Host "  [warn] Attempting install of ThreadJob v$tjPinned (PS 5.1-compatible)..." -ForegroundColor Yellow
+            Write-Host "  [warn] Attempting install of ThreadJob v$tjPinned..." -ForegroundColor Yellow
         }
         try {
             Get-Module -ListAvailable ThreadJob | ForEach-Object {
@@ -2205,8 +2206,7 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
             $threadJobOk = $true
         } catch {
             if ($verboseTJ) {
-                Write-Host "  [warn] Could not install/import ThreadJob v$tjPinned ($($_.Exception.Message.Split([Environment]::NewLine)[0]))." -ForegroundColor Yellow
-                Write-Host "  [warn] To restore parallel: Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor DarkYellow
+                Write-Host "  [warn] ThreadJob install failed - falling back to async runspace shims." -ForegroundColor Yellow
             }
         }
     }
@@ -2214,130 +2214,212 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
     if ($threadJobOk) {
         $Global:SDT_ThreadJobMode = 'parallel'
     } else {
-        # ----- SERIAL FALLBACK SHIMS -----
-        # Start-ThreadJob runs the scriptblock SYNCHRONOUSLY in the current runspace
-        # and returns a synthetic PSCustomObject that mimics a completed job. The
-        # Wait-Job/Receive-Job/Stop-Job/Remove-Job proxies below detect this object
-        # by its PSTypeName ('Sdt.SerialJob') and handle it locally, otherwise they
-        # delegate to the real cmdlets in Microsoft.PowerShell.Core.
-        $Global:SDT_ThreadJobMode = 'serial'
+        # ----- ASYNC RUNSPACE SHIMS -----
+        # Each Start-ThreadJob call spawns a fresh runspace in the current
+        # AppDomain. $Session (a synchronized hashtable) stays shared by
+        # reference, so the HTTP listener sees live updates.
+        $Global:SDT_ThreadJobMode = 'asyncShim'
 
-        function global:Start-ThreadJob {
-            [CmdletBinding()]
-            param(
-                [Parameter(Mandatory=$true, Position=0)][scriptblock]$ScriptBlock,
-                [object[]]$ArgumentList,
-                [int]$ThrottleLimit = 1,
-                [string]$Name = 'SdtSerialJob',
-                [scriptblock]$InitializationScript,
-                [object[]]$InputObject,
-                [object]$StreamingHost
-            )
-            $output = $null
-            $errs   = @()
-            $start  = Get-Date
-            try {
-                if ($InitializationScript) { . $InitializationScript }
-                if ($ArgumentList -and $ArgumentList.Count -gt 0) {
-                    $output = & $ScriptBlock @ArgumentList
-                } else {
-                    $output = & $ScriptBlock
-                }
-            } catch {
-                $errs += $_
-            }
-            $finished = Get-Date
-            $obj = [pscustomobject]@{
-                Id            = [Math]::Abs([Guid]::NewGuid().GetHashCode())
-                Name          = $Name
-                State         = if ($errs.Count) { 'Failed' } else { 'Completed' }
-                HasMoreData   = $true
-                PSBeginTime   = $start
-                PSEndTime     = $finished
-                _Output       = $output
-                _Errors       = $errs
-            }
-            $obj.PSObject.TypeNames.Insert(0, 'Sdt.SerialJob')
-            return $obj
-        }
+        # Source text of the shim functions. Stored globally so child runspaces
+        # can re-inject it when they recursively call Start-ThreadJob.
+        $Global:SDT_ShimSource = @'
+function Start-ThreadJob {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true, Position=0)][scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList,
+        [int]$ThrottleLimit = 5,
+        [string]$Name = 'SdtAsyncJob',
+        [scriptblock]$InitializationScript,
+        [object[]]$InputObject,
+        [object]$StreamingHost
+    )
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = 'STA'
+    $rs.ThreadOptions  = 'ReuseThread'
+    try { $rs.Open() } catch {
+        # Runspace creation failed - degrade further to inline execution rather
+        # than throw. The user sees the work happen but the listener will block
+        # for the duration. Last-resort path.
+        $out = $null; $errs = @()
+        try {
+            if ($ArgumentList) { $out = & $ScriptBlock @ArgumentList } else { $out = & $ScriptBlock }
+        } catch { $errs += $_ }
+        $obj = [pscustomobject]@{ Id = [Math]::Abs([Guid]::NewGuid().GetHashCode()); Name = $Name; HasMoreData = $true; _InlineOutput = $out; _InlineErrors = $errs; _InlineCompleted = $true }
+        $obj | Add-Member -MemberType ScriptProperty -Name State -Value { if ($this._InlineErrors.Count) { 'Failed' } else { 'Completed' } }
+        $obj.PSObject.TypeNames.Insert(0, 'Sdt.InlineJob')
+        return $obj
+    }
+    # Push the shim source into the child runspace's globals so recursive
+    # Start-ThreadJob calls inside the user's scriptblock work.
+    try { $rs.SessionStateProxy.SetVariable('SDT_ShimSource', $SDT_ShimSource) } catch {}
 
-        function global:Wait-Job {
-            [CmdletBinding()]
-            param(
-                [Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job,
-                [int]$Timeout = -1,
-                [switch]$Any,
-                [switch]$Force
-            )
-            process {
-                foreach ($j in @($Job)) {
-                    if ($j -and $j.PSObject.TypeNames -contains 'Sdt.SerialJob') {
-                        # Already completed.
-                        $j
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript('try { . ([scriptblock]::Create($SDT_ShimSource)) } catch {}')
+    [void]$ps.AddStatement()
+    [void]$ps.AddScript($ScriptBlock.ToString())
+    if ($ArgumentList) {
+        foreach ($a in $ArgumentList) { [void]$ps.AddArgument($a) }
+    }
+    $handle = $ps.BeginInvoke()
+
+    $obj = [pscustomobject]@{
+        Id          = [Math]::Abs([Guid]::NewGuid().GetHashCode())
+        Name        = $Name
+        HasMoreData = $true
+        PSBeginTime = Get-Date
+        _PS         = $ps
+        _Handle     = $handle
+        _Runspace   = $rs
+    }
+    $obj | Add-Member -MemberType ScriptProperty -Name State -Value {
+        try {
+            if ($this._Handle -and $this._Handle.IsCompleted) {
+                if ($this._PS.HadErrors -or $this._PS.InvocationStateInfo.State -eq 'Failed') { 'Failed' } else { 'Completed' }
+            } elseif ($this._PS.InvocationStateInfo.State -eq 'Stopped') { 'Stopped' }
+            else { 'Running' }
+        } catch { 'Unknown' }
+    }
+    $obj.PSObject.TypeNames.Insert(0, 'Sdt.AsyncJob')
+    return $obj
+}
+
+function Wait-Job {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job,
+        [int]$Timeout = -1,
+        [switch]$Any,
+        [switch]$Force
+    )
+    process {
+        foreach ($j in @($Job)) {
+            if ($j -and ($j.PSObject.TypeNames -contains 'Sdt.AsyncJob')) {
+                try {
+                    if ($Timeout -gt 0) {
+                        [void]$j._Handle.AsyncWaitHandle.WaitOne([int]($Timeout * 1000))
                     } else {
-                        Microsoft.PowerShell.Core\Wait-Job -Job $j -Timeout $Timeout -Any:$Any -Force:$Force
+                        [void]$j._Handle.AsyncWaitHandle.WaitOne()
                     }
-                }
+                } catch {}
+                $j
+            } elseif ($j -and ($j.PSObject.TypeNames -contains 'Sdt.InlineJob')) {
+                $j
+            } else {
+                Microsoft.PowerShell.Core\Wait-Job -Job $j -Timeout $Timeout -Any:$Any -Force:$Force
             }
         }
+    }
+}
 
-        function global:Receive-Job {
-            [CmdletBinding()]
-            param(
-                [Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job,
-                [switch]$Keep,
-                [switch]$Wait,
-                [switch]$AutoRemoveJob,
-                [int]$WriteEvents,
-                [int]$WriteJobInResults
-            )
-            process {
-                foreach ($j in @($Job)) {
-                    if ($j -and $j.PSObject.TypeNames -contains 'Sdt.SerialJob') {
-                        foreach ($e in $j._Errors) { Write-Error $e }
-                        $j._Output
+function Receive-Job {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job,
+        [switch]$Keep,
+        [switch]$Wait,
+        [switch]$AutoRemoveJob
+    )
+    process {
+        foreach ($j in @($Job)) {
+            if ($j -and ($j.PSObject.TypeNames -contains 'Sdt.AsyncJob')) {
+                try {
+                    if (-not $j._Handle.IsCompleted -and $Wait) {
+                        [void]$j._Handle.AsyncWaitHandle.WaitOne()
+                    }
+                    if ($j._Handle.IsCompleted) {
+                        $out = $null
+                        try { $out = $j._PS.EndInvoke($j._Handle) } catch { Write-Error $_ }
+                        foreach ($e in $j._PS.Streams.Error) { Write-Error $e }
+                        $out
                         if (-not $Keep) { $j.HasMoreData = $false }
-                    } else {
-                        Microsoft.PowerShell.Core\Receive-Job -Job $j -Keep:$Keep -Wait:$Wait -AutoRemoveJob:$AutoRemoveJob
                     }
-                }
+                } catch {}
+            } elseif ($j -and ($j.PSObject.TypeNames -contains 'Sdt.InlineJob')) {
+                foreach ($e in $j._InlineErrors) { Write-Error $e }
+                $j._InlineOutput
+                if (-not $Keep) { $j.HasMoreData = $false }
+            } else {
+                Microsoft.PowerShell.Core\Receive-Job -Job $j -Keep:$Keep -Wait:$Wait -AutoRemoveJob:$AutoRemoveJob
             }
         }
+    }
+}
 
-        function global:Stop-Job {
-            [CmdletBinding()]
-            param([Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job, [switch]$PassThru)
-            process {
-                foreach ($j in @($Job)) {
-                    if ($j -and $j.PSObject.TypeNames -contains 'Sdt.SerialJob') {
-                        # Synchronous serial job - already completed by the time it returns.
-                        if ($PassThru) { $j }
-                    } else {
-                        Microsoft.PowerShell.Core\Stop-Job -Job $j -PassThru:$PassThru
-                    }
-                }
+function Stop-Job {
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job, [switch]$PassThru)
+    process {
+        foreach ($j in @($Job)) {
+            if ($j -and ($j.PSObject.TypeNames -contains 'Sdt.AsyncJob')) {
+                try { if ($j._PS -and -not $j._Handle.IsCompleted) { $j._PS.Stop() } } catch {}
+                if ($PassThru) { $j }
+            } elseif ($j -and ($j.PSObject.TypeNames -contains 'Sdt.InlineJob')) {
+                if ($PassThru) { $j }
+            } else {
+                Microsoft.PowerShell.Core\Stop-Job -Job $j -PassThru:$PassThru
             }
         }
+    }
+}
 
-        function global:Remove-Job {
-            [CmdletBinding()]
-            param([Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job, [switch]$Force)
-            process {
-                foreach ($j in @($Job)) {
-                    if ($j -and $j.PSObject.TypeNames -contains 'Sdt.SerialJob') {
-                        # No-op - synthetic job has nothing to dispose.
-                    } else {
-                        Microsoft.PowerShell.Core\Remove-Job -Job $j -Force:$Force
-                    }
+function Remove-Job {
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job, [switch]$Force)
+    process {
+        foreach ($j in @($Job)) {
+            if ($j -and ($j.PSObject.TypeNames -contains 'Sdt.AsyncJob')) {
+                try { if ($j._PS -and -not $j._Handle.IsCompleted -and $Force) { $j._PS.Stop() } } catch {}
+                try { $j._PS.Dispose() } catch {}
+                try { $j._Runspace.Close() } catch {}
+                try { $j._Runspace.Dispose() } catch {}
+            } elseif ($j -and ($j.PSObject.TypeNames -contains 'Sdt.InlineJob')) {
+                # no-op
+            } else {
+                Microsoft.PowerShell.Core\Remove-Job -Job $j -Force:$Force
+            }
+        }
+    }
+}
+'@
+
+        # Dot-source the shim into the parent's global scope.
+        try {
+            . ([scriptblock]::Create($Global:SDT_ShimSource))
+        } catch {
+            Write-Host "  [error] Could not load runspace shim: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  [error] Discovery will not work. Reinstall ThreadJob manually:" -ForegroundColor Red
+            Write-Host "          Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor Yellow
+            $Global:SDT_ThreadJobMode = 'broken'
+        }
+
+        # Self-check: spawn a tiny async job, wait, verify output. If it
+        # works, we're good. If not, surface the error early.
+        if ($Global:SDT_ThreadJobMode -eq 'asyncShim') {
+            try {
+                $testJob = Start-ThreadJob -ScriptBlock { param($x) "ok-$x" } -ArgumentList 'shim'
+                [void]$testJob._Handle.AsyncWaitHandle.WaitOne(5000)
+                $testOut = $testJob._PS.EndInvoke($testJob._Handle)
+                if ("$testOut" -ne 'ok-shim') {
+                    throw "shim self-test produced '$testOut' (expected 'ok-shim')"
                 }
+                try { $testJob._PS.Dispose() } catch {}
+                try { $testJob._Runspace.Dispose() } catch {}
+            } catch {
+                Write-Host "  [error] Runspace shim self-test FAILED: $($_.Exception.Message)" -ForegroundColor Red
+                $Global:SDT_ThreadJobMode = 'broken'
             }
         }
     }
 }
 
 # Single quiet line: ThreadJob status.
-if ($Global:SDT_ThreadJobMode -eq 'serial') {
-    Write-Host "  [sdt] ThreadJob unavailable - using sequential discovery" -ForegroundColor DarkGray
+if ($Global:SDT_ThreadJobMode -eq 'asyncShim') {
+    Write-Host "  [sdt] ThreadJob unavailable - using runspace shim (in-process async)" -ForegroundColor DarkGray
+} elseif ($Global:SDT_ThreadJobMode -eq 'broken') {
+    Write-Host "  [sdt] WARNING: ThreadJob unavailable AND runspace shim failed self-test." -ForegroundColor Red
+    Write-Host "  [sdt] Discovery may not start. Fix: Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor Yellow
 }
 
 # Auto-minimize the host PowerShell window so the GUI takes focus.
