@@ -2620,30 +2620,58 @@ try {
                                     try { $script:Session.Targets[0].Phase    = 'complete' } catch {}
                                     try { $script:Session.Targets[0].Finished = (Get-Date).ToString('HH:mm:ss') } catch {}
                                     $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Discovery JSON produced: $($jsonProduced[0].Name)")
-                                    # Kick off gen_report.py
+                                    # Build the manifest in the EXACT shape gen_report.py expects
+                                    # (same as the main orchestrator does in Start-DiscoveryRun).
                                     try {
                                         $gen = Join-Path $script:ScriptDir 'gen_report.py'
                                         $py  = Join-Path $script:ScriptDir 'python\python.exe'
                                         if (-not (Test-Path $py)) { $py = 'python' }
-                                        if (Test-Path $gen) {
-                                            $manifest = Join-Path $script:Session.SessionDir 'manifest.json'
-                                            $servers = @(@{ file = $jsonProduced[0].Name; name = $script:Session.Client; id = $script:Session.Client })
-                                            $manifestObj = @{ client = $script:Session.Client; sessionDir = $script:Session.SessionDir; servers = $servers }
-                                            $manifestObj | ConvertTo-Json -Depth 10 | Set-Content $manifest -Encoding UTF8
-                                            $reportLog = Join-Path $script:Session.SessionDir 'gen_report.log'
-                                            $genArgs = @($gen, '--manifest', $manifest, '--out-dir', $script:Session.SessionDir)
-                                            $reportProc = Start-Process -FilePath $py -ArgumentList $genArgs -NoNewWindow -PassThru -RedirectStandardOutput $reportLog -RedirectStandardError "$reportLog.err"
-                                            $reportProc.WaitForExit(180000) | Out-Null
-                                            $htmlOut = @(Get-ChildItem $script:Session.SessionDir -Filter '*.html' -EA 0 | Select-Object -First 1)
-                                            if ($htmlOut.Count -gt 0) {
-                                                $script:Session.ReportPath = $htmlOut[0].FullName
-                                                $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Report generated: $($htmlOut[0].Name)")
+                                        if (-not (Test-Path $gen)) { throw "gen_report.py not found at $gen" }
+
+                                        $jsonName = $jsonProduced[0].Name
+                                        $tBase    = ($jsonName -replace '-discovery-\d{4}-\d{2}-\d{2}.*$','') -replace '\.json$',''
+                                        $tSlug    = ($tBase.ToLower() -replace '[^a-z0-9]+','-').Trim('-')
+                                        if (-not $tSlug) { $tSlug = 'server' }
+
+                                        $manifestPath = Join-Path $script:Session.SessionDir 'manifest.json'
+                                        $manifest = @{
+                                            client         = $script:Session.Client
+                                            client_full    = $script:Session.Client
+                                            date           = (Get-Date).ToString('yyyy-MM-dd')
+                                            session_dir    = '.'
+                                            output_dir     = '.'
+                                            inventory_file = ''
+                                            logo_file      = ''
+                                            servers        = @(@{ file = $jsonName; name = $tBase; id = $tSlug; in_scope = $true })
+                                        } | ConvertTo-Json -Depth 6
+                                        [System.IO.File]::WriteAllText($manifestPath, $manifest, [System.Text.Encoding]::UTF8)
+
+                                        $reportLog = Join-Path $script:Session.SessionDir 'gen_report.log'
+                                        # gen_report.py is positional: python gen_report.py <manifest>
+                                        $reportProc = Start-Process -FilePath $py -ArgumentList @($gen, $manifestPath) -NoNewWindow -PassThru `
+                                                      -RedirectStandardOutput $reportLog -RedirectStandardError "$reportLog.err" `
+                                                      -WorkingDirectory $script:Session.SessionDir
+                                        $reportProc.WaitForExit(180000) | Out-Null
+
+                                        # Real output filename pattern is *DiscoveryReport*.html, size > 1KB
+                                        $htmlOut = @(Get-ChildItem $script:Session.SessionDir -Filter '*DiscoveryReport*.html' -EA 0 |
+                                                     Where-Object { $_.Length -gt 1024 } | Select-Object -First 1)
+                                        if ($htmlOut.Count -gt 0) {
+                                            $script:Session.ReportPath = $htmlOut[0].FullName
+                                            $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Report generated: $($htmlOut[0].Name)")
+                                        } else {
+                                            # Fallback: any sufficiently-large .html in the session dir
+                                            $anyHtml = @(Get-ChildItem $script:Session.SessionDir -Filter '*.html' -EA 0 |
+                                                         Where-Object { $_.Length -gt 1024 } | Select-Object -First 1)
+                                            if ($anyHtml.Count -gt 0) {
+                                                $script:Session.ReportPath = $anyHtml[0].FullName
+                                                $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Report (fallback match): $($anyHtml[0].Name)")
                                             } else {
-                                                $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py finished but no HTML produced - see gen_report.log")
+                                                $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py finished but no HTML produced - check gen_report.log + gen_report.log.err in session dir")
                                             }
                                         }
                                     } catch {
-                                        $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py failed: $($_.Exception.Message)")
+                                        $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py invocation failed: $($_.Exception.Message)")
                                     }
                                     $script:Session.Status = 'complete'
                                 } else {
