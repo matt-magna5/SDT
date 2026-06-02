@@ -817,7 +817,7 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 <!-- Quick action: scan THIS machine only (no HV, no creds, no remote) -->
 <div id="localOnlyBar" style="display:flex;align-items:center;gap:10px;padding:8px 12px;margin-bottom:10px;font-size:12px;color:var(--muted);background:rgba(80,160,255,0.05);border:1px solid var(--border);border-radius:8px;">
 <span style="flex:1;">No HV / remote access? Quick-scan this machine only:</span>
-<button type="button" class="btn btn-secondary" id="localOnlyBtn" onclick="runLocalOnly()" style="padding:4px 10px;font-size:12px;white-space:nowrap;">Scan this box</button>
+<button type="button" class="btn btn-secondary" id="localOnlyBtn" onclick="runLocalOnly()" style="padding:4px 10px;font-size:12px;white-space:nowrap;">Scan this server only</button>
 <span id="localOnlyStatus" style="font-size:11px;"></span>
 </div>
 
@@ -1189,7 +1189,7 @@ async function runLocalOnly(){
     if (!d.ok) {
       status.textContent = 'Failed: ' + (d.error || 'unknown error');
       status.style.color = 'var(--danger, #f55)';
-      btn.disabled = false; btn.textContent = 'Scan this box';
+      btn.disabled = false; btn.textContent = 'Scan this server only';
       return;
     }
     status.textContent = '';
@@ -1200,7 +1200,7 @@ async function runLocalOnly(){
   } catch (e) {
     status.textContent = 'Request failed: ' + e.message;
     status.style.color = 'var(--danger, #f55)';
-    btn.disabled = false; btn.textContent = 'Scan this box';
+    btn.disabled = false; btn.textContent = 'Scan this server only';
   }
 }
 
