@@ -813,6 +813,19 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 
 <!-- SETUP TAB -->
 <div id="tab-setup" class="tab-pane active">
+
+<!-- Quick action: scan THIS machine only (no HV, no creds, no remote) -->
+<div class="card" id="localOnlyCard" style="border-left:4px solid var(--accent);background:rgba(80,160,255,0.06);">
+<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;">
+<div style="flex:1;min-width:260px;">
+<div style="font-weight:600;font-size:14px;">No HV / remote access? Scan THIS machine only.</div>
+<div style="color:var(--muted);font-size:12px;margin-top:4px;">Runs Invoke-ServerDiscovery against the local machine. No credentials, no WinRM, no hypervisor required. Use when you are RDP'd into a single server and just need its inventory + a report.</div>
+</div>
+<button type="button" class="btn" id="localOnlyBtn" onclick="runLocalOnly()" style="white-space:nowrap;">Scan THIS machine</button>
+</div>
+<div id="localOnlyStatus" style="margin-top:8px;font-size:12px;color:var(--muted);"></div>
+</div>
+
 <form id="setupForm" novalidate onsubmit="submitSetup(event)">
 
 <div class="card">
@@ -1162,6 +1175,32 @@ function updateVmCount(){
 function toggleAllVms(on){
   (window._discoveredVMs || []).forEach(v => v._checked = !!on);
   renderVmTable();
+}
+
+async function runLocalOnly(){
+  const btn = document.getElementById('localOnlyBtn');
+  const status = document.getElementById('localOnlyStatus');
+  if (!confirm('Run discovery against THIS machine only? No HV, no remote targets. Use this when you are RDP-ed into a single server and just need its inventory.')) return;
+  btn.disabled = true; btn.textContent = 'Starting...';
+  status.textContent = '';
+  status.style.color = 'var(--muted)';
+  try {
+    const r = await fetch('/api/local-only', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const d = await r.json();
+    if (!d.ok) {
+      status.textContent = 'Failed: ' + (d.error || 'unknown error');
+      status.style.color = 'var(--danger, #f55)';
+      btn.disabled = false; btn.textContent = 'Scan THIS machine';
+      return;
+    }
+    status.textContent = 'Started. Switching to Run tab... target = ' + (d.target || 'localhost');
+    status.style.color = 'var(--ok, #6c6)';
+    setTab('run');
+  } catch (e) {
+    status.textContent = 'Request failed: ' + e.message;
+    status.style.color = 'var(--danger, #f55)';
+    btn.disabled = false; btn.textContent = 'Scan THIS machine';
+  }
 }
 
 async function submitSetup(e){
@@ -1644,6 +1683,19 @@ function Start-DiscoveryRun {
 
             try {
                 # ---- Preflight reachability check ---------------------
+                # If the target IS this machine, skip the WinRM probe entirely.
+                # Invoke-ServerDiscovery auto-detects local execution (no WinRM
+                # needed) and the probe would just print noisy "inconclusive"
+                # warnings. Mark reachable so the orchestrator proceeds straight
+                # to the scan.
+                $isLocalTarget = ($t.Address -ieq $env:COMPUTERNAME) -or ($t.Address -ieq 'localhost') -or ($t.Address -eq '127.0.0.1') -or ($t.Address -eq '.')
+                if ($isLocalTarget) {
+                    $t.Phase = 'local discovery (no WinRM needed)'
+                    $Session.Targets[$i] = $t
+                    [void]$lines.Add("[preflight] target is local machine - skipping WinRM probe")
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $($t.Address): local target - skipping WinRM probe") | Out-Null
+                    $pingOk = $true; $winrmOk = $true; $sshOk = $false
+                } else {
                 # 5s per probe - 1.5s was too aggressive across VPN + NetBIOS
                 # name resolution. DNS alone can chew 3s.
                 $t.Phase = 'preflight...'
@@ -1680,6 +1732,7 @@ function Start-DiscoveryRun {
                     $tcp.Close()
                 } catch {}
                 [void]$lines.Add("[preflight] ping=$pingOk winrm=$winrmOk ssh=$sshOk")
+                } # end else (non-local preflight)
 
                 # Only skip the scan in ONE case: truly unreachable (no ping,
                 # no WinRM, no SSH). Every other combination - including
@@ -2529,6 +2582,36 @@ try {
                         }
                     } catch {
                         Send-Json -Response $resp -Data @{ ok=$false; error=$_.Exception.Message } -StatusCode 500
+                    }
+                    break
+                }
+                '^POST /api/local-only$' {
+                    # No-HV, no-creds, single-target = THIS machine.
+                    # Used when the SE is RDP-ed into a server and just needs that
+                    # one box scanned + a report. Bypasses the form entirely.
+                    if ($script:Session.Status -eq 'running') {
+                        Send-Json -Response $resp -Data @{ ok = $false; error = 'A discovery session is already running.' } -StatusCode 409
+                        break
+                    }
+                    $localTarget = $env:COMPUTERNAME
+                    $payload = [pscustomobject]@{
+                        client    = $localTarget
+                        outputDir = 'C:\Temp\sdt\sessions'
+                        parallel  = 1
+                        targets   = @($localTarget)
+                        winrmUser = ''
+                        winrmPass = ''
+                        hvType    = 'none'
+                        hvHost    = ''
+                        hvUser    = ''
+                        hvPass    = ''
+                        localOnly = $true
+                    }
+                    try {
+                        $null = Start-DiscoveryRun -Payload $payload
+                        Send-Json -Response $resp -Data @{ ok = $true; sessionDir = $script:Session.SessionDir; target = $localTarget }
+                    } catch {
+                        Send-Json -Response $resp -Data @{ ok = $false; error = $_.Exception.Message } -StatusCode 500
                     }
                     break
                 }
