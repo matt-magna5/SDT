@@ -1995,8 +1995,23 @@ def build_eol_tab():
         sql_inst = d.get('SQL', {})
         if isinstance(sql_inst, list) and sql_inst: sql_inst = sql_inst[0]
         if isinstance(sql_inst, dict) and sql_inst.get('Edition'):
+            # Prefer ProductName + SKU Edition + ProductLevel for the new
+            # discovery format (Invoke-ServerDiscovery v4.2.22+).
+            # Fall back to old single-field 'Edition' for older JSONs.
+            sku = sql_inst.get('Edition', '')
+            prod = sql_inst.get('ProductName', '') or sku
+            plevel = sql_inst.get('ProductLevel', '')
+            ver = sql_inst.get('Version', '')
+            label_bits = [prod] if prod else []
+            # Don't duplicate when ProductName == Edition (old discovery)
+            if sku and sku != prod:
+                label_bits.append(sku)
+            if plevel and plevel.upper() not in ('UNKNOWN','NULL',''):
+                label_bits.append(plevel)
+            if ver:
+                label_bits.append(ver)
             _eol_row(name, 'SQL Server',
-                     f'{sql_inst.get("Edition","")} {sql_inst.get("Version","")}',
+                     ' '.join(label_bits),
                      sql_inst.get('EOLDate', ''), sql_inst.get('EOLStatus', ''))
         # Exchange
         exch = d.get('Exchange', {})

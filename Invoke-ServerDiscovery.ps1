@@ -1196,7 +1196,7 @@ $CollectionBlock = {
 
         foreach ($instName in $instanceNames) {
             Write-Host ("    [SQL] Instance: $instName") -ForegroundColor DarkGray
-            $inst = @{ InstanceName=$instName; Version='Unknown'; Edition='Unknown'; ServiceAccount='Unknown'; EOLStatus='Unknown'; EOLDate='Unknown'; Databases=@(); Partial=$false }
+            $inst = @{ InstanceName=$instName; Version='Unknown'; Edition='Unknown'; ProductName='Unknown'; ProductLevel='Unknown'; ProductVersion='Unknown'; EngineEdition=$null; ServiceAccount='Unknown'; EOLStatus='Unknown'; EOLDate='Unknown'; Databases=@(); Partial=$false }
             try {
                 # Get version from registry
                 $vKey = if ($instName -eq 'MSSQLSERVER') { 'MSSQL' } else { "MSSQL.$instName" }
@@ -1221,9 +1221,13 @@ $CollectionBlock = {
                 $verKey10  = $verParts[0] + '.' + $verParts[1]
                 foreach ($k in $SQLEOLMap.Keys) {
                     if ($inst.Version.StartsWith($k)) {
-                        $inst.EOLStatus = $SQLEOLMap[$k].Status
-                        $inst.EOLDate   = $SQLEOLMap[$k].EOL
-                        $inst.Edition   = $SQLEOLMap[$k].Name
+                        $inst.EOLStatus   = $SQLEOLMap[$k].Status
+                        $inst.EOLDate     = $SQLEOLMap[$k].EOL
+                        # ProductName = friendly version (e.g. "SQL Server 2017").
+                        # Edition gets the SKU (Standard/Enterprise/...) below
+                        # if the SQL connection succeeds.
+                        $inst.ProductName = $SQLEOLMap[$k].Name
+                        $inst.Edition     = $SQLEOLMap[$k].Name  # provisional - real SKU overwrites below
                         if ($inst.EOLStatus -eq 'EOL') {
                             cb-Flag 'critical' "EOL SQL Server: $($SQLEOLMap[$k].Name) ($instName)" "EOL: $($SQLEOLMap[$k].EOL). No security patches. Must upgrade or migrate before production use."
                         }
@@ -1244,6 +1248,44 @@ $CollectionBlock = {
                     $conn.ConnectionString = "Server=$sqlServer;Integrated Security=True;Connect Timeout=10;Application Name=M5Discovery"
                     $conn.Open()
                     $inst.Connected = $true
+
+                    # SERVERPROPERTY pull: capture the actual SKU edition and
+                    # patch level, not just the friendly product name. The
+                    # registry path only gives us the version number; without
+                    # this query we can't distinguish Standard/Enterprise/
+                    # Developer/Web/Express.
+                    try {
+                        $cmdSp = $conn.CreateCommand()
+                        $cmdSp.CommandText = @"
+SELECT
+    CAST(SERVERPROPERTY('Edition')        AS nvarchar(256)) AS [Edition],
+    CAST(SERVERPROPERTY('EngineEdition')  AS int)           AS [EngineEdition],
+    CAST(SERVERPROPERTY('ProductLevel')   AS nvarchar(64))  AS [ProductLevel],
+    CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(64))  AS [ProductVersion],
+    CAST(SERVERPROPERTY('ProductUpdateLevel') AS nvarchar(64)) AS [ProductUpdateLevel],
+    CAST(SERVERPROPERTY('ProductBuild')   AS nvarchar(64))  AS [ProductBuild]
+"@
+                        $rdrSp = $cmdSp.ExecuteReader()
+                        if ($rdrSp.Read()) {
+                            $skuEdition = "$($rdrSp['Edition'])"
+                            if ($skuEdition) { $inst.Edition = $skuEdition }
+                            $eEdition = $rdrSp['EngineEdition']
+                            if ($eEdition -isnot [DBNull]) { $inst.EngineEdition = [int]$eEdition }
+                            $pLevel = "$($rdrSp['ProductLevel'])"
+                            if ($pLevel) { $inst.ProductLevel = $pLevel }
+                            $pVer = "$($rdrSp['ProductVersion'])"
+                            if ($pVer) { $inst.ProductVersion = $pVer }
+                            $pUpd = "$($rdrSp['ProductUpdateLevel'])"
+                            if ($pUpd -and $pUpd -ne 'NULL') { $inst.ProductUpdateLevel = $pUpd }
+                            $pBld = "$($rdrSp['ProductBuild'])"
+                            if ($pBld) { $inst.ProductBuild = $pBld }
+                        }
+                        $rdrSp.Close()
+                    } catch {
+                        $inst.Partial = $true
+                        Write-Host ("    [SQL]   SERVERPROPERTY query failed: $($_.Exception.Message)") -ForegroundColor DarkYellow
+                    }
+
                     $cmd = $conn.CreateCommand()
                     $cmd.CommandText = @"
 SELECT
