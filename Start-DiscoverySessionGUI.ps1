@@ -2391,21 +2391,68 @@ function Remove-Job {
             $Global:SDT_ThreadJobMode = 'broken'
         }
 
-        # Self-check: spawn a tiny async job, wait, verify output. If it
-        # works, we're good. If not, surface the error early.
+        # Self-check: spawn a tiny async job, wait with HARD timeout. If the
+        # runspace hangs (e.g. ThreatLocker blocking .NET API), we abort the
+        # PowerShell handle and fall back to inline execution rather than
+        # letting EndInvoke block the startup forever.
         if ($Global:SDT_ThreadJobMode -eq 'asyncShim') {
+            $selfTestPassed = $false
+            $testJob = $null
             try {
                 $testJob = Start-ThreadJob -ScriptBlock { param($x) "ok-$x" } -ArgumentList 'shim'
-                [void]$testJob._Handle.AsyncWaitHandle.WaitOne(5000)
+                $completed = $testJob._Handle.AsyncWaitHandle.WaitOne(3000)
+                if (-not $completed) {
+                    throw "self-test timed out after 3s (runspace hung)"
+                }
                 $testOut = $testJob._PS.EndInvoke($testJob._Handle)
                 if ("$testOut" -ne 'ok-shim') {
-                    throw "shim self-test produced '$testOut' (expected 'ok-shim')"
+                    throw "self-test produced '$testOut' (expected 'ok-shim')"
                 }
-                try { $testJob._PS.Dispose() } catch {}
-                try { $testJob._Runspace.Dispose() } catch {}
+                $selfTestPassed = $true
             } catch {
-                Write-Host "  [error] Runspace shim self-test FAILED: $($_.Exception.Message)" -ForegroundColor Red
-                $Global:SDT_ThreadJobMode = 'broken'
+                Write-Host "  [warn] Runspace shim self-test FAILED: $($_.Exception.Message)" -ForegroundColor Yellow
+                Write-Host "  [warn] Falling back to inline execution (discovery will block listener)." -ForegroundColor Yellow
+                $Global:SDT_ThreadJobMode = 'inlineLastResort'
+            } finally {
+                # Always try to clean up the test runspace, even on timeout.
+                if ($testJob) {
+                    try { if (-not $testJob._Handle.IsCompleted) { $testJob._PS.Stop() } } catch {}
+                    try { $testJob._PS.Dispose() } catch {}
+                    try { $testJob._Runspace.Dispose() } catch {}
+                }
+            }
+            if (-not $selfTestPassed -and $Global:SDT_ThreadJobMode -eq 'inlineLastResort') {
+                # Replace the runspace-based Start-ThreadJob with an inline
+                # synchronous version. This blocks the caller but never hangs.
+                # Wait-Job / Receive-Job / etc. handle the synthetic InlineJob.
+                Remove-Item Function:\Start-ThreadJob -EA SilentlyContinue
+                function global:Start-ThreadJob {
+                    [CmdletBinding()]
+                    param(
+                        [Parameter(Mandatory=$true, Position=0)][scriptblock]$ScriptBlock,
+                        [object[]]$ArgumentList,
+                        [int]$ThrottleLimit = 1,
+                        [string]$Name = 'SdtInlineJob',
+                        [scriptblock]$InitializationScript
+                    )
+                    $out = $null; $errs = @()
+                    try {
+                        if ($InitializationScript) { . $InitializationScript }
+                        if ($ArgumentList -and $ArgumentList.Count -gt 0) {
+                            $out = & $ScriptBlock @ArgumentList
+                        } else {
+                            $out = & $ScriptBlock
+                        }
+                    } catch { $errs += $_ }
+                    $obj = [pscustomobject]@{
+                        Id = [Math]::Abs([Guid]::NewGuid().GetHashCode())
+                        Name = $Name; HasMoreData = $true
+                        _InlineOutput = $out; _InlineErrors = $errs; _InlineCompleted = $true
+                    }
+                    $obj | Add-Member -MemberType ScriptProperty -Name State -Value { if ($this._InlineErrors.Count) { 'Failed' } else { 'Completed' } }
+                    $obj.PSObject.TypeNames.Insert(0, 'Sdt.InlineJob')
+                    return $obj
+                }
             }
         }
     }
@@ -2414,9 +2461,10 @@ function Remove-Job {
 # Single quiet line: ThreadJob status.
 if ($Global:SDT_ThreadJobMode -eq 'asyncShim') {
     Write-Host "  [sdt] ThreadJob unavailable - using runspace shim (in-process async)" -ForegroundColor DarkGray
+} elseif ($Global:SDT_ThreadJobMode -eq 'inlineLastResort') {
+    Write-Host "  [sdt] WARNING: runspaces also blocked - using inline mode (UI may freeze during scan)." -ForegroundColor Yellow
 } elseif ($Global:SDT_ThreadJobMode -eq 'broken') {
-    Write-Host "  [sdt] WARNING: ThreadJob unavailable AND runspace shim failed self-test." -ForegroundColor Red
-    Write-Host "  [sdt] Discovery may not start. Fix: Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor Yellow
+    Write-Host "  [sdt] WARNING: discovery primitives broken. Fix: Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor Red
 }
 
 # Auto-minimize the host PowerShell window so the GUI takes focus.

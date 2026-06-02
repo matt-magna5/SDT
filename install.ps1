@@ -386,9 +386,9 @@ function Invoke-SdtRepair {
 
 # ---- Loud auto-update - always prints status on every launch ----
 function Invoke-SdtAutoUpdate {
-    `$local = if (Test-Path `$VerFile) { (Get-Content `$VerFile -Raw -EA 0).Trim() } else { '' }
-    # Normalize: VERSION file stores tags as 'v4.2.7' but format strings already
-    # prepend 'v' - strip any leading 'v' so we don't print 'vv4.2.7'.
+    `$localRaw = if (Test-Path `$VerFile) { (Get-Content `$VerFile -Raw -EA 0).Trim() } else { '' }
+    # `$local is the bare version for display (format strings add 'v').
+    `$local = `$localRaw
     if (`$local -match '^v') { `$local = `$local.Substring(1) }
     if (`$env:SDT_NO_AUTOUPDATE -eq '1') {
         Write-Host ("  [sdt] update check skipped (SDT_NO_AUTOUPDATE=1, local v{0})" -f `$local) -ForegroundColor DarkGray
@@ -423,12 +423,12 @@ function Invoke-SdtAutoUpdate {
         Write-Host "  [sdt] couldn't determine latest release - running local" -ForegroundColor DarkYellow
         return
     }
-    if (`$latest -eq `$local) {
+    # Normalize BOTH sides before comparison: 'v4.2.11' vs '4.2.11' must match.
+    `$latestDisplay = `$latest; if (`$latestDisplay -match '^v') { `$latestDisplay = `$latestDisplay.Substring(1) }
+    if (`$latestDisplay -eq `$local) {
         Write-Host ("  [sdt] up to date (v{0})" -f `$local) -ForegroundColor DarkGreen
         return
     }
-    # Strip 'v' prefix from latest tag for clean display (format string adds it back).
-    `$latestDisplay = `$latest; if (`$latestDisplay -match '^v') { `$latestDisplay = `$latestDisplay.Substring(1) }
     Write-Host ("  [sdt] v{0} available (local v{1}) - updating..." -f `$latestDisplay, `$local) -ForegroundColor Yellow
     try {
         `$inst = Invoke-WebRequest 'https://raw.githubusercontent.com/matt-magna5/SDT/main/install.ps1' -UseBasicParsing -TimeoutSec 30
