@@ -1547,6 +1547,203 @@ async function testCreds(){
 $script:HtmlUI = $script:HtmlUI -replace '__VERSION__', $script:Version
 
 # -----------------------------------------------------------------------------
+# Bare-bones LEGACY UI (served when User-Agent is old IE, or via /legacy)
+# -----------------------------------------------------------------------------
+# Pure ES5: XMLHttpRequest, var, function declarations, no template literals,
+# no arrow funcs, no fetch, no async/await, no const/let.
+# Works in IE9+ (and obviously in any modern browser).
+$script:HtmlUI_Legacy = @'
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta charset="utf-8">
+<title>SDT - Server Discovery (Legacy UI)</title>
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; background:#f4f4f4; color:#222; }
+h1 { margin: 0 0 4px 0; font-size: 22px; }
+.ver { color: #777; font-size: 11px; margin-bottom: 18px; }
+.card { background:#fff; border:1px solid #ccc; border-radius:6px; padding:14px 16px; margin-bottom:14px; }
+.btn { display:inline-block; padding:8px 16px; background:#0066cc; color:#fff; border:0; cursor:pointer; font-size:13px; border-radius:4px; }
+.btn:hover { background:#0055aa; }
+.btn:disabled { background:#999; cursor:not-allowed; }
+.btn-sec { background:#666; }
+.status { padding:8px 12px; border-radius:4px; margin:8px 0; font-size:13px; }
+.status-idle { background:#eee; color:#666; }
+.status-running { background:#fff3cd; color:#856404; }
+.status-complete { background:#d4edda; color:#155724; }
+.status-error { background:#f8d7da; color:#721c24; }
+.log { font-family: Consolas, monospace; background:#1e1e1e; color:#d4d4d4; padding:12px; height:420px; overflow:auto; white-space:pre-wrap; font-size:12px; border-radius:4px; }
+.muted { color:#999; }
+a { color:#0066cc; }
+</style>
+</head>
+<body>
+
+<h1>SDT &mdash; Server Discovery (Legacy UI)</h1>
+<div class="ver">v__VERSION__ &middot; bare-bones mode for IE / no modern browser. Server: <span id="hostName">this machine</span></div>
+
+<div class="card">
+  <p style="margin-top:0;">Single-server scan. Runs <code>Invoke-ServerDiscovery.ps1</code> against this machine as the current user. No domain creds, no remote, no hypervisor.</p>
+  <button class="btn" id="scanBtn" onclick="startScan()">Scan This Server</button>
+  <button class="btn btn-sec" onclick="refresh()" style="margin-left:6px;">Refresh status</button>
+  <button class="btn btn-sec" onclick="copyLogs()" style="margin-left:6px;">Copy logs</button>
+  <div id="status" class="status status-idle">Idle &mdash; click &quot;Scan This Server&quot; to start.</div>
+  <div id="reportLine" class="muted" style="margin-top:6px;font-size:12px;"></div>
+</div>
+
+<div class="card">
+  <div style="font-weight:bold;margin-bottom:6px;">Log</div>
+  <div id="log" class="log">Waiting...</div>
+</div>
+
+<textarea id="copyBuf" style="position:absolute;left:-9999px;top:-9999px;"></textarea>
+
+<script>
+var pollTimer = null;
+
+function getHost() {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/status', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) return;
+    try {
+      var s = JSON.parse(xhr.responseText);
+      if (s.Client) { document.getElementById('hostName').innerHTML = s.Client; }
+    } catch(e) {}
+  };
+  xhr.send();
+}
+
+function setStatus(text, cls) {
+  var el = document.getElementById('status');
+  el.innerHTML = text;
+  el.className = 'status status-' + cls;
+}
+
+function startScan() {
+  var btn = document.getElementById('scanBtn');
+  btn.disabled = true;
+  btn.innerHTML = 'Starting...';
+  setStatus('Starting...', 'running');
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/local-only', true);
+  xhr.setRequestHeader('Content-Type', 'application/json');
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) return;
+    btn.disabled = false;
+    btn.innerHTML = 'Scan This Server';
+    if (xhr.status >= 200 && xhr.status < 300) {
+      var r;
+      try { r = JSON.parse(xhr.responseText); } catch(e) { setStatus('Bad response from server', 'error'); return; }
+      if (r.ok) {
+        setStatus('Running on ' + r.target + ' (PID ' + r.pid + ')', 'running');
+        if (r.target) document.getElementById('hostName').innerHTML = r.target;
+        startPolling();
+      } else {
+        setStatus('Failed: ' + (r.error || 'unknown'), 'error');
+      }
+    } else {
+      setStatus('HTTP ' + xhr.status + ' from /api/local-only', 'error');
+    }
+  };
+  xhr.send('{}');
+}
+
+function refresh() { poll(); }
+
+function poll() {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/status', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) return;
+    if (xhr.status < 200 || xhr.status >= 300) return;
+    var s;
+    try { s = JSON.parse(xhr.responseText); } catch(e) { return; }
+    renderStatus(s);
+  };
+  xhr.send();
+}
+
+function renderStatus(s) {
+  var cls = 'idle';
+  if (s.Status === 'running') cls = 'running';
+  else if (s.Status === 'complete') cls = 'complete';
+  else if (s.Status === 'error')    cls = 'error';
+
+  var msg = 'Status: ' + s.Status;
+  if (s.Targets && s.Targets.length && s.Targets[0].Phase) {
+    msg += ' &middot; ' + s.Targets[0].Phase;
+  }
+  setStatus(msg, cls);
+
+  if (s.Client) document.getElementById('hostName').innerHTML = s.Client;
+
+  if (s.LogTail && s.LogTail.length) {
+    var logEl = document.getElementById('log');
+    var lines = s.LogTail.slice(-200).join('\n');
+    logEl.innerHTML = lines.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  if (s.Status === 'complete') {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    var rl = document.getElementById('reportLine');
+    if (s.ReportPath) {
+      rl.innerHTML = 'Report: <a href="/api/report-html" target="_blank">Open</a> &middot; <code>' + s.ReportPath + '</code>';
+    } else {
+      rl.innerHTML = 'Scan complete; no report file found. Session dir: <code>' + (s.SessionDir||'') + '</code>';
+    }
+  } else if (s.Status === 'error') {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+}
+
+function startPolling() {
+  if (pollTimer) { clearInterval(pollTimer); }
+  pollTimer = setInterval(poll, 2000);
+  poll();
+}
+
+function copyLogs() {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/status', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) return;
+    var body = '';
+    try {
+      var s = JSON.parse(xhr.responseText);
+      body += '=== STATUS ===\n';
+      body += 'Status: ' + s.Status + '\n';
+      body += 'Client: ' + (s.Client||'?') + '\n';
+      body += 'SessionDir: ' + (s.SessionDir||'?') + '\n';
+      body += 'ReportPath: ' + (s.ReportPath||'') + '\n';
+      body += 'Targets: ' + JSON.stringify(s.Targets||[]) + '\n\n';
+      body += '=== LOG ===\n' + (document.getElementById('log').innerText || '');
+    } catch(e) { body = 'failed to read status'; }
+    var ta = document.getElementById('copyBuf');
+    ta.value = body;
+    ta.style.left='0';ta.style.top='0';
+    ta.focus(); ta.select();
+    try { document.execCommand('copy'); alert('Logs copied to clipboard.'); }
+    catch(e) { alert('Copy failed; select all and copy manually.'); }
+    ta.style.left='-9999px';ta.style.top='-9999px';
+  };
+  xhr.send();
+}
+
+// Initial fetch on load
+getHost();
+poll();
+</script>
+
+</body>
+</html>
+'@
+$script:HtmlUI_Legacy = $script:HtmlUI_Legacy -replace '__VERSION__', $script:Version
+
+# -----------------------------------------------------------------------------
 # HTTP LISTENER
 # -----------------------------------------------------------------------------
 function Start-HttpListener {
@@ -3264,7 +3461,22 @@ namespace Win32 {
                     break
                 }
                 '^GET /$|^GET /index\.html$' {
-                    Send-Response -Response $resp -Body $script:HtmlUI
+                    # Legacy IE detection: serve a bare-bones page that uses
+                    # XMLHttpRequest + setInterval (no fetch/async/template
+                    # literals/arrow funcs) when the browser is old IE.
+                    $ua = "$($req.UserAgent)"
+                    $isLegacyIE = ($ua -match 'MSIE|Trident')
+                    if ($isLegacyIE) {
+                        Send-Response -Response $resp -Body $script:HtmlUI_Legacy
+                    } else {
+                        Send-Response -Response $resp -Body $script:HtmlUI
+                    }
+                    break
+                }
+                '^GET /legacy$' {
+                    # Manual override - forces the bare-bones UI even on modern
+                    # browsers, useful for debugging or if the modern UI breaks.
+                    Send-Response -Response $resp -Body $script:HtmlUI_Legacy
                     break
                 }
                 default {

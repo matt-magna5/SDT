@@ -442,11 +442,75 @@ function Invoke-SdtAutoUpdate {
 
 # ---- Dispatch ----
 switch -Regex (`$Mode) {
+    '^(help|-h|--help|/\?|\?)$' {
+        Write-Host ""
+        Write-Host "SDT - Magna5 Server Discovery Tool" -ForegroundColor Cyan
+        Write-Host "==================================" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "USAGE:" -ForegroundColor Yellow
+        Write-Host "  sdt [<command>] [args...]"
+        Write-Host ""
+        Write-Host "COMMANDS:" -ForegroundColor Yellow
+        Write-Host "  (no args)            Launch the browser GUI (default)"
+        Write-Host "  gui                  Launch the browser GUI explicitly"
+        Write-Host "  invoke / local       Run Invoke-ServerDiscovery.ps1 on this box only"
+        Write-Host "                       (passes any remaining args to the script)"
+        Write-Host "  cli / console / tui  Legacy console wizard (Start-DiscoverySession.ps1)"
+        Write-Host ""
+        Write-Host "  version / -v         Show installed version + path"
+        Write-Host "  folder / where       Show the install folder paths"
+        Write-Host "  open                 Open the install folder in Explorer"
+        Write-Host "  update / upgrade     Force-pull the latest release from GitHub"
+        Write-Host "  repair / reinstall   Re-download the install (use if 'sdt' won't launch)"
+        Write-Host "  uninstall / remove   Remove SDT entirely (cleans up PATH)"
+        Write-Host ""
+        Write-Host "  help / -h / /?       Show this help"
+        Write-Host ""
+        Write-Host "EXAMPLES:" -ForegroundColor Yellow
+        Write-Host "  sdt                  # browser GUI"
+        Write-Host "  sdt invoke           # single-host scan, no UI"
+        Write-Host "  sdt folder           # print install paths"
+        Write-Host "  sdt update           # force-fetch latest from GitHub"
+        Write-Host ""
+        Write-Host "ENV VARS:" -ForegroundColor Yellow
+        Write-Host "  SDT_NO_AUTOUPDATE=1  Skip the auto-update check on launch"
+        Write-Host "  SDT_VERBOSE_THREADJOB=1  Show ThreadJob fallback details"
+        Write-Host ""
+        Write-Host "DOCS:  https://github.com/matt-magna5/SDT"
+        Write-Host ""
+        return
+    }
     '^(version|-v|--version)$' {
         `$v = if (Test-Path `$VerFile) { Get-Content `$VerFile -Raw -EA 0 } else { 'unknown' }
         Write-Host "SDT installed at: `$AppDir"
         Write-Host "Version: `$(`$v.Trim())"
         return
+    }
+    '^(folder|folders|where|paths|installdir)$' {
+        Write-Host ""
+        Write-Host "SDT install paths:" -ForegroundColor Cyan
+        Write-Host "  Root:    `$Root"
+        Write-Host "  App:     `$AppDir"
+        Write-Host "  Bin:     `$BinDir"
+        Write-Host "  Python:  `$(Join-Path `$AppDir 'python')"
+        Write-Host "  Version: `$VerFile"
+        Write-Host ""
+        Write-Host "Tip: 'sdt open' opens the install folder in Explorer."
+        Write-Host ""
+        return
+    }
+    '^(open|reveal|explorer)$' {
+        if (Test-Path `$AppDir) {
+            Write-Host "Opening `$AppDir ..." -ForegroundColor DarkGray
+            Start-Process explorer.exe `$AppDir
+        } else {
+            Write-Host "App dir not found: `$AppDir" -ForegroundColor Red
+        }
+        return
+    }
+    '^gui$' {
+        # Explicit GUI launch - falls through to the default dispatch below.
+        `$Mode = ''
     }
     '^(update|upgrade)$' {
         Write-Host "Forcing update..." -ForegroundColor Cyan
@@ -558,6 +622,9 @@ Say "  sdt update      pull latest tag from GitHub" DarkGray
 Say "  sdt repair      force re-download (use if sdt won't launch)" DarkGray
 Say "  sdt uninstall   remove everything" DarkGray
 Say "  sdt version     show install info" DarkGray
+Say "  sdt folder      show install paths" DarkGray
+Say "  sdt open        open install folder in Explorer" DarkGray
+Say "  sdt help        show all commands" DarkGray
 Say ""
 Say "Auto-update runs on every 'sdt' launch - you'll never paste a" DarkGray
 Say "download one-liner again." DarkGray
