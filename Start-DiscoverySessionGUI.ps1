@@ -2099,30 +2099,44 @@ function Start-DiscoveryRun {
 # MAIN
 # -----------------------------------------------------------------------------
 
-# Ensure ThreadJob is available (ships with PS 5.1 since WMF 5.1; may need install).
-# ThreadJob 2.1.0+ depends on netstandard 2.0; on some Windows PowerShell 5.1 hosts
-# (older .NET Framework, or netstandard.dll not auto-loaded) the Import-Module fails
-# with "Could not load file or assembly 'netstandard, Version=2.0.0.0'".
-# Workaround: preload netstandard if available, and pin install to ThreadJob 2.0.3
-# which is the last version that imports cleanly on Windows PowerShell 5.1.
+# -----------------------------------------------------------------------------
+# ThreadJob availability + serial fallback
+# -----------------------------------------------------------------------------
+# ThreadJob 2.1.0+ depends on netstandard 2.0; some Windows PowerShell 5.1 hosts
+# fail Import-Module with "Could not load file or assembly 'netstandard, Version=2.0.0.0'".
+#
+# Resolution ladder:
+#   1. Preload netstandard if .NET Framework 4.7.2+ provides it (Add-Type belt).
+#   2. Try Import-Module ThreadJob.
+#   3. If that fails, install pinned ThreadJob 2.0.3 (last PS 5.1-friendly version)
+#      after uninstalling any broken 2.1.0+ copy.
+#   4. If installation also fails (no network, gallery blocked, etc.), DON'T THROW.
+#      Fall back to SERIAL discovery: shim Start-ThreadJob so jobs run inline,
+#      one server at a time, in the current runspace. Slower but never blocks the
+#      user. Wait-Job / Receive-Job / Stop-Job / Remove-Job are proxied to handle
+#      the synthetic job objects.
+# -----------------------------------------------------------------------------
+$Global:SDT_ThreadJobMode = 'unknown'
+
 if (-not (Get-Command Start-ThreadJob -EA 0)) {
-    # Belt: pre-load netstandard if the host has it (.NET Framework 4.7.2+).
+    # Belt: pre-load netstandard if the host has it.
     try { Add-Type -AssemblyName 'netstandard' -EA SilentlyContinue } catch {}
 
-    $tjPinned = '2.0.3'  # last version known to import cleanly on Windows PowerShell 5.1
+    $tjPinned = '2.0.3'
 
+    $threadJobOk = $false
     try {
         Import-Module ThreadJob -EA Stop
+        $threadJobOk = $true
     } catch {
         $firstLine = ($_.Exception.Message -split "`r?`n")[0]
         Write-Host "  [warn] ThreadJob import failed ($firstLine)." -ForegroundColor Yellow
-        Write-Host "  [warn] Installing ThreadJob v$tjPinned (PS 5.1-compatible)..." -ForegroundColor Yellow
+        Write-Host "  [warn] Attempting install of ThreadJob v$tjPinned (PS 5.1-compatible)..." -ForegroundColor Yellow
         try {
             # Remove any broken existing copy (e.g. 2.1.0 that needs netstandard).
             Get-Module -ListAvailable ThreadJob | ForEach-Object {
                 try { Uninstall-Module ThreadJob -RequiredVersion $_.Version -Force -EA SilentlyContinue } catch {}
             }
-            # Ensure NuGet provider + PSGallery trust so Install-Module doesn't prompt.
             try {
                 if (-not (Get-PackageProvider -Name NuGet -EA SilentlyContinue)) {
                     Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser -EA SilentlyContinue | Out-Null
@@ -2131,13 +2145,143 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
             } catch {}
             Install-Module ThreadJob -RequiredVersion $tjPinned -Scope CurrentUser -Force -AllowClobber -EA Stop
             Import-Module ThreadJob -RequiredVersion $tjPinned -EA Stop
+            $threadJobOk = $true
         } catch {
-            Write-Host "  [error] Could not install/import ThreadJob v$tjPinned." -ForegroundColor Red
-            Write-Host "          $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "          Manual fix: Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor Yellow
-            throw
+            Write-Host "  [warn] Could not install/import ThreadJob v$tjPinned ($($_.Exception.Message.Split([Environment]::NewLine)[0]))." -ForegroundColor Yellow
+            Write-Host "  [warn] Falling back to SERIAL discovery (one server at a time)." -ForegroundColor Yellow
+            Write-Host "  [warn] Scan will work but slower. To restore parallel: Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor DarkYellow
         }
     }
+
+    if ($threadJobOk) {
+        $Global:SDT_ThreadJobMode = 'parallel'
+    } else {
+        # ----- SERIAL FALLBACK SHIMS -----
+        # Start-ThreadJob runs the scriptblock SYNCHRONOUSLY in the current runspace
+        # and returns a synthetic PSCustomObject that mimics a completed job. The
+        # Wait-Job/Receive-Job/Stop-Job/Remove-Job proxies below detect this object
+        # by its PSTypeName ('Sdt.SerialJob') and handle it locally, otherwise they
+        # delegate to the real cmdlets in Microsoft.PowerShell.Core.
+        $Global:SDT_ThreadJobMode = 'serial'
+
+        function global:Start-ThreadJob {
+            [CmdletBinding()]
+            param(
+                [Parameter(Mandatory=$true, Position=0)][scriptblock]$ScriptBlock,
+                [object[]]$ArgumentList,
+                [int]$ThrottleLimit = 1,
+                [string]$Name = 'SdtSerialJob',
+                [scriptblock]$InitializationScript,
+                [object[]]$InputObject,
+                [object]$StreamingHost
+            )
+            $output = $null
+            $errs   = @()
+            $start  = Get-Date
+            try {
+                if ($InitializationScript) { . $InitializationScript }
+                if ($ArgumentList -and $ArgumentList.Count -gt 0) {
+                    $output = & $ScriptBlock @ArgumentList
+                } else {
+                    $output = & $ScriptBlock
+                }
+            } catch {
+                $errs += $_
+            }
+            $finished = Get-Date
+            $obj = [pscustomobject]@{
+                Id            = [Math]::Abs([Guid]::NewGuid().GetHashCode())
+                Name          = $Name
+                State         = if ($errs.Count) { 'Failed' } else { 'Completed' }
+                HasMoreData   = $true
+                PSBeginTime   = $start
+                PSEndTime     = $finished
+                _Output       = $output
+                _Errors       = $errs
+            }
+            $obj.PSObject.TypeNames.Insert(0, 'Sdt.SerialJob')
+            return $obj
+        }
+
+        function global:Wait-Job {
+            [CmdletBinding()]
+            param(
+                [Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job,
+                [int]$Timeout = -1,
+                [switch]$Any,
+                [switch]$Force
+            )
+            process {
+                foreach ($j in @($Job)) {
+                    if ($j -and $j.PSObject.TypeNames -contains 'Sdt.SerialJob') {
+                        # Already completed.
+                        $j
+                    } else {
+                        Microsoft.PowerShell.Core\Wait-Job -Job $j -Timeout $Timeout -Any:$Any -Force:$Force
+                    }
+                }
+            }
+        }
+
+        function global:Receive-Job {
+            [CmdletBinding()]
+            param(
+                [Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job,
+                [switch]$Keep,
+                [switch]$Wait,
+                [switch]$AutoRemoveJob,
+                [int]$WriteEvents,
+                [int]$WriteJobInResults
+            )
+            process {
+                foreach ($j in @($Job)) {
+                    if ($j -and $j.PSObject.TypeNames -contains 'Sdt.SerialJob') {
+                        foreach ($e in $j._Errors) { Write-Error $e }
+                        $j._Output
+                        if (-not $Keep) { $j.HasMoreData = $false }
+                    } else {
+                        Microsoft.PowerShell.Core\Receive-Job -Job $j -Keep:$Keep -Wait:$Wait -AutoRemoveJob:$AutoRemoveJob
+                    }
+                }
+            }
+        }
+
+        function global:Stop-Job {
+            [CmdletBinding()]
+            param([Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job, [switch]$PassThru)
+            process {
+                foreach ($j in @($Job)) {
+                    if ($j -and $j.PSObject.TypeNames -contains 'Sdt.SerialJob') {
+                        # Synchronous serial job - already completed by the time it returns.
+                        if ($PassThru) { $j }
+                    } else {
+                        Microsoft.PowerShell.Core\Stop-Job -Job $j -PassThru:$PassThru
+                    }
+                }
+            }
+        }
+
+        function global:Remove-Job {
+            [CmdletBinding()]
+            param([Parameter(ValueFromPipeline=$true, Position=0)][object[]]$Job, [switch]$Force)
+            process {
+                foreach ($j in @($Job)) {
+                    if ($j -and $j.PSObject.TypeNames -contains 'Sdt.SerialJob') {
+                        # No-op - synthetic job has nothing to dispose.
+                    } else {
+                        Microsoft.PowerShell.Core\Remove-Job -Job $j -Force:$Force
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Surface the chosen mode loudly so the SE sees it in the launch log.
+if ($Global:SDT_ThreadJobMode -eq 'serial') {
+    Write-Host "  [sdt] discovery mode: SERIAL (one server at a time, ThreadJob unavailable)" -ForegroundColor Yellow
+} elseif ($Global:SDT_ThreadJobMode -eq 'parallel') {
+    Write-Host "  [sdt] discovery mode: parallel (ThreadJob available)" -ForegroundColor DarkGray
 }
 
 # Auto-minimize the host PowerShell window so the GUI takes focus.
