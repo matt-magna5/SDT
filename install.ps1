@@ -453,8 +453,9 @@ switch -Regex (`$Mode) {
         Write-Host "COMMANDS:" -ForegroundColor Yellow
         Write-Host "  (no args)            Launch the browser GUI (default)"
         Write-Host "  gui                  Launch the browser GUI explicitly"
-        Write-Host "  invoke / local       Run Invoke-ServerDiscovery.ps1 on this box only"
-        Write-Host "                       (passes any remaining args to the script)"
+        Write-Host "  invoke / run-local   Run Invoke-ServerDiscovery.ps1 on this box only"
+        Write-Host "  scan / scan-local    (aliases - all do the same thing)"
+        Write-Host "                       Any extra args are passed to the script."
         Write-Host "  cli / console / tui  Legacy console wizard (Start-DiscoverySession.ps1)"
         Write-Host ""
         Write-Host "  version / -v         Show installed version + path"
@@ -573,7 +574,7 @@ switch -Regex (`$Mode) {
         else { & (Join-Path `$AppDir 'Start-DiscoverySession.ps1') }
         return
     }
-    '^(invoke|local|bare)$' {
+    '^(invoke|local|bare|run-local|runlocal|scan-local|scan)$' {
         if (`$RestArr.Count -gt 0) { & (Join-Path `$AppDir 'Invoke-ServerDiscovery.ps1') @RestArr }
         else { & (Join-Path `$AppDir 'Invoke-ServerDiscovery.ps1') }
         return
@@ -616,7 +617,7 @@ Say "================================================================" DarkMagen
 Say ""
 Say "Commands (in ANY new terminal):" Cyan
 Say "  sdt             browser GUI (default)" DarkGray
-Say "  sdt invoke      local per-host Invoke-ServerDiscovery" DarkGray
+Say "  sdt invoke      local per-host Invoke-ServerDiscovery (also: sdt run-local, sdt scan)" DarkGray
 Say "  sdt cli         legacy console session wizard" DarkGray
 Say "  sdt update      pull latest tag from GitHub" DarkGray
 Say "  sdt repair      force re-download (use if sdt won't launch)" DarkGray
