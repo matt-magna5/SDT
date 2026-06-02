@@ -2099,14 +2099,44 @@ function Start-DiscoveryRun {
 # MAIN
 # -----------------------------------------------------------------------------
 
-# Ensure ThreadJob is available (ships with PS 5.1 since WMF 5.1; may need install)
+# Ensure ThreadJob is available (ships with PS 5.1 since WMF 5.1; may need install).
+# ThreadJob 2.1.0+ depends on netstandard 2.0; on some Windows PowerShell 5.1 hosts
+# (older .NET Framework, or netstandard.dll not auto-loaded) the Import-Module fails
+# with "Could not load file or assembly 'netstandard, Version=2.0.0.0'".
+# Workaround: preload netstandard if available, and pin install to ThreadJob 2.0.3
+# which is the last version that imports cleanly on Windows PowerShell 5.1.
 if (-not (Get-Command Start-ThreadJob -EA 0)) {
+    # Belt: pre-load netstandard if the host has it (.NET Framework 4.7.2+).
+    try { Add-Type -AssemblyName 'netstandard' -EA SilentlyContinue } catch {}
+
+    $tjPinned = '2.0.3'  # last version known to import cleanly on Windows PowerShell 5.1
+
     try {
         Import-Module ThreadJob -EA Stop
     } catch {
-        Write-Host "  [warn] ThreadJob module not available. Installing..." -ForegroundColor Yellow
-        Install-Module ThreadJob -Scope CurrentUser -Force -AllowClobber -EA Stop
-        Import-Module ThreadJob -EA Stop
+        $firstLine = ($_.Exception.Message -split "`r?`n")[0]
+        Write-Host "  [warn] ThreadJob import failed ($firstLine)." -ForegroundColor Yellow
+        Write-Host "  [warn] Installing ThreadJob v$tjPinned (PS 5.1-compatible)..." -ForegroundColor Yellow
+        try {
+            # Remove any broken existing copy (e.g. 2.1.0 that needs netstandard).
+            Get-Module -ListAvailable ThreadJob | ForEach-Object {
+                try { Uninstall-Module ThreadJob -RequiredVersion $_.Version -Force -EA SilentlyContinue } catch {}
+            }
+            # Ensure NuGet provider + PSGallery trust so Install-Module doesn't prompt.
+            try {
+                if (-not (Get-PackageProvider -Name NuGet -EA SilentlyContinue)) {
+                    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser -EA SilentlyContinue | Out-Null
+                }
+                Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -EA SilentlyContinue
+            } catch {}
+            Install-Module ThreadJob -RequiredVersion $tjPinned -Scope CurrentUser -Force -AllowClobber -EA Stop
+            Import-Module ThreadJob -RequiredVersion $tjPinned -EA Stop
+        } catch {
+            Write-Host "  [error] Could not install/import ThreadJob v$tjPinned." -ForegroundColor Red
+            Write-Host "          $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "          Manual fix: Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor Yellow
+            throw
+        }
     }
 }
 
