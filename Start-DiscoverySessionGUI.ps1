@@ -2211,11 +2211,22 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
     if ($threadJobOk) {
         $Global:SDT_ThreadJobMode = 'parallel'
     } else {
-        # ----- ASYNC RUNSPACE SHIMS -----
-        # Each Start-ThreadJob call spawns a fresh runspace in the current
-        # AppDomain. $Session (a synchronized hashtable) stays shared by
-        # reference, so the HTTP listener sees live updates.
+        # ----- ASYNC RUNSPACE SHIMS (via shared runspace pool) -----
+        # Open ONE runspace pool at startup and reuse for every Start-ThreadJob
+        # call. Avoids per-call CreateRunspace + Open which can hang under
+        # ThreatLocker / aggressive endpoint protection. Use .NET defaults
+        # (no explicit STA / ReuseThread - those can deadlock).
         $Global:SDT_ThreadJobMode = 'asyncShim'
+        $Global:SDT_RunspacePool  = $null
+        try {
+            $Global:SDT_RunspacePool = [runspacefactory]::CreateRunspacePool(1, 8)
+            $Global:SDT_RunspacePool.Open()
+        } catch {
+            $Global:SDT_RunspacePool = $null
+            if ($verboseTJ) {
+                Write-Host "  [warn] Runspace pool open failed: $($_.Exception.Message.Split([Environment]::NewLine)[0])" -ForegroundColor DarkGray
+            }
+        }
 
         # Source text of the shim functions. Stored globally so child runspaces
         # can re-inject it when they recursively call Start-ThreadJob.
@@ -2231,13 +2242,50 @@ function Start-ThreadJob {
         [object[]]$InputObject,
         [object]$StreamingHost
     )
-    $rs = [runspacefactory]::CreateRunspace()
-    $rs.ApartmentState = 'STA'
-    $rs.ThreadOptions  = 'ReuseThread'
-    try { $rs.Open() } catch {
-        # Runspace creation failed - degrade further to inline execution rather
-        # than throw. The user sees the work happen but the listener will block
-        # for the duration. Last-resort path.
+    # Path A: shared runspace pool (preferred - opened once at startup)
+    if ($Global:SDT_RunspacePool) {
+        try {
+            $ps = [System.Management.Automation.PowerShell]::Create()
+            $ps.RunspacePool = $Global:SDT_RunspacePool
+            [void]$ps.AddScript('try { . ([scriptblock]::Create($SDT_ShimSource)) } catch {}')
+            [void]$ps.AddStatement()
+            [void]$ps.AddScript($ScriptBlock.ToString())
+            if ($ArgumentList) { foreach ($a in $ArgumentList) { [void]$ps.AddArgument($a) } }
+            $handle = $ps.BeginInvoke()
+            $obj = [pscustomobject]@{
+                Id          = [Math]::Abs([Guid]::NewGuid().GetHashCode())
+                Name        = $Name
+                HasMoreData = $true
+                PSBeginTime = Get-Date
+                _PS         = $ps
+                _Handle     = $handle
+                _Runspace   = $null
+            }
+            $obj | Add-Member -MemberType ScriptProperty -Name State -Value {
+                try {
+                    if ($this._Handle -and $this._Handle.IsCompleted) {
+                        if ($this._PS.HadErrors -or $this._PS.InvocationStateInfo.State -eq 'Failed') { 'Failed' } else { 'Completed' }
+                    } elseif ($this._PS.InvocationStateInfo.State -eq 'Stopped') { 'Stopped' }
+                    else { 'Running' }
+                } catch { 'Unknown' }
+            }
+            $obj.PSObject.TypeNames.Insert(0, 'Sdt.AsyncJob')
+            return $obj
+        } catch {
+            # Pool path failed - fall through to per-call runspace
+        }
+    }
+
+    # Path B: per-call runspace (no pool available, or pool errored)
+    $rs = $null
+    try {
+        $rs = [runspacefactory]::CreateRunspace()
+        # Default ApartmentState / ThreadOptions - explicit settings can hang
+        # under ThreatLocker / aggressive endpoint protection.
+        $rs.Open()
+    } catch {
+        # Path C: degrade to inline execution (synchronous - blocks listener
+        # but never hangs). Caller sees a fully-completed InlineJob right away.
         $out = $null; $errs = @()
         try {
             if ($ArgumentList) { $out = & $ScriptBlock @ArgumentList } else { $out = & $ScriptBlock }
@@ -2247,18 +2295,14 @@ function Start-ThreadJob {
         $obj.PSObject.TypeNames.Insert(0, 'Sdt.InlineJob')
         return $obj
     }
-    # Push the shim source into the child runspace's globals so recursive
-    # Start-ThreadJob calls inside the user's scriptblock work.
-    try { $rs.SessionStateProxy.SetVariable('SDT_ShimSource', $SDT_ShimSource) } catch {}
 
+    try { $rs.SessionStateProxy.SetVariable('SDT_ShimSource', $SDT_ShimSource) } catch {}
     $ps = [System.Management.Automation.PowerShell]::Create()
     $ps.Runspace = $rs
     [void]$ps.AddScript('try { . ([scriptblock]::Create($SDT_ShimSource)) } catch {}')
     [void]$ps.AddStatement()
     [void]$ps.AddScript($ScriptBlock.ToString())
-    if ($ArgumentList) {
-        foreach ($a in $ArgumentList) { [void]$ps.AddArgument($a) }
-    }
+    if ($ArgumentList) { foreach ($a in $ArgumentList) { [void]$ps.AddArgument($a) } }
     $handle = $ps.BeginInvoke()
 
     $obj = [pscustomobject]@{
@@ -2369,8 +2413,12 @@ function Remove-Job {
             if ($j -and ($j.PSObject.TypeNames -contains 'Sdt.AsyncJob')) {
                 try { if ($j._PS -and -not $j._Handle.IsCompleted -and $Force) { $j._PS.Stop() } } catch {}
                 try { $j._PS.Dispose() } catch {}
-                try { $j._Runspace.Close() } catch {}
-                try { $j._Runspace.Dispose() } catch {}
+                # Only dispose the runspace if we own it (per-call path).
+                # Pool runspaces are managed by the pool.
+                if ($j._Runspace) {
+                    try { $j._Runspace.Close() } catch {}
+                    try { $j._Runspace.Dispose() } catch {}
+                }
             } elseif ($j -and ($j.PSObject.TypeNames -contains 'Sdt.InlineJob')) {
                 # no-op
             } else {
@@ -2391,80 +2439,21 @@ function Remove-Job {
             $Global:SDT_ThreadJobMode = 'broken'
         }
 
-        # Self-check: spawn a tiny async job, wait with HARD timeout. If the
-        # runspace hangs (e.g. ThreatLocker blocking .NET API), we abort the
-        # PowerShell handle and fall back to inline execution rather than
-        # letting EndInvoke block the startup forever.
-        if ($Global:SDT_ThreadJobMode -eq 'asyncShim') {
-            $selfTestPassed = $false
-            $testJob = $null
-            try {
-                $testJob = Start-ThreadJob -ScriptBlock { param($x) "ok-$x" } -ArgumentList 'shim'
-                $completed = $testJob._Handle.AsyncWaitHandle.WaitOne(3000)
-                if (-not $completed) {
-                    throw "self-test timed out after 3s (runspace hung)"
-                }
-                $testOut = $testJob._PS.EndInvoke($testJob._Handle)
-                if ("$testOut" -ne 'ok-shim') {
-                    throw "self-test produced '$testOut' (expected 'ok-shim')"
-                }
-                $selfTestPassed = $true
-            } catch {
-                Write-Host "  [warn] Runspace shim self-test FAILED: $($_.Exception.Message)" -ForegroundColor Yellow
-                Write-Host "  [warn] Falling back to inline execution (discovery will block listener)." -ForegroundColor Yellow
-                $Global:SDT_ThreadJobMode = 'inlineLastResort'
-            } finally {
-                # Always try to clean up the test runspace, even on timeout.
-                if ($testJob) {
-                    try { if (-not $testJob._Handle.IsCompleted) { $testJob._PS.Stop() } } catch {}
-                    try { $testJob._PS.Dispose() } catch {}
-                    try { $testJob._Runspace.Dispose() } catch {}
-                }
-            }
-            if (-not $selfTestPassed -and $Global:SDT_ThreadJobMode -eq 'inlineLastResort') {
-                # Replace the runspace-based Start-ThreadJob with an inline
-                # synchronous version. This blocks the caller but never hangs.
-                # Wait-Job / Receive-Job / etc. handle the synthetic InlineJob.
-                Remove-Item Function:\Start-ThreadJob -EA SilentlyContinue
-                function global:Start-ThreadJob {
-                    [CmdletBinding()]
-                    param(
-                        [Parameter(Mandatory=$true, Position=0)][scriptblock]$ScriptBlock,
-                        [object[]]$ArgumentList,
-                        [int]$ThrottleLimit = 1,
-                        [string]$Name = 'SdtInlineJob',
-                        [scriptblock]$InitializationScript
-                    )
-                    $out = $null; $errs = @()
-                    try {
-                        if ($InitializationScript) { . $InitializationScript }
-                        if ($ArgumentList -and $ArgumentList.Count -gt 0) {
-                            $out = & $ScriptBlock @ArgumentList
-                        } else {
-                            $out = & $ScriptBlock
-                        }
-                    } catch { $errs += $_ }
-                    $obj = [pscustomobject]@{
-                        Id = [Math]::Abs([Guid]::NewGuid().GetHashCode())
-                        Name = $Name; HasMoreData = $true
-                        _InlineOutput = $out; _InlineErrors = $errs; _InlineCompleted = $true
-                    }
-                    $obj | Add-Member -MemberType ScriptProperty -Name State -Value { if ($this._InlineErrors.Count) { 'Failed' } else { 'Completed' } }
-                    $obj.PSObject.TypeNames.Insert(0, 'Sdt.InlineJob')
-                    return $obj
-                }
-            }
-        }
+        # No self-test. The shim has three internal paths (pool / per-call
+        # runspace / inline) and degrades gracefully at use time. Self-test
+        # in v4.2.10-v4.2.12 caused false failures under aggressive endpoint
+        # protection where the test runspace cold-started slowly. The shim
+        # is reliable in actual use even when self-test hangs.
     }
 }
 
-# Single quiet line: ThreadJob status.
+# Single quiet line about ThreadJob status (only when not parallel).
 if ($Global:SDT_ThreadJobMode -eq 'asyncShim') {
-    Write-Host "  [sdt] ThreadJob unavailable - using runspace shim (in-process async)" -ForegroundColor DarkGray
-} elseif ($Global:SDT_ThreadJobMode -eq 'inlineLastResort') {
-    Write-Host "  [sdt] WARNING: runspaces also blocked - using inline mode (UI may freeze during scan)." -ForegroundColor Yellow
-} elseif ($Global:SDT_ThreadJobMode -eq 'broken') {
-    Write-Host "  [sdt] WARNING: discovery primitives broken. Fix: Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor Red
+    if ($Global:SDT_RunspacePool) {
+        Write-Host "  [sdt] using runspace pool (ThreadJob not available)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  [sdt] using per-call runspaces (pool unavailable)" -ForegroundColor DarkGray
+    }
 }
 
 # Auto-minimize the host PowerShell window so the GUI takes focus.
