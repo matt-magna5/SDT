@@ -2581,9 +2581,80 @@ try {
         try {
             switch -Regex ("$method $path") {
                 '^GET /api/status$' {
-                    # Wrapped so a single malformed field (e.g. XML in a Phase
-                    # string) can never 500 the status poll and break the UI.
+                    # Local-only mode: check on the child process + tail its log
+                    # file so the UI sees progress. Self-heals the Session state
+                    # when the child exits (success or failure).
                     try {
+                        if ($script:Session.LocalProcId -and $script:Session.Status -eq 'running') {
+                            $childProc = $null
+                            try { $childProc = Get-Process -Id $script:Session.LocalProcId -EA SilentlyContinue } catch {}
+                            # Append any new log lines (best-effort tail)
+                            if ($script:Session.LocalLogFile -and (Test-Path $script:Session.LocalLogFile)) {
+                                try {
+                                    $logLines = Get-Content $script:Session.LocalLogFile -EA SilentlyContinue
+                                    if ($logLines) {
+                                        $shownCount = if ($script:Session.LocalLogShown) { [int]$script:Session.LocalLogShown } else { 0 }
+                                        if ($logLines.Count -gt $shownCount) {
+                                            $newLines = $logLines[$shownCount..($logLines.Count - 1)]
+                                            foreach ($ln in $newLines) {
+                                                $stripped = "$ln".Trim()
+                                                if ($stripped -and $stripped -notmatch '^[=\-_]{4,}$') {
+                                                    $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] $stripped")
+                                                    if ($stripped -match '^\s*\[(\w+)\]') {
+                                                        try { $script:Session.Targets[0].Phase = $matches[1] } catch {}
+                                                    }
+                                                }
+                                            }
+                                            $script:Session.LocalLogShown = $logLines.Count
+                                            while ($script:Session.LogTail.Count -gt 2000) { try { $script:Session.LogTail.RemoveAt(0) } catch { break } }
+                                        }
+                                    }
+                                } catch {}
+                            }
+                            # Child exited? Finalize the session.
+                            if (-not $childProc) {
+                                $jsonProduced = @(Get-ChildItem $script:Session.SessionDir -Filter '*discovery*.json' -EA 0)
+                                if ($jsonProduced.Count -gt 0) {
+                                    try { $script:Session.Targets[0].JsonPath = $jsonProduced[0].FullName } catch {}
+                                    try { $script:Session.Targets[0].State    = 'done' } catch {}
+                                    try { $script:Session.Targets[0].Phase    = 'complete' } catch {}
+                                    try { $script:Session.Targets[0].Finished = (Get-Date).ToString('HH:mm:ss') } catch {}
+                                    $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Discovery JSON produced: $($jsonProduced[0].Name)")
+                                    # Kick off gen_report.py
+                                    try {
+                                        $gen = Join-Path $script:ScriptDir 'gen_report.py'
+                                        $py  = Join-Path $script:ScriptDir 'python\python.exe'
+                                        if (-not (Test-Path $py)) { $py = 'python' }
+                                        if (Test-Path $gen) {
+                                            $manifest = Join-Path $script:Session.SessionDir 'manifest.json'
+                                            $servers = @(@{ file = $jsonProduced[0].Name; name = $script:Session.Client; id = $script:Session.Client })
+                                            $manifestObj = @{ client = $script:Session.Client; sessionDir = $script:Session.SessionDir; servers = $servers }
+                                            $manifestObj | ConvertTo-Json -Depth 10 | Set-Content $manifest -Encoding UTF8
+                                            $reportLog = Join-Path $script:Session.SessionDir 'gen_report.log'
+                                            $genArgs = @($gen, '--manifest', $manifest, '--out-dir', $script:Session.SessionDir)
+                                            $reportProc = Start-Process -FilePath $py -ArgumentList $genArgs -NoNewWindow -PassThru -RedirectStandardOutput $reportLog -RedirectStandardError "$reportLog.err"
+                                            $reportProc.WaitForExit(180000) | Out-Null
+                                            $htmlOut = @(Get-ChildItem $script:Session.SessionDir -Filter '*.html' -EA 0 | Select-Object -First 1)
+                                            if ($htmlOut.Count -gt 0) {
+                                                $script:Session.ReportPath = $htmlOut[0].FullName
+                                                $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Report generated: $($htmlOut[0].Name)")
+                                            } else {
+                                                $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py finished but no HTML produced - see gen_report.log")
+                                            }
+                                        }
+                                    } catch {
+                                        $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] gen_report.py failed: $($_.Exception.Message)")
+                                    }
+                                    $script:Session.Status = 'complete'
+                                } else {
+                                    try { $script:Session.Targets[0].State = 'error' } catch {}
+                                    try { $script:Session.Targets[0].Phase = 'no JSON produced (see discovery.err)' } catch {}
+                                    $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Child PID $($script:Session.LocalProcId) exited without producing a discovery JSON")
+                                    $script:Session.Status = 'error'
+                                }
+                                $script:Session.LocalProcId = $null
+                            }
+                        }
                         $safeTargets = @()
                         foreach ($t in $script:Session.Targets) {
                             $copy = [ordered]@{}
@@ -2755,31 +2826,74 @@ try {
                     break
                 }
                 '^POST /api/local-only$' {
-                    # No-HV, no-creds, single-target = THIS machine.
-                    # Used when the SE is RDP-ed into a server and just needs that
-                    # one box scanned + a report. Bypasses the form entirely.
+                    # SIMPLE PATH - bypass ThreadJob/shim/orchestrator entirely.
+                    # Spawn a child powershell.exe that runs Invoke-ServerDiscovery
+                    # against the local machine. Poll the process + log file for
+                    # status. Process-isolated, doesn't need any of the
+                    # threading machinery.
                     if ($script:Session.Status -eq 'running') {
                         Send-Json -Response $resp -Data @{ ok = $false; error = 'A discovery session is already running.' } -StatusCode 409
                         break
                     }
-                    $localTarget = $env:COMPUTERNAME
-                    $payload = [pscustomobject]@{
-                        client    = $localTarget
-                        outputDir = 'C:\Temp\sdt\sessions'
-                        parallel  = 1
-                        targets   = @($localTarget)
-                        winrmUser = ''
-                        winrmPass = ''
-                        hvType    = 'none'
-                        hvHost    = ''
-                        hvUser    = ''
-                        hvPass    = ''
-                        localOnly = $true
-                    }
                     try {
-                        $null = Start-DiscoveryRun -Payload $payload
-                        Send-Json -Response $resp -Data @{ ok = $true; sessionDir = $script:Session.SessionDir; target = $localTarget }
+                        $localTarget = $env:COMPUTERNAME
+                        $stamp       = (Get-Date).ToString('yyyy-MM-dd-HHmmss')
+                        $sessionDir  = Join-Path 'C:\Temp\sdt\sessions' "$localTarget-$stamp-local"
+                        New-Item -ItemType Directory -Path $sessionDir -Force | Out-Null
+
+                        $invokePs1 = Join-Path $script:ScriptDir 'Invoke-ServerDiscovery.ps1'
+                        if (-not (Test-Path $invokePs1)) { throw "Invoke-ServerDiscovery.ps1 not found at $invokePs1" }
+
+                        $logFile = Join-Path $sessionDir 'discovery.log'
+                        $errFile = Join-Path $sessionDir 'discovery.err'
+
+                        # Initialize Session state for UI polling
+                        $script:Session.Status         = 'running'
+                        $script:Session.Client         = $localTarget
+                        $script:Session.SessionDir     = $sessionDir
+                        $script:Session.ReportPath     = $null
+                        $script:Session.ReportZipPath  = $null
+                        $script:Session.MissingTargets = @()
+                        $script:Session.Targets        = @(
+                            [ordered]@{
+                                Address = $localTarget
+                                Kind    = 'server'
+                                State   = 'running'
+                                Phase   = 'launching local scan...'
+                                Started = (Get-Date).ToString('HH:mm:ss')
+                                LogPath = $logFile
+                            }
+                        )
+                        $script:Session.LogTail = New-Object System.Collections.ArrayList
+                        $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Local-only scan starting for $localTarget")
+                        $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Session dir: $sessionDir")
+
+                        # Use the SDT-bundled portable PowerShell if absent, default to Windows PowerShell.
+                        # Pass SDT_NO_AUTOUPDATE=1 so the child doesn't try to self-update mid-scan.
+                        $psExe = (Get-Command powershell.exe -EA SilentlyContinue).Source
+                        if (-not $psExe) { $psExe = 'powershell.exe' }
+                        $args = @(
+                            '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                            '-File', $invokePs1,
+                            '-ComputerName', $localTarget,
+                            '-OutputPath', $sessionDir,
+                            '-NonInteractive'
+                        )
+
+                        # Hand back the listener IMMEDIATELY. The scan runs out-of-process.
+                        $env:SDT_NO_AUTOUPDATE = '1'
+                        $proc = Start-Process -FilePath $psExe -ArgumentList $args -NoNewWindow -PassThru `
+                                -RedirectStandardOutput $logFile -RedirectStandardError $errFile
+
+                        $script:Session.LocalProcId  = $proc.Id
+                        $script:Session.LocalLogFile = $logFile
+                        $script:Session.LocalErrFile = $errFile
+                        $script:Session.LocalStarted = Get-Date
+                        $null = $script:Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Spawned PID $($proc.Id) - $($args -join ' ')")
+
+                        Send-Json -Response $resp -Data @{ ok = $true; sessionDir = $sessionDir; target = $localTarget; pid = $proc.Id }
                     } catch {
+                        $script:Session.Status = 'error'
                         Send-Json -Response $resp -Data @{ ok = $false; error = $_.Exception.Message } -StatusCode 500
                     }
                     break
