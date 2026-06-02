@@ -297,6 +297,18 @@ def derive_role_label(srv):
     has_print = 'Print-Services' in role_names
     has_iis   = 'Web-Server' in role_names
     has_hv    = 'Hyper-V' in role_names
+    # RDS detection - any subrole or the parent counts. Don't classify as
+    # file/print just because an RDS host happens to have shares (RDS user
+    # profile disks, redirected folders, etc. legitimately create shares).
+    has_rds_session = 'RDS-RD-Server'         in role_names
+    has_rds_gateway = 'RDS-Gateway'           in role_names
+    has_rds_broker  = 'RDS-Connection-Broker' in role_names
+    has_rds_web     = 'RDS-Web-Access'        in role_names
+    has_rds_lic     = 'RDS-Licensing'         in role_names
+    has_rds_virt    = 'RDS-Virtualization'    in role_names
+    has_rds_parent  = 'Remote-Desktop-Services' in role_names
+    has_rds_any     = (has_rds_session or has_rds_gateway or has_rds_broker
+                       or has_rds_web or has_rds_lic or has_rds_virt or has_rds_parent)
     sl = as_list(sw.get('Shares', [])) if isinstance(sw, dict) else []
     real = [s for s in sl if isinstance(s, dict)
             and not s.get('Name','').startswith('$')
@@ -317,6 +329,27 @@ def derive_role_label(srv):
         if has_dhcp:             mods.append('DHCP')
         if has_nps:              mods.append('NPS')
         return 'Domain Controller' + (f' ({", ".join(mods)})' if mods else '')
+
+    # RDS comes BEFORE file/print so a dedicated RDS host doesn't get
+    # mis-bucketed as "File & Print" just because of user-profile-disk shares.
+    if has_rds_any:
+        rds_mods = []
+        if has_rds_session: rds_mods.append('Session Host')
+        if has_rds_gateway: rds_mods.append('Gateway')
+        if has_rds_broker:  rds_mods.append('Broker')
+        if has_rds_web:     rds_mods.append('Web Access')
+        if has_rds_lic:     rds_mods.append('Licensing')
+        if has_rds_virt:    rds_mods.append('Virtualization Host')
+        rds_label = 'RDS Server'
+        if rds_mods:
+            rds_label += f' ({", ".join(rds_mods)})'
+        # Append SQL/Hyper-V tags if also present, but never File/Print -
+        # those shares are RDS user-profile artifacts, not a file server.
+        extras = []
+        if has_sql: extras.append('SQL Server')
+        if has_hv:  extras.append('Hyper-V Host')
+        return rds_label + (' · ' + ' · '.join(extras) if extras else '')
+
     parts = []
     if real and has_print: parts.append('File & Print Server')
     elif real:             parts.append('File Server')
@@ -2498,18 +2531,20 @@ def _bucket(label, is_linux):
     l = (label or '').lower()
     if 'exchange' in l:           return 'Exchange'
     if 'domain controller' in l:  return 'Domain Controllers'
+    # RDS BEFORE SQL/File/Print so a dual-role RDS+SQL or RDS+File host
+    # goes into RDS, where it actually lives day-to-day.
+    if 'rds' in l or 'remote desktop' in l: return 'RDS / Terminal'
     if 'hyper-v' in l or 'vmware' in l or 'hypervisor' in l: return 'Hypervisor Hosts'
     if 'sql' in l:                return 'SQL Servers'
     if 'file' in l or 'print' in l: return 'File / Print'
     if 'web' in l or 'iis' in l:  return 'Web / IIS'
-    if 'remote desktop' in l or 'rds' in l: return 'RDS / Terminal'
     if 'cert' in l:               return 'Certificate / PKI'
     if 'dns' in l or 'dhcp' in l: return 'DNS / DHCP'
     return 'Application / Other'
 
 # Display order of buckets
-BUCKET_ORDER = ['Domain Controllers','Exchange','SQL Servers','Hypervisor Hosts',
-                'Web / IIS','File / Print','RDS / Terminal','Certificate / PKI',
+BUCKET_ORDER = ['Domain Controllers','Exchange','SQL Servers','RDS / Terminal',
+                'Hypervisor Hosts','Web / IIS','File / Print','Certificate / PKI',
                 'DNS / DHCP','Application / Other','Linux / Appliance']
 
 # Index tabs by bucket
