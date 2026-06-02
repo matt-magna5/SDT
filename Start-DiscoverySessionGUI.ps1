@@ -948,6 +948,10 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 <div class="card">
 <div class="card-title">Log</div>
 <div class="logbox" id="logbox">Waiting for discovery to start...</div>
+<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:8px;">
+  <span id="copyRunLogsStatus" style="font-size:11px;color:var(--muted);"></span>
+  <button type="button" class="btn btn-secondary" onclick="copyRunLogs(this)" style="padding:6px 14px;font-size:12px;">Copy logs</button>
+</div>
 </div>
 
 <div style="margin-top:18px;text-align:center;">
@@ -1393,6 +1397,44 @@ async function retryReportGen(btn){
   } catch(e) {
     btn.textContent = 'Failed: ' + e.message.substring(0, 60);
     setTimeout(()=>{ btn.textContent = orig; btn.disabled = false; }, 4000);
+  }
+}
+
+async function copyRunLogs(btn){
+  // Copies whatever is currently in the Run tab's logbox + a summary of the
+  // current /api/status. Works mid-scan; useful when discovery is stuck.
+  const orig = btn.textContent;
+  const status = document.getElementById('copyRunLogsStatus');
+  btn.textContent = 'Copying...';
+  btn.disabled = true;
+  try {
+    let body = '';
+    try {
+      const r = await fetch('/api/status');
+      const s = await r.json();
+      body += '=== STATUS ===\n';
+      body += 'Status: ' + (s.Status||'?') + '\n';
+      body += 'Client: ' + (s.Client||'?') + '\n';
+      body += 'SessionDir: ' + (s.SessionDir||'?') + '\n';
+      body += 'Targets: ' + JSON.stringify(s.Targets||[], null, 2) + '\n\n';
+    } catch(e) {}
+    body += '=== LOG ===\n' + (document.getElementById('logbox')?.innerText || '');
+    try {
+      await navigator.clipboard.writeText(body);
+      btn.textContent = 'Copied';
+      status.textContent = 'Logs + status copied to clipboard.';
+    } catch(e) {
+      const ta = document.createElement('textarea');
+      ta.value = body; document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta);
+      btn.textContent = 'Copied';
+      status.textContent = 'Logs + status copied to clipboard.';
+    }
+    setTimeout(()=>{ btn.textContent = orig; btn.disabled = false; status.textContent=''; }, 2500);
+  } catch(e) {
+    btn.textContent = 'Failed';
+    status.textContent = 'Copy failed: ' + e.message;
+    setTimeout(()=>{ btn.textContent = orig; btn.disabled = false; status.textContent=''; }, 2500);
   }
 }
 
@@ -2218,15 +2260,9 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
         # (no explicit STA / ReuseThread - those can deadlock).
         $Global:SDT_ThreadJobMode = 'asyncShim'
         $Global:SDT_RunspacePool  = $null
-        try {
-            $Global:SDT_RunspacePool = [runspacefactory]::CreateRunspacePool(1, 8)
-            $Global:SDT_RunspacePool.Open()
-        } catch {
-            $Global:SDT_RunspacePool = $null
-            if ($verboseTJ) {
-                Write-Host "  [warn] Runspace pool open failed: $($_.Exception.Message.Split([Environment]::NewLine)[0])" -ForegroundColor DarkGray
-            }
-        }
+        # Pool needs to be created AFTER $Global:SDT_ShimSource is set (below).
+        # We defer pool creation to a marker - see "PoolInit" block below.
+        $Global:SDT_PoolDeferredInit = $true
 
         # Source text of the shim functions. Stored globally so child runspaces
         # can re-inject it when they recursively call Start-ThreadJob.
@@ -2434,16 +2470,30 @@ function Remove-Job {
             . ([scriptblock]::Create($Global:SDT_ShimSource))
         } catch {
             Write-Host "  [error] Could not load runspace shim: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "  [error] Discovery will not work. Reinstall ThreadJob manually:" -ForegroundColor Red
-            Write-Host "          Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor Yellow
             $Global:SDT_ThreadJobMode = 'broken'
         }
 
-        # No self-test. The shim has three internal paths (pool / per-call
-        # runspace / inline) and degrades gracefully at use time. Self-test
-        # in v4.2.10-v4.2.12 caused false failures under aggressive endpoint
-        # protection where the test runspace cold-started slowly. The shim
-        # is reliable in actual use even when self-test hangs.
+        # PoolInit: create pool AFTER $SDT_ShimSource exists, and seed every
+        # pool runspace with that variable via InitialSessionState. This is
+        # critical: pool runspaces don't have SessionStateProxy.SetVariable
+        # accessible (the pool manages runspaces internally), so the shim
+        # source must be baked into the initial session state. Otherwise
+        # the inner Start-ThreadJob call (line 1868 in serverWorker fan-out)
+        # can't find the shim function -> discovery stalls in 'running'.
+        if ($Global:SDT_ThreadJobMode -eq 'asyncShim' -and $Global:SDT_PoolDeferredInit) {
+            try {
+                $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+                $shimVar = New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry 'SDT_ShimSource', $Global:SDT_ShimSource, 'Async runspace shim source'
+                $iss.Variables.Add($shimVar)
+                $Global:SDT_RunspacePool = [runspacefactory]::CreateRunspacePool(1, 8, $iss, $Host)
+                $Global:SDT_RunspacePool.Open()
+            } catch {
+                $Global:SDT_RunspacePool = $null
+                if ($verboseTJ) {
+                    Write-Host "  [warn] Runspace pool open failed: $($_.Exception.Message.Split([Environment]::NewLine)[0])" -ForegroundColor DarkGray
+                }
+            }
+        }
     }
 }
 
