@@ -461,6 +461,7 @@ switch -Regex (`$Mode) {
         Write-Host "  version / -v         Show installed version + path"
         Write-Host "  folder / where       Show the install folder paths"
         Write-Host "  open                 Open the install folder in Explorer"
+        Write-Host "  stop / kill          Stop any running SDT GUI process"
         Write-Host "  update / upgrade     Force-pull the latest release from GitHub"
         Write-Host "  repair / reinstall   Re-download the install (use if 'sdt' won't launch)"
         Write-Host "  uninstall / remove   Remove SDT entirely (cleans up PATH)"
@@ -507,6 +508,20 @@ switch -Regex (`$Mode) {
         } else {
             Write-Host "App dir not found: `$AppDir" -ForegroundColor Red
         }
+        return
+    }
+    '^(stop|kill|quit)$' {
+        # Find PowerShell processes running the GUI script and stop them.
+        `$guiPath = Join-Path `$AppDir 'Start-DiscoverySessionGUI.ps1'
+        `$killed = 0
+        Get-CimInstance Win32_Process -EA SilentlyContinue |
+            Where-Object { `$_.Name -match 'powershell\.exe' -and `$_.CommandLine -and `$_.CommandLine.Contains(`$guiPath) } |
+            ForEach-Object {
+                Write-Host ("  [sdt] stopping GUI PID {0}" -f `$_.ProcessId) -ForegroundColor Yellow
+                try { Stop-Process -Id `$_.ProcessId -Force -EA Stop; `$killed++ } catch { Write-Host "  [sdt] failed: `$_" -ForegroundColor Red }
+            }
+        if (`$killed -eq 0) { Write-Host "  [sdt] no SDT GUI process found." -ForegroundColor DarkGray }
+        else { Write-Host ("  [sdt] stopped {0} process(es)." -f `$killed) -ForegroundColor Green }
         return
     }
     '^gui$' {
@@ -580,8 +595,23 @@ switch -Regex (`$Mode) {
         return
     }
     default {
-        if (`$RestArr.Count -gt 0) { & (Join-Path `$AppDir 'Start-DiscoverySessionGUI.ps1') @RestArr }
-        else { & (Join-Path `$AppDir 'Start-DiscoverySessionGUI.ps1') }
+        # Detached GUI launch - spawn the listener in a NEW PowerShell process
+        # so the user's current prompt is freed immediately. Without this the
+        # listener's blocking GetContext() call wedges the calling shell and
+        # Ctrl+C doesn't escape (only X works). The GUI script self-minimizes
+        # its own console after startup, so the user just sees the browser.
+        `$guiScript = Join-Path `$AppDir 'Start-DiscoverySessionGUI.ps1'
+        `$psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `$guiScript)
+        if (`$RestArr.Count -gt 0) { `$psArgs += `$RestArr }
+        try {
+            `$child = Start-Process powershell.exe -ArgumentList `$psArgs -PassThru
+            Write-Host ("  [sdt] GUI launched in background (PID {0}). Browser will open shortly." -f `$child.Id) -ForegroundColor DarkGray
+            Write-Host "  [sdt] Your prompt is yours. To stop the GUI: close the browser tab + run 'sdt stop' or kill the PID above." -ForegroundColor DarkGray
+        } catch {
+            Write-Host "  [sdt] Detached launch failed (`$(`$_.Exception.Message)) - falling back to in-process." -ForegroundColor Yellow
+            if (`$RestArr.Count -gt 0) { & `$guiScript @RestArr }
+            else { & `$guiScript }
+        }
         return
     }
 }
@@ -625,6 +655,7 @@ Say "  sdt uninstall   remove everything" DarkGray
 Say "  sdt version     show install info" DarkGray
 Say "  sdt folder      show install paths" DarkGray
 Say "  sdt open        open install folder in Explorer" DarkGray
+Say "  sdt stop        stop a running SDT GUI process" DarkGray
 Say "  sdt help        show all commands" DarkGray
 Say ""
 Say "Auto-update runs on every 'sdt' launch - you'll never paste a" DarkGray
