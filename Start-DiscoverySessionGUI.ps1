@@ -839,7 +839,7 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 </div>
 <div class="grid2" style="margin-top:10px;">
 <div class="field"><label>Parallel scans <span class="hint" data-tip="How many servers to scan at once. 4 is a good default. Go higher (6-8) on powerful boxes, lower if you see WinRM errors from load. Each scan takes ~3-5 minutes on busy servers.">i</span></label>
-<select name="parallel"><option value="1">1 (sequential - old behavior)</option><option value="2">2</option><option value="4" selected>4 (recommended)</option><option value="6">6</option><option value="8">8</option></select></div>
+<select name="parallel"><option value="1" selected>1 (sequential - default)</option><option value="2">2</option><option value="4">4</option><option value="6">6</option><option value="8">8</option></select></div>
 <div class="field"></div>
 </div>
 </div>
@@ -2177,16 +2177,20 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
 
     $tjPinned = '2.0.3'
 
+    # Quiet by default - one summary line at the end. Set $env:SDT_VERBOSE_THREADJOB=1
+    # for the legacy 3-line warning if needed for debugging.
+    $verboseTJ = ($env:SDT_VERBOSE_THREADJOB -eq '1')
     $threadJobOk = $false
     try {
         Import-Module ThreadJob -EA Stop
         $threadJobOk = $true
     } catch {
-        $firstLine = ($_.Exception.Message -split "`r?`n")[0]
-        Write-Host "  [warn] ThreadJob import failed ($firstLine)." -ForegroundColor Yellow
-        Write-Host "  [warn] Attempting install of ThreadJob v$tjPinned (PS 5.1-compatible)..." -ForegroundColor Yellow
+        if ($verboseTJ) {
+            $firstLine = ($_.Exception.Message -split "`r?`n")[0]
+            Write-Host "  [warn] ThreadJob import failed ($firstLine)." -ForegroundColor Yellow
+            Write-Host "  [warn] Attempting install of ThreadJob v$tjPinned (PS 5.1-compatible)..." -ForegroundColor Yellow
+        }
         try {
-            # Remove any broken existing copy (e.g. 2.1.0 that needs netstandard).
             Get-Module -ListAvailable ThreadJob | ForEach-Object {
                 try { Uninstall-Module ThreadJob -RequiredVersion $_.Version -Force -EA SilentlyContinue } catch {}
             }
@@ -2196,13 +2200,14 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
                 }
                 Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -EA SilentlyContinue
             } catch {}
-            Install-Module ThreadJob -RequiredVersion $tjPinned -Scope CurrentUser -Force -AllowClobber -EA Stop
+            Install-Module ThreadJob -RequiredVersion $tjPinned -Scope CurrentUser -Force -AllowClobber -EA Stop 2>$null
             Import-Module ThreadJob -RequiredVersion $tjPinned -EA Stop
             $threadJobOk = $true
         } catch {
-            Write-Host "  [warn] Could not install/import ThreadJob v$tjPinned ($($_.Exception.Message.Split([Environment]::NewLine)[0]))." -ForegroundColor Yellow
-            Write-Host "  [warn] Falling back to SERIAL discovery (one server at a time)." -ForegroundColor Yellow
-            Write-Host "  [warn] Scan will work but slower. To restore parallel: Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor DarkYellow
+            if ($verboseTJ) {
+                Write-Host "  [warn] Could not install/import ThreadJob v$tjPinned ($($_.Exception.Message.Split([Environment]::NewLine)[0]))." -ForegroundColor Yellow
+                Write-Host "  [warn] To restore parallel: Install-Module ThreadJob -RequiredVersion 2.0.3 -Scope CurrentUser -Force" -ForegroundColor DarkYellow
+            }
         }
     }
 
@@ -2330,11 +2335,9 @@ if (-not (Get-Command Start-ThreadJob -EA 0)) {
     }
 }
 
-# Surface the chosen mode loudly so the SE sees it in the launch log.
+# Single quiet line: ThreadJob status.
 if ($Global:SDT_ThreadJobMode -eq 'serial') {
-    Write-Host "  [sdt] discovery mode: SERIAL (one server at a time, ThreadJob unavailable)" -ForegroundColor Yellow
-} elseif ($Global:SDT_ThreadJobMode -eq 'parallel') {
-    Write-Host "  [sdt] discovery mode: parallel (ThreadJob available)" -ForegroundColor DarkGray
+    Write-Host "  [sdt] ThreadJob unavailable - using sequential discovery" -ForegroundColor DarkGray
 }
 
 # Auto-minimize the host PowerShell window so the GUI takes focus.
