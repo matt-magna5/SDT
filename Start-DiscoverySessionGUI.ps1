@@ -815,15 +815,10 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical;}
 <div id="tab-setup" class="tab-pane active">
 
 <!-- Quick action: scan THIS machine only (no HV, no creds, no remote) -->
-<div class="card" id="localOnlyCard" style="border-left:4px solid var(--accent);background:rgba(80,160,255,0.06);">
-<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;">
-<div style="flex:1;min-width:260px;">
-<div style="font-weight:600;font-size:14px;">No HV / remote access? Scan THIS machine only.</div>
-<div style="color:var(--muted);font-size:12px;margin-top:4px;">Runs Invoke-ServerDiscovery against the local machine. No credentials, no WinRM, no hypervisor required. Use when you are RDP'd into a single server and just need its inventory + a report.</div>
-</div>
-<button type="button" class="btn" id="localOnlyBtn" onclick="runLocalOnly()" style="white-space:nowrap;">Scan THIS machine</button>
-</div>
-<div id="localOnlyStatus" style="margin-top:8px;font-size:12px;color:var(--muted);"></div>
+<div id="localOnlyBar" style="display:flex;align-items:center;gap:10px;padding:8px 12px;margin-bottom:10px;font-size:12px;color:var(--muted);background:rgba(80,160,255,0.05);border:1px solid var(--border);border-radius:8px;">
+<span style="flex:1;">No HV / remote access? Quick-scan this machine only:</span>
+<button type="button" class="btn btn-secondary" id="localOnlyBtn" onclick="runLocalOnly()" style="padding:4px 10px;font-size:12px;white-space:nowrap;">Scan this box</button>
+<span id="localOnlyStatus" style="font-size:11px;"></span>
 </div>
 
 <form id="setupForm" novalidate onsubmit="submitSetup(event)">
@@ -1180,7 +1175,7 @@ function toggleAllVms(on){
 async function runLocalOnly(){
   const btn = document.getElementById('localOnlyBtn');
   const status = document.getElementById('localOnlyStatus');
-  if (!confirm('Run discovery against THIS machine only? No HV, no remote targets. Use this when you are RDP-ed into a single server and just need its inventory.')) return;
+  if (!confirm('Run discovery against THIS machine only? No HV, no remote targets.')) return;
   btn.disabled = true; btn.textContent = 'Starting...';
   status.textContent = '';
   status.style.color = 'var(--muted)';
@@ -1190,16 +1185,18 @@ async function runLocalOnly(){
     if (!d.ok) {
       status.textContent = 'Failed: ' + (d.error || 'unknown error');
       status.style.color = 'var(--danger, #f55)';
-      btn.disabled = false; btn.textContent = 'Scan THIS machine';
+      btn.disabled = false; btn.textContent = 'Scan this box';
       return;
     }
-    status.textContent = 'Started. Switching to Run tab... target = ' + (d.target || 'localhost');
-    status.style.color = 'var(--ok, #6c6)';
+    status.textContent = '';
     setTab('run');
+    // CRITICAL: kick off the status poller so the Run tab updates as the
+    // discovery progresses. Without this the UI stalls on "Waiting...".
+    startPolling();
   } catch (e) {
     status.textContent = 'Request failed: ' + e.message;
     status.style.color = 'var(--danger, #f55)';
-    btn.disabled = false; btn.textContent = 'Scan THIS machine';
+    btn.disabled = false; btn.textContent = 'Scan this box';
   }
 }
 
