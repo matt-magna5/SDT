@@ -1285,10 +1285,13 @@ function renderStatus(s){
     list.innerHTML = s.Targets.map(t => {
       const stateCls = t.State==='done'?'ok':t.State==='error'?'err':t.State==='running'?'running':'idle';
       const stateLabel = t.State.charAt(0).toUpperCase()+t.State.slice(1);
+      const copyLogBtn = (t.State==='error' && t.HvLog)
+        ? `<button class="btn btn-secondary" style="font-size:11px;padding:2px 8px;margin-left:8px;" onclick="copyHvLog(this)" data-log="${escapeHtml(t.HvLog||'')}">Copy log</button>`
+        : '';
       return `<div class="target-row">
         <span class="buddy">${escapeHtml(t.Buddy || '')}</span>
         <div><div class="target-name">${escapeHtml(t.Name)}</div>
-        <div class="target-phase">${escapeHtml(t.Phase || '')}</div></div>
+        <div class="target-phase">${escapeHtml(t.Phase || '')}${copyLogBtn}</div></div>
         <span class="pill ${stateCls}"><span class="dot"></span>${stateLabel}</span>
       </div>`;
     }).join('');
@@ -1435,6 +1438,19 @@ async function copyRunLogs(btn){
     btn.textContent = 'Failed';
     status.textContent = 'Copy failed: ' + e.message;
     setTimeout(()=>{ btn.textContent = orig; btn.disabled = false; status.textContent=''; }, 2500);
+  }
+}
+
+function copyHvLog(btn){
+  const log = btn.dataset.log || '';
+  const orig = btn.textContent;
+  const finish = (ok) => { btn.textContent = ok ? 'Copied!' : 'Failed'; setTimeout(()=>btn.textContent=orig, 1500); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(log).then(()=>finish(true)).catch(()=>{
+      try { const el=document.createElement('textarea'); el.value=log; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); finish(true); } catch(e){ finish(false); }
+    });
+  } else {
+    try { const el=document.createElement('textarea'); el.value=log; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); finish(true); } catch(e){ finish(false); }
   }
 }
 
@@ -2124,6 +2140,7 @@ function Start-DiscoveryRun {
                     } elseif (-not $hvResult.ok) {
                         $t.State='error'
                         $t.Phase = $hvResult.error
+                        $t.HvLog = $hvResult.log
                         $Session.Targets[$i] = $t
                     }
                     # Look for any *-inventory-*.json written into the session dir

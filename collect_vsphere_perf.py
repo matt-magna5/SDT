@@ -438,21 +438,36 @@ def get_licenses(sess, host, pc_ref, lic_ref):
 # ── Step 7: Performance counter IDs ──────────────────────────────────────────
 
 def get_counter_ids(sess, host, perf_ref):
-    """Return dict: 'group.name.rollup' -> counter_id"""
-    body = f'''<vim25:QueryPerfCounterByLevel>
+    """Return dict: 'group.name.rollup' -> counter_id.
+    Tries QueryPerfCounterByLevel first (vCenter / ESXi 6.7+).
+    Falls back to QueryPerfCounter for standalone ESXi 6.5 which raises
+    ServerFaultCode: The operation is not supported on the object.
+    """
+    def _parse_counters(root):
+        counters = {}
+        for pc in list(root.iter(f'{{{NS}}}returnval')) + list(root.iter('returnval')):
+            grp  = pc.findtext(f'{{{NS}}}groupInfo/{{{NS}}}key') or pc.findtext('groupInfo/key') or ''
+            nm   = pc.findtext(f'{{{NS}}}nameInfo/{{{NS}}}key')  or pc.findtext('nameInfo/key')  or ''
+            roll = pc.findtext(f'{{{NS}}}rollupType') or pc.findtext('rollupType') or ''
+            cid  = pc.findtext(f'{{{NS}}}key')        or pc.findtext('key')        or ''
+            if grp and nm and cid:
+                counters[f'{grp}.{nm}.{roll}'] = int(cid)
+        return counters
+
+    try:
+        body = f'''<vim25:QueryPerfCounterByLevel>
       <vim25:_this type="PerformanceManager">{perf_ref}</vim25:_this>
       <vim25:level>4</vim25:level>
     </vim25:QueryPerfCounterByLevel>'''
-    root = soap_req(sess, host, body)
-    counters = {}
-    for pc in list(root.iter(f'{{{NS}}}returnval')) + list(root.iter('returnval')):
-        grp  = pc.findtext(f'{{{NS}}}groupInfo/{{{NS}}}key') or pc.findtext('groupInfo/key') or ''
-        nm   = pc.findtext(f'{{{NS}}}nameInfo/{{{NS}}}key')  or pc.findtext('nameInfo/key')  or ''
-        roll = pc.findtext(f'{{{NS}}}rollupType') or pc.findtext('rollupType') or ''
-        cid  = pc.findtext(f'{{{NS}}}key')        or pc.findtext('key')        or ''
-        if grp and nm and cid:
-            counters[f'{grp}.{nm}.{roll}'] = int(cid)
-    return counters
+        return _parse_counters(soap_req(sess, host, body))
+    except RuntimeError as e:
+        if 'not supported on the object' not in str(e) and 'ServerFaultCode' not in str(e):
+            raise
+        print('      [fallback] QueryPerfCounterByLevel unsupported (ESXi 6.5 standalone) - using QueryPerfCounter')
+        body = f'''<vim25:QueryPerfCounter>
+      <vim25:_this type="PerformanceManager">{perf_ref}</vim25:_this>
+    </vim25:QueryPerfCounter>'''
+        return _parse_counters(soap_req(sess, host, body))
 
 # ── Step 8: Query performance (VM or Host) ───────────────────────────────────
 
