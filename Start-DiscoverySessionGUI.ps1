@@ -1886,9 +1886,15 @@ function Start-DiscoveryRun {
         }
     }
 
+    # Capture Invoke-VsphereCollect so it's available inside the ThreadJob runspace
+    $script:IVSCBody = ${function:Invoke-VsphereCollect}
+
     # Kick off the worker scriptblock in a runspace so the HTTP listener stays responsive.
     $job = Start-ThreadJob -ScriptBlock {
         param($Session, $Payload, $ScriptDir, $BuddyFrames)
+
+        # Re-define Invoke-VsphereCollect in this runspace
+        $function:Invoke-VsphereCollect = $using:script:IVSCBody
 
         $invoke = Join-Path $ScriptDir 'Invoke-ServerDiscovery.ps1'
         if (-not (Test-Path $invoke)) {
