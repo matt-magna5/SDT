@@ -437,13 +437,15 @@ def get_licenses(sess, host, pc_ref, lic_ref):
 
 # ── Step 7: Performance counter IDs ──────────────────────────────────────────
 
-def get_counter_ids(sess, host, perf_ref):
+def get_counter_ids(sess, host, perf_ref, pc_ref=None):
     """Return dict: 'group.name.rollup' -> counter_id.
-    Tries QueryPerfCounterByLevel first (vCenter / ESXi 6.7+).
-    Falls back to QueryPerfCounter for standalone ESXi 6.5 which raises
-    ServerFaultCode: The operation is not supported on the object.
+
+    Fallback chain:
+    1. QueryPerfCounterByLevel level=4  (vCenter / ESXi 6.7+)
+    2. RetrievePropertiesEx on PropertyCollector (ESXi 6.5 standalone)
+    3. Empty dict + warning (perf collection skipped gracefully)
     """
-    def _parse_counters(root):
+    def _parse_by_level(root):
         counters = {}
         for pc in list(root.iter(f'{{{NS}}}returnval')) + list(root.iter('returnval')):
             grp  = pc.findtext(f'{{{NS}}}groupInfo/{{{NS}}}key') or pc.findtext('groupInfo/key') or ''
@@ -454,20 +456,51 @@ def get_counter_ids(sess, host, perf_ref):
                 counters[f'{grp}.{nm}.{roll}'] = int(cid)
         return counters
 
+    def _parse_retrieve_props(root):
+        # RetrievePropertiesEx returns perfCounter as a list of PerfCounterInfo
+        # under returnval/propSet/val/PerfCounterInfo
+        counters = {}
+        for pci in list(root.iter(f'{{{NS}}}PerfCounterInfo')) + list(root.iter('PerfCounterInfo')):
+            grp  = pci.findtext(f'{{{NS}}}groupInfo/{{{NS}}}key') or pci.findtext('groupInfo/key') or ''
+            nm   = pci.findtext(f'{{{NS}}}nameInfo/{{{NS}}}key')  or pci.findtext('nameInfo/key')  or ''
+            roll = pci.findtext(f'{{{NS}}}rollupType') or pci.findtext('rollupType') or ''
+            cid  = pci.findtext(f'{{{NS}}}key')        or pci.findtext('key')        or ''
+            if grp and nm and cid:
+                counters[f'{grp}.{nm}.{roll}'] = int(cid)
+        return counters
+
+    # Attempt 1: QueryPerfCounterByLevel (vCenter / ESXi 6.7+)
     try:
         body = f'''<vim25:QueryPerfCounterByLevel>
       <vim25:_this type="PerformanceManager">{perf_ref}</vim25:_this>
       <vim25:level>4</vim25:level>
     </vim25:QueryPerfCounterByLevel>'''
-        return _parse_counters(soap_req(sess, host, body))
+        return _parse_by_level(soap_req(sess, host, body))
     except RuntimeError as e:
         if 'not supported on the object' not in str(e) and 'ServerFaultCode' not in str(e):
             raise
-        print('      [fallback] QueryPerfCounterByLevel unsupported (ESXi 6.5 standalone) - using QueryPerfCounter')
-        body = f'''<vim25:QueryPerfCounter>
-      <vim25:_this type="PerformanceManager">{perf_ref}</vim25:_this>
-    </vim25:QueryPerfCounter>'''
-        return _parse_counters(soap_req(sess, host, body))
+
+    # Attempt 2: RetrievePropertiesEx via PropertyCollector (works on ESXi 6.5 standalone)
+    if pc_ref:
+        try:
+            print('      [fallback] ESXi 6.5 standalone - using RetrievePropertiesEx for counter list')
+            body = f'''<vim25:RetrievePropertiesEx>
+      <vim25:_this type="PropertyCollector">{pc_ref}</vim25:_this>
+      <vim25:specSet>
+        <vim25:propSet><vim25:type>PerformanceManager</vim25:type><vim25:pathSet>perfCounter</vim25:pathSet></vim25:propSet>
+        <vim25:objectSet><vim25:obj type="PerformanceManager">{perf_ref}</vim25:obj></vim25:objectSet>
+      </vim25:specSet>
+      <vim25:options/>
+    </vim25:RetrievePropertiesEx>'''
+            result = _parse_retrieve_props(soap_req(sess, host, body))
+            if result:
+                return result
+        except RuntimeError as e2:
+            print(f'      [fallback] RetrievePropertiesEx also failed: {e2}')
+
+    # Attempt 3: skip perf gracefully rather than crash
+    print('      [warn] Could not enumerate perf counters - performance data will be omitted')
+    return {}
 
 # ── Step 8: Query performance (VM or Host) ───────────────────────────────────
 
@@ -675,7 +708,7 @@ def run(vcenter, username, password, days=90, output_dir='.'):
     print(f"      {len(licenses)} license(s) found")
 
     print(f"[7/8] Performance counter definitions...")
-    counter_ids = get_counter_ids(sess, vcenter, perf_ref)
+    counter_ids = get_counter_ids(sess, vcenter, perf_ref, pc_ref=pc_ref)
     print(f"      {len(counter_ids)} counters available")
     for k in ['cpu.usage.average','cpu.ready.summation','mem.active.average',
               'disk.numberRead.summation','disk.read.average']:
