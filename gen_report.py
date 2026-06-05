@@ -1578,6 +1578,8 @@ def build_server_tab(srv):
         shares_body += ('<tr style="background:#271e41">'
                        '<th style="padding:7px 12px;color:#fff;text-align:left">Share</th>'
                        '<th style="padding:7px 12px;color:#fff;text-align:left">Path</th>'
+                       '<th style="padding:7px 12px;color:#fff;text-align:right">Size</th>'
+                       '<th style="padding:7px 12px;color:#fff;text-align:right">Files</th>'
                        '<th style="padding:7px 12px;color:#fff;text-align:left">Flag</th></tr>\n')
         for i, s in enumerate(sl):
             if not isinstance(s, dict): continue
@@ -1597,10 +1599,26 @@ def build_server_tab(srv):
                          'padding:3px 10px;border-radius:10px;border:1px solid #fca5a5;">&#9888; Everyone: Full</span>'
                          if everyone_full else
                          '<span style="color:#065f46;font-size:9pt;">&#10003;</span>')
+            size_gb   = s.get('SizeGB')
+            file_cnt  = s.get('FileCount')
+            size_str  = f'{size_gb} GB' if size_gb is not None else '<span style="color:#9ca3af">—</span>'
+            count_str = f'{file_cnt:,}' if file_cnt is not None else '<span style="color:#9ca3af">—</span>'
             bg = ' style="background:#f5f4f8"' if i % 2 == 1 else ''
             shares_body += (f'<tr{bg}><td style="padding:5px 8px;font-weight:600">{h(s.get("Name",""))}</td>'
                            f'<td style="padding:5px 8px;font-family:monospace;font-size:8.5pt">{h(s.get("Path",""))}</td>'
+                           f'<td style="padding:5px 8px;text-align:right;font-variant-numeric:tabular-nums">{size_str}</td>'
+                           f'<td style="padding:5px 8px;text-align:right;font-variant-numeric:tabular-nums">{count_str}</td>'
                            f'<td style="padding:5px 8px">{flag_cell}</td></tr>\n')
+            # Subfolder breakdown (collapsed)
+            subs = s.get('Subfolders') or []
+            if subs and isinstance(subs, list):
+                sub_rows = ''.join(
+                    f'<tr><td style="padding:3px 8px 3px 28px;color:#6b6080;font-size:8.5pt">&nbsp;&#9492; {h(sf.get("Name",""))}</td>'
+                    f'<td></td><td style="padding:3px 8px;text-align:right;font-size:8.5pt;color:#6b6080">{sf.get("SizeGB","—")} GB</td>'
+                    f'<td></td><td></td></tr>\n'
+                    for sf in sorted(subs, key=lambda x: x.get('SizeGB', 0) or 0, reverse=True)
+                )
+                shares_body += sub_rows
         shares_body += '</table>\n' + top_link(sid)
 
     # -- ASSEMBLE --------------------------------------------------------------

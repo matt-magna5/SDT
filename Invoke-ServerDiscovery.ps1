@@ -1039,11 +1039,46 @@ $CollectionBlock = {
                         Write-Host ("  [Shares] ({0}/{1}) {2} -> {3}" -f $idx, $allShares.Count, $s.Name, $s.Path) -ForegroundColor DarkGray
                         try {
                             $acl = Get-SmbShareAccess -Name $s.Name -ErrorAction SilentlyContinue
+
+                            # Enumerate folder size + file count (30s timeout per share via background job)
+                            $sizeGB = $null; $fileCount = $null; $subfolders = @()
+                            if ($s.Path -and (Test-Path $s.Path -ErrorAction SilentlyContinue)) {
+                                try {
+                                    $sizeJob = Start-Job -ScriptBlock {
+                                        param($p)
+                                        $items = Get-ChildItem $p -Recurse -Force -ErrorAction SilentlyContinue
+                                        $bytes = ($items | Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+                                        $count = ($items | Where-Object {-not $_.PSIsContainer} | Measure-Object).Count
+                                        # Top-level subfolder sizes (one level deep only)
+                                        $subs = Get-ChildItem $p -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                                            $sb = (Get-ChildItem $_.FullName -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                                            @{ Name=$_.Name; SizeGB=[math]::Round(($sb/1GB),2) }
+                                        }
+                                        @{ Bytes=$bytes; Count=$count; Subs=$subs }
+                                    } -ArgumentList $s.Path
+                                    $done = Wait-Job $sizeJob -Timeout 30
+                                    if ($done) {
+                                        $r = Receive-Job $sizeJob -ErrorAction SilentlyContinue
+                                        if ($r) {
+                                            $sizeGB    = [math]::Round(($r.Bytes / 1GB), 2)
+                                            $fileCount = $r.Count
+                                            $subfolders = @($r.Subs)
+                                        }
+                                    } else {
+                                        Write-Host ("  [Shares] ({0}/{1}) {2} size timed out" -f $idx, $allShares.Count, $s.Name) -ForegroundColor DarkYellow
+                                    }
+                                    Remove-Job $sizeJob -Force -ErrorAction SilentlyContinue
+                                } catch { }
+                            }
+
                             [void]$collected.Add(@{
                                 Name        = $s.Name
                                 Path        = $s.Path
                                 Description = $s.Description
                                 Permissions = @($acl | Select-Object AccountName, AccessControlType, AccessRight)
+                                SizeGB      = $sizeGB
+                                FileCount   = $fileCount
+                                Subfolders  = $subfolders
                             })
                         } catch {
                             Write-Host ("  [Shares] ({0}/{1}) {2} ACL failed: {3}" -f $idx, $allShares.Count, $s.Name, $_.Exception.Message) -ForegroundColor DarkYellow
