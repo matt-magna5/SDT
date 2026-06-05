@@ -2282,7 +2282,18 @@ def build_ad_tab():
     cc     = domain_info.get('ComputerCount', '-')
     ou     = domain_info.get('OUCount', '-')
 
+    # Detect partial data — typically means DC WinRM failed and AD info came
+    # from a domain-joined member server (limited AD query rights)
+    _ad_is_partial = domain_info.get('Partial', False) or all(
+        str(v) in ('', '0', '-', 'None') for v in [uc, cc, ou, fl_d])
+
     out  = '<div style="padding:24px;">'
+    if _ad_is_partial:
+        out += ('<div class="flag-warning" style="margin-bottom:20px;">'
+                '<div class="flag-label">Incomplete AD Data — Domain Controller WinRM Unavailable</div>'
+                '<div class="flag-detail">AD data was collected from a domain-joined member server, not the DC directly. '
+                'User counts, OU counts, FSMO roles, and functional levels require WinRM access to the DC. '
+                'Re-run discovery with domain admin credentials once the DC is reachable.</div></div>\n')
     # Headline stats
     out += (f'<div class="stat-grid">'
             f'<div class="stat-box"><div class="stat-num">{len(dcs)}</div><div class="stat-lbl">Domain Controllers</div></div>'
@@ -2591,17 +2602,20 @@ for bucket in BUCKET_ORDER:
 env_tab_buttons = ''  # goes into top tab-nav
 _has_hyperv  = any(h.get('_type') == 'HyperVInventory'   for h in hv_inventories)
 _has_vsphere = any(h.get('_type') == 'vSphereInventory'  for h in hv_inventories)
-_virt_label  = ('Hyper-V / ESX' if _has_hyperv and _has_vsphere
-                else 'ESX Hosts'    if _has_vsphere
-                else 'Hyper-V Hosts')
-# Order: Summary | Virt (ESX/Hyper-V) | AD | SQL | EOL | Sizing
+# Fall back to manifest hv_type hint when no inventory file was collected
+_hv_hint = str(CFG.get('hv_type', '')).lower()
+_virt_label  = ('Hyper-V / ESX Hosts' if _has_hyperv and _has_vsphere
+                else 'ESX Hosts'       if _has_vsphere or _hv_hint in ('vsphere', 'esxi', 'esx', 'vcenter')
+                else 'Hyper-V Hosts'   if _has_hyperv or _hv_hint in ('hyperv', 'hyper-v')
+                else 'Hypervisor Hosts')
+# Order: Summary | Virt (ESX/Hyper-V) | AD | SQL | EOL | Private Cloud
 env_tab_buttons += '<button class="tab-btn active" data-tab="tab-summary" onclick="showTab(\'summary\')">Summary</button>\n'
 env_tab_buttons += f'<button class="tab-btn" data-tab="tab-virt" onclick="showTab(\'virt\')">{_virt_label}</button>\n'
 env_tab_buttons += '<button class="tab-btn" data-tab="tab-ad" onclick="showTab(\'ad\')">Active Directory</button>\n'
 if sql_tab_html:
     env_tab_buttons += '<button class="tab-btn" data-tab="tab-sql" onclick="showTab(\'sql\')">SQL</button>\n'
 env_tab_buttons += '<button class="tab-btn" data-tab="tab-eol" onclick="showTab(\'eol\')" style="border-top:3px solid #d63638;">EOL</button>\n'
-env_tab_buttons += '<button class="tab-btn" data-tab="tab-cloud" onclick="showTab(\'cloud\')" style="border-top:3px solid #5b1fa4;">Sizing (PC + Commvault)</button>\n'
+env_tab_buttons += '<button class="tab-btn" data-tab="tab-cloud" onclick="showTab(\'cloud\')" style="border-top:3px solid #5b1fa4;">Private Cloud + Commvault</button>\n'
 
 tab_contents = ''
 # Summary first (and active by default)
