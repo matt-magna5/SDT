@@ -1894,6 +1894,7 @@ function Start-DiscoveryRun {
     # $using: scoping is not supported by the fallback and silently crashes the job.
     $job = Start-ThreadJob -ScriptBlock {
         param($Session, $Payload, $ScriptDir, $BuddyFrames, $IvscFn)
+        try {
 
         # Re-define Invoke-VsphereCollect in this runspace (needed for vSphere perf collection)
         if ($IvscFn) { ${function:Invoke-VsphereCollect} = $IvscFn }
@@ -2403,6 +2404,13 @@ function Start-DiscoveryRun {
 
         $Session.Status     = 'complete'
         $Session.FinishedAt = Get-Date
+
+        } catch {
+            $errMsg = $_.Exception.Message
+            $errLine = $_.InvocationInfo.ScriptLineNumber
+            $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] WORKER CRASH at line $errLine : $errMsg") | Out-Null
+            $Session.Status = 'error'
+        }
 
     } -ArgumentList $script:Session, $Payload, $script:ScriptDir, $script:BuddyFrames, $ivscFn
 
