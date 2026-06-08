@@ -434,7 +434,8 @@ function Invoke-SdtAutoUpdate {
         `$inst = Invoke-WebRequest 'https://raw.githubusercontent.com/matt-magna5/SDT/main/install.ps1' -UseBasicParsing -TimeoutSec 30
         `$sb = [ScriptBlock]::Create(`$inst.Content)
         & `$sb -Version `$latest -Quiet -NoLaunch | Out-Null
-        Write-Host ("  [sdt] updated to v{0}" -f `$latestDisplay) -ForegroundColor Green
+        Write-Host ("  [sdt] updated to v{0} - relaunching" -f `$latestDisplay) -ForegroundColor Green
+        return 'updated'
     } catch {
         Write-Host ("  [sdt] update failed: {0} - running local v{1}" -f `$_.Exception.Message, `$local) -ForegroundColor Red
     }
@@ -457,6 +458,7 @@ switch -Regex (`$Mode) {
         Write-Host "  scan / scan-local    (aliases - all do the same thing)"
         Write-Host "                       Any extra args are passed to the script."
         Write-Host "  cli / console / tui  Legacy console wizard (Start-DiscoverySession.ps1)"
+  Write-Host "  newui                Launch the dossier-style UI (test/preview)"
         Write-Host ""
         Write-Host "  version / -v         Show installed version + path"
         Write-Host "  folder / where       Show the install folder paths"
@@ -577,7 +579,15 @@ if (-not `$health.ok) {
     }
 }
 
-Invoke-SdtAutoUpdate
+`$updateResult = Invoke-SdtAutoUpdate
+if (`$updateResult -eq 'updated') {
+    # Relaunch with the new version - this process has old code in memory
+    `$fwd = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `$PSCommandPath)
+    if (`$Mode -and `$Mode -ne 'gui') { `$fwd += `$Mode }
+    if (`$Rest) { `$fwd += @(`$Rest) }
+    Start-Process powershell.exe -ArgumentList `$fwd
+    exit 0
+}
 
 # Normalize `$Rest so empty splat is safe on PS 5.1 + PS 7
 if (`$null -eq `$Rest) { `$Rest = @() }
@@ -592,6 +602,19 @@ switch -Regex (`$Mode) {
     '^(invoke|local|bare|run-local|runlocal|scan-local|scan)$' {
         if (`$RestArr.Count -gt 0) { & (Join-Path `$AppDir 'Invoke-ServerDiscovery.ps1') @RestArr }
         else { & (Join-Path `$AppDir 'Invoke-ServerDiscovery.ps1') }
+        return
+    }
+    '^(newui|new-ui|ui2|dossier)$' {
+        # Launch GUI with the dossier-style light UI (test/preview flag)
+        `$guiScript = Join-Path `$AppDir 'Start-DiscoverySessionGUI.ps1'
+        `$psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `$guiScript, '-NewUI')
+        try {
+            `$child = Start-Process powershell.exe -ArgumentList `$psArgs -PassThru
+            Write-Host ("  [sdt] New UI launched in background (PID {0}). Browser will open shortly." -f `$child.Id) -ForegroundColor DarkGray
+        } catch {
+            Write-Host "  [sdt] Detached launch failed - falling back to in-process." -ForegroundColor Yellow
+            & `$guiScript -NewUI
+        }
         return
     }
     default {

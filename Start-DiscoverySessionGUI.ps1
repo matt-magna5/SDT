@@ -1886,14 +1886,11 @@ function Start-DiscoveryRun {
         }
     }
 
-    # Capture Invoke-VsphereCollect so it's available inside the ThreadJob runspace
+    # Capture Invoke-VsphereCollect so it's available inside the worker runspace
     $ivscFn = ${function:Invoke-VsphereCollect}
 
-    # Kick off the worker scriptblock in a runspace so the HTTP listener stays responsive.
-    # Pass $ivscFn via -ArgumentList so the PS5.1 fallback runspace receives it correctly.
-    # $using: scoping is not supported by the fallback and silently crashes the job.
-    $job = Start-ThreadJob -ScriptBlock {
-        param($Session, $Payload, $ScriptDir, $BuddyFrames, $IvscFn)
+    # ---- Outer worker scriptblock (param-less - variables injected via SessionStateProxy) ----
+    $outerWorker = {
         try {
 
         # Re-define Invoke-VsphereCollect in this runspace (needed for vSphere perf collection)
@@ -2406,13 +2403,52 @@ function Start-DiscoveryRun {
         $Session.FinishedAt = Get-Date
 
         } catch {
-            $errMsg = $_.Exception.Message
-            $errLine = $_.InvocationInfo.ScriptLineNumber
-            $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] WORKER CRASH at line $errLine : $errMsg") | Out-Null
-            $Session.Status = 'error'
+            $errMsg  = $_.Exception.Message
+            $errLine = try { $_.InvocationInfo.ScriptLineNumber } catch { '?' }
+            try { $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] WORKER CRASH line $errLine : $errMsg") | Out-Null } catch {}
+            try { $Session.Status = 'error' } catch {}
         }
+    }
 
-    } -ArgumentList $script:Session, $Payload, $script:ScriptDir, $script:BuddyFrames, $ivscFn
+    # ---- Launch outer worker as a direct PS runspace (no Start-ThreadJob / shim) ----
+    # SessionStateProxy injection is reliable on any PS version - no $using:,
+    # no ArgumentList type issues, no shim path selection.
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable('Session',     $script:Session)
+    $rs.SessionStateProxy.SetVariable('Payload',     $Payload)
+    $rs.SessionStateProxy.SetVariable('ScriptDir',   $script:ScriptDir)
+    $rs.SessionStateProxy.SetVariable('BuddyFrames', $script:BuddyFrames)
+    if ($ivscFn) { $rs.SessionStateProxy.SetVariable('IvscFn', $ivscFn) }
+    # Inject shim source so inner Start-ThreadJob calls (parallel server workers) still work
+    $rs.SessionStateProxy.SetVariable('SDT_ShimSource',    $Global:SDT_ShimSource)
+    $rs.SessionStateProxy.SetVariable('SDT_RunspacePool',  $Global:SDT_RunspacePool)
+    $rs.SessionStateProxy.SetVariable('SDT_ThreadJobMode', "$($Global:SDT_ThreadJobMode)")
+
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $rs
+    # Load shim so inner Start-ThreadJob works for parallel server scanning
+    [void]$ps.AddScript('if ($SDT_ShimSource) { try { . ([scriptblock]::Create($SDT_ShimSource)) } catch {} }')
+    [void]$ps.AddStatement()
+    # Define Invoke-VsphereCollect if captured
+    if ($ivscFn) {
+        [void]$ps.AddScript('${function:Invoke-VsphereCollect} = $IvscFn')
+        [void]$ps.AddStatement()
+    }
+    [void]$ps.AddScript($outerWorker)
+    $handle = $ps.BeginInvoke()
+
+    $job = [pscustomobject]@{
+        Id = 1; Name = 'DiscoveryWorker'; HasMoreData = $true; PSBeginTime = Get-Date
+        _PS = $ps; _Handle = $handle; _RS = $rs
+    }
+    $job | Add-Member -MemberType ScriptProperty -Name State -Value {
+        try {
+            if ($this._Handle -and $this._Handle.IsCompleted) {
+                if ($this._PS.HadErrors -or $this._PS.InvocationStateInfo.State -eq 'Failed') { 'Failed' } else { 'Completed' }
+            } else { 'Running' }
+        } catch { 'Unknown' }
+    }
 
     return $job
 }
