@@ -2427,8 +2427,14 @@ function Start-DiscoveryRun {
 
     $ps = [System.Management.Automation.PowerShell]::Create()
     $ps.Runspace = $rs
-    # Load shim so inner Start-ThreadJob works for parallel server scanning
-    [void]$ps.AddScript('if ($SDT_ShimSource) { try { . ([scriptblock]::Create($SDT_ShimSource)) } catch {} }')
+    # Make Start-ThreadJob available inside the runspace for inner parallel server workers.
+    # 'parallel' = native ThreadJob module installed - import it.
+    # 'asyncShim' = no native module - dot-source the injected shim source.
+    if ($Global:SDT_ThreadJobMode -eq 'parallel') {
+        [void]$ps.AddScript('try { Import-Module ThreadJob -EA Stop } catch { try { Import-Module ThreadJob } catch {} }')
+    } else {
+        [void]$ps.AddScript('if ($SDT_ShimSource) { try { . ([scriptblock]::Create($SDT_ShimSource)) } catch {} }')
+    }
     [void]$ps.AddStatement()
     # Define Invoke-VsphereCollect if captured
     if ($ivscFn) {
