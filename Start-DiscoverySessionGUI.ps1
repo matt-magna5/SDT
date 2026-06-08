@@ -2166,32 +2166,188 @@ function Start-DiscoveryRun {
             $Session.Targets[$i] = $t
         }
 
-        # ---- Fan out server targets across $parallel ThreadJobs ----
+        # ---- Self-healing server fan-out ----
+        # 3-tier launch fallback + per-target stall watchdog + auto-retry
+        $STALL_SEC  = 120   # no phase change in this many seconds = stall -> retry tier-2
+        $HARD_SEC   = 900   # absolute per-target cap (15 min) -> kill + error
+        $TICK_MS    = 500   # watchdog poll interval
+
+        # Classify an error string into a known action category for logging
+        function Get-SdtErrorAction([string]$Msg) {
+            if ($Msg -match 'Start-ThreadJob|ThreadJob|runspace|Runspace') { return 'threadjob-unavailable' }
+            if ($Msg -match 'WinRM|WSMan|5985|5986|WS-Man')               { return 'winrm-unreachable' }
+            if ($Msg -match 'Access is denied|LogonFailure|AccessDenied|0x80070005') { return 'auth-denied' }
+            if ($Msg -match 'unreachable|ping|RPC|timed out|timeout')      { return 'network-unreachable' }
+            return 'unknown'
+        }
+
+        # Dispose of a job object safely regardless of tier
+        function Remove-SdtJob([object]$j) {
+            try { if ($j._PS)  { $j._PS.Stop() }  } catch {}
+            try { if ($j._RS)  { $j._RS.Dispose() } } catch {}
+            try { Stop-Job  -Job $j -Force -EA SilentlyContinue } catch {}
+            try { Remove-Job -Job $j -Force -EA SilentlyContinue } catch {}
+        }
+
+        # 3-tier launcher. Tier 1 = Start-ThreadJob, 2 = direct runspace, 3 = inline sync.
+        # Returns a job-like object (or $null for inline).
+        function Invoke-ServerWorkerSafe(
+            $Session, $Payload, $ScriptDir, $BuddyFrames,
+            $idx, $cred, $invoke, $serverWorker, [int]$Tier = 1
+        ) {
+            $tName = $Session.Targets[$idx].Name
+
+            # --- Tier 1: Start-ThreadJob ---
+            if ($Tier -le 1) {
+                try {
+                    $j = Start-ThreadJob -ScriptBlock $serverWorker `
+                        -ArgumentList $Session, $Payload, $ScriptDir, $BuddyFrames, $idx, $cred, $invoke
+                    if ($j) {
+                        $j | Add-Member -NotePropertyName _Tier -NotePropertyValue 1 -EA SilentlyContinue
+                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$tName] tier-1 (ThreadJob) launched") | Out-Null
+                        return $j
+                    }
+                } catch {
+                    $act = Get-SdtErrorAction $_.Exception.Message
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$tName] tier-1 failed ($act): $($_.Exception.Message) -- escalating") | Out-Null
+                }
+            }
+
+            # --- Tier 2: direct [PowerShell] runspace (no shim, no module needed) ---
+            if ($Tier -le 2) {
+                try {
+                    $rs2 = [runspacefactory]::CreateRunspace()
+                    $rs2.Open()
+                    $ps2 = [System.Management.Automation.PowerShell]::Create()
+                    $ps2.Runspace = $rs2
+                    [void]$ps2.AddScript($serverWorker)
+                    [void]$ps2.AddArgument($Session)
+                    [void]$ps2.AddArgument($Payload)
+                    [void]$ps2.AddArgument($ScriptDir)
+                    [void]$ps2.AddArgument($BuddyFrames)
+                    [void]$ps2.AddArgument($idx)
+                    [void]$ps2.AddArgument($cred)
+                    [void]$ps2.AddArgument($invoke)
+                    $h2 = $ps2.BeginInvoke()
+                    $j2 = [pscustomobject]@{ Id=($idx+1000); Name="t2-$tName"; HasMoreData=$true; PSBeginTime=Get-Date; _PS=$ps2; _Handle=$h2; _RS=$rs2; _Tier=2 }
+                    $j2 | Add-Member -MemberType ScriptProperty -Name State -Value {
+                        try { if ($this._Handle.IsCompleted) { if ($this._PS.HadErrors) {'Failed'} else {'Completed'} } else {'Running'} } catch {'Unknown'}
+                    }
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$tName] tier-2 (direct runspace) launched") | Out-Null
+                    return $j2
+                } catch {
+                    $act = Get-SdtErrorAction $_.Exception.Message
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$tName] tier-2 failed ($act): $($_.Exception.Message) -- falling to inline") | Out-Null
+                }
+            }
+
+            # --- Tier 3: inline synchronous (blocks, but never fails on threading) ---
+            $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$tName] tier-3 (inline/sync) - running synchronously") | Out-Null
+            try {
+                & $serverWorker $Session $Payload $ScriptDir $BuddyFrames $idx $cred $invoke
+            } catch {
+                $t3 = $Session.Targets[$idx]
+                $t3.State = 'error'; $t3.Phase = "inline error: $($_.Exception.Message)"
+                $t3.Finished = (Get-Date).ToString('HH:mm:ss')
+                $Session.Targets[$idx] = $t3
+            }
+            return $null
+        }
+
         $serverIndexes = @()
         for ($i = 0; $i -lt $Session.Targets.Count; $i++) {
             if ($Session.Targets[$i].Kind -ne 'hypervisor') { $serverIndexes += $i }
         }
-        $jobs = [System.Collections.ArrayList]@()
+
+        # jobMap: idx -> hashtable with Job, StartTime, LastPhase, LastPhaseTime, Retried
+        $jobMap    = @{}
+        $completed = [System.Collections.Generic.HashSet[int]]@()
+
         foreach ($idx in $serverIndexes) {
-            # Throttle: wait until under the limit before launching another
-            while (($jobs | Where-Object { $_.State -eq 'Running' }).Count -ge $parallel) {
-                Start-Sleep -Milliseconds 400
-            }
-            $j = Start-ThreadJob -ScriptBlock $serverWorker `
-                -ArgumentList $Session, $Payload, $ScriptDir, $BuddyFrames, $idx, $cred, $invoke
-            [void]$jobs.Add($j)
-        }
-        # Wait for every server job to finish. 30-minute safety cap per job.
-        foreach ($j in $jobs) {
-            try {
-                Wait-Job -Job $j -Timeout 1800 | Out-Null
-                if ($j.State -eq 'Running') {
-                    Stop-Job -Job $j -EA SilentlyContinue
-                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] Worker job $($j.Id) exceeded 30 min timeout - stopped") | Out-Null
+
+            # --- Throttle + watchdog while waiting for a slot ---
+            $slotWait = Get-Date
+            while ($true) {
+                $running = 0
+                foreach ($je in $jobMap.Values) {
+                    $st = try { $je.Job.State } catch { 'Unknown' }
+                    if ($st -eq 'Running') { $running++ }
                 }
-                Receive-Job -Job $j -EA SilentlyContinue | Out-Null
-            } catch {}
-            try { Remove-Job -Job $j -Force -EA SilentlyContinue } catch {}
+                if ($running -lt $parallel) { break }
+
+                # Watchdog while throttling
+                foreach ($wi in @($jobMap.Keys)) {
+                    if ($completed.Contains($wi)) { continue }
+                    $je  = $jobMap[$wi]
+                    $wt  = $Session.Targets[$wi]
+                    $wjs = try { $je.Job.State } catch { 'Unknown' }
+                    $we  = ((Get-Date) - $je.StartTime).TotalSeconds
+                    if ($wt.Phase -ne $je.LastPhase) { $je.LastPhase = $wt.Phase; $je.LastPhaseTime = Get-Date }
+                    $wpe = ((Get-Date) - $je.LastPhaseTime).TotalSeconds
+                    if ($wjs -eq 'Completed' -or $wt.State -eq 'done' -or $wt.State -eq 'error') {
+                        [void]$completed.Add($wi); Remove-SdtJob $je.Job; continue
+                    }
+                    if ($wpe -gt $STALL_SEC -and -not $je.Retried) {
+                        $act = Get-SdtErrorAction $wt.Phase
+                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] STALL ${wpe}s (phase='$($wt.Phase)' act=$act) - retry tier-2") | Out-Null
+                        Remove-SdtJob $je.Job
+                        $wt.State='pending'; $wt.Phase='retry (stall)'; $wt.Started=$null; $Session.Targets[$wi]=$wt
+                        $je.Retried=$true; $je.StartTime=Get-Date; $je.LastPhase=''; $je.LastPhaseTime=Get-Date
+                        $je.Job = Invoke-ServerWorkerSafe $Session $Payload $ScriptDir $BuddyFrames $wi $cred $invoke $serverWorker 2
+                        $jobMap[$wi] = $je
+                    }
+                    if ($we -gt $HARD_SEC) {
+                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] HARD TIMEOUT ${we}s - killing") | Out-Null
+                        Remove-SdtJob $je.Job
+                        $wt.State='error'; $wt.Phase="hard timeout (${we}s)"; $wt.Finished=(Get-Date).ToString('HH:mm:ss')
+                        $Session.Targets[$wi]=$wt; [void]$completed.Add($wi)
+                    }
+                }
+                Start-Sleep -Milliseconds $TICK_MS
+                if (((Get-Date) - $slotWait).TotalSeconds -gt 30) { break }
+            }
+
+            # Launch this target
+            $jNew = Invoke-ServerWorkerSafe $Session $Payload $ScriptDir $BuddyFrames $idx $cred $invoke $serverWorker 1
+            $jobMap[$idx] = @{ Job=$jNew; StartTime=Get-Date; LastPhase=''; LastPhaseTime=Get-Date; Retried=$false }
+        }
+
+        # --- Final wait loop with watchdog ---
+        $deadline = (Get-Date).AddSeconds($HARD_SEC + 120)
+        while ($completed.Count -lt $serverIndexes.Count -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds ($TICK_MS * 10)
+
+            foreach ($wi in @($jobMap.Keys)) {
+                if ($completed.Contains($wi)) { continue }
+                $je  = $jobMap[$wi]
+                if (-not $je) { [void]$completed.Add($wi); continue }
+                $wt  = $Session.Targets[$wi]
+                $wjs = try { $je.Job.State } catch { 'Unknown' }
+                $we  = ((Get-Date) - $je.StartTime).TotalSeconds
+                if ($wt.Phase -ne $je.LastPhase) { $je.LastPhase = $wt.Phase; $je.LastPhaseTime = Get-Date }
+                $wpe = ((Get-Date) - $je.LastPhaseTime).TotalSeconds
+
+                if ($wjs -eq 'Completed' -or $wt.State -eq 'done' -or $wt.State -eq 'error') {
+                    [void]$completed.Add($wi); Remove-SdtJob $je.Job
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] finished (state=$($wt.State))") | Out-Null
+                    continue
+                }
+                if ($wpe -gt $STALL_SEC -and -not $je.Retried) {
+                    $act = Get-SdtErrorAction $wt.Phase
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] STALL ${wpe}s ($act) - escalate tier-2") | Out-Null
+                    Remove-SdtJob $je.Job
+                    $wt.State='pending'; $wt.Phase='retry (stall)'; $wt.Started=$null; $Session.Targets[$wi]=$wt
+                    $je.Retried=$true; $je.StartTime=Get-Date; $je.LastPhase=''; $je.LastPhaseTime=Get-Date
+                    $je.Job = Invoke-ServerWorkerSafe $Session $Payload $ScriptDir $BuddyFrames $wi $cred $invoke $serverWorker 2
+                    $jobMap[$wi] = $je; continue
+                }
+                if ($we -gt $HARD_SEC) {
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] HARD TIMEOUT ${we}s - killing") | Out-Null
+                    Remove-SdtJob $je.Job
+                    $wt.State='error'; $wt.Phase="hard timeout (${we}s)"; $wt.Finished=(Get-Date).ToString('HH:mm:ss')
+                    $Session.Targets[$wi]=$wt; [void]$completed.Add($wi)
+                }
+            }
         }
 
         # ---------------------------------------------------------------
