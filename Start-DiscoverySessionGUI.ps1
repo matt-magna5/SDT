@@ -2168,9 +2168,13 @@ function Start-DiscoveryRun {
 
         # ---- Self-healing server fan-out ----
         # 3-tier launch fallback + per-target stall watchdog + auto-retry
-        $STALL_SEC  = 120   # no phase change in this many seconds = stall -> retry tier-2
-        $HARD_SEC   = 900   # absolute per-target cap (15 min) -> kill + error
+        # Parallel=1 runs inline (no threading at all - always works).
+        # Parallel>1 uses threading with fast stall detection and tier escalation.
+        $STALL_SEC  = 30    # no phase change in N seconds = stall -> escalate tier
+        $STALL2_SEC = 30    # tier-2 stall -> go straight to tier-3 inline
+        $HARD_SEC   = 600   # absolute per-target cap (10 min) -> kill + error
         $TICK_MS    = 500   # watchdog poll interval
+        $LOG_EVERY  = 10    # log a countdown heartbeat every N seconds
 
         # Classify an error string into a known action category for logging
         function Get-SdtErrorAction([string]$Msg) {
@@ -2307,15 +2311,29 @@ function Start-DiscoveryRun {
                 if (((Get-Date) - $slotWait).TotalSeconds -gt 30) { break }
             }
 
-            # Launch this target
-            $jNew = Invoke-ServerWorkerSafe $Session $Payload $ScriptDir $BuddyFrames $idx $cred $invoke $serverWorker 1
-            $jobMap[$idx] = @{ Job=$jNew; StartTime=Get-Date; LastPhase=''; LastPhaseTime=Get-Date; Retried=$false }
+            # Launch: inline if sequential, threaded if parallel
+            if ($parallel -le 1) {
+                # Inline (no threading at all) - always works
+                $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($Session.Targets[$idx].Name)] inline start") | Out-Null
+                try {
+                    & $serverWorker $Session $Payload $ScriptDir $BuddyFrames $idx $cred $invoke
+                } catch {
+                    $ti = $Session.Targets[$idx]
+                    $ti.State='error'; $ti.Phase="error: $($_.Exception.Message)"; $ti.Finished=(Get-Date).ToString('HH:mm:ss')
+                    $Session.Targets[$idx] = $ti
+                }
+                [void]$completed.Add($idx)
+            } else {
+                $jNew = Invoke-ServerWorkerSafe $Session $Payload $ScriptDir $BuddyFrames $idx $cred $invoke $serverWorker 1
+                $jobMap[$idx] = @{ Job=$jNew; StartTime=Get-Date; LastPhase=''; LastPhaseTime=Get-Date; Tier=1; LastLog=Get-Date }
+            }
         }
 
-        # --- Final wait loop with watchdog ---
-        $deadline = (Get-Date).AddSeconds($HARD_SEC + 120)
+        # --- Final wait loop with watchdog (threaded path only) ---
+        if ($parallel -gt 1) {
+        $deadline = (Get-Date).AddSeconds($HARD_SEC + 60)
         while ($completed.Count -lt $serverIndexes.Count -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Milliseconds ($TICK_MS * 10)
+            Start-Sleep -Milliseconds $TICK_MS
 
             foreach ($wi in @($jobMap.Keys)) {
                 if ($completed.Contains($wi)) { continue }
@@ -2323,23 +2341,53 @@ function Start-DiscoveryRun {
                 if (-not $je) { [void]$completed.Add($wi); continue }
                 $wt  = $Session.Targets[$wi]
                 $wjs = try { $je.Job.State } catch { 'Unknown' }
-                $we  = ((Get-Date) - $je.StartTime).TotalSeconds
+                $we  = [math]::Round(((Get-Date) - $je.StartTime).TotalSeconds, 1)
                 if ($wt.Phase -ne $je.LastPhase) { $je.LastPhase = $wt.Phase; $je.LastPhaseTime = Get-Date }
-                $wpe = ((Get-Date) - $je.LastPhaseTime).TotalSeconds
+                $wpe = [math]::Round(((Get-Date) - $je.LastPhaseTime).TotalSeconds, 1)
+                $stallLimit = if ($je.Tier -ge 2) { $STALL2_SEC } else { $STALL_SEC }
+
+                # Countdown heartbeat every $LOG_EVERY seconds
+                if (((Get-Date) - $je.LastLog).TotalSeconds -ge $LOG_EVERY) {
+                    $remaining = [math]::Round($stallLimit - $wpe, 0)
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] tier-$($je.Tier) running ${we}s | phase='$($wt.Phase)' | stall-check in ${remaining}s") | Out-Null
+                    $je.LastLog = Get-Date
+                    $jobMap[$wi] = $je
+                }
 
                 if ($wjs -eq 'Completed' -or $wt.State -eq 'done' -or $wt.State -eq 'error') {
                     [void]$completed.Add($wi); Remove-SdtJob $je.Job
-                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] finished (state=$($wt.State))") | Out-Null
+                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] finished state=$($wt.State)") | Out-Null
                     continue
                 }
-                if ($wpe -gt $STALL_SEC -and -not $je.Retried) {
+
+                if ($wpe -gt $stallLimit) {
                     $act = Get-SdtErrorAction $wt.Phase
-                    $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] STALL ${wpe}s ($act) - escalate tier-2") | Out-Null
-                    Remove-SdtJob $je.Job
-                    $wt.State='pending'; $wt.Phase='retry (stall)'; $wt.Started=$null; $Session.Targets[$wi]=$wt
-                    $je.Retried=$true; $je.StartTime=Get-Date; $je.LastPhase=''; $je.LastPhaseTime=Get-Date
-                    $je.Job = Invoke-ServerWorkerSafe $Session $Payload $ScriptDir $BuddyFrames $wi $cred $invoke $serverWorker 2
-                    $jobMap[$wi] = $je; continue
+                    $nextTier = $je.Tier + 1
+                    if ($nextTier -gt 3) {
+                        # All tiers exhausted - mark error
+                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] all tiers exhausted after ${we}s ($act) - error") | Out-Null
+                        Remove-SdtJob $je.Job
+                        $wt.State='error'; $wt.Phase="stall on all tiers (${we}s, $act)"; $wt.Finished=(Get-Date).ToString('HH:mm:ss')
+                        $Session.Targets[$wi]=$wt; [void]$completed.Add($wi)
+                    } elseif ($nextTier -eq 3) {
+                        # Tier 3 = inline sync - run it right here in the watchdog
+                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] tier-2 stall ${wpe}s ($act) - running tier-3 inline now") | Out-Null
+                        Remove-SdtJob $je.Job
+                        $wt.State='pending'; $wt.Phase='tier-3 inline'; $wt.Started=$null; $Session.Targets[$wi]=$wt
+                        try { & $serverWorker $Session $Payload $ScriptDir $BuddyFrames $wi $cred $invoke } catch {
+                            $wt = $Session.Targets[$wi]; $wt.State='error'; $wt.Phase="tier-3 error: $($_.Exception.Message)"
+                            $wt.Finished=(Get-Date).ToString('HH:mm:ss'); $Session.Targets[$wi]=$wt
+                        }
+                        [void]$completed.Add($wi)
+                    } else {
+                        $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] tier-$($je.Tier) stall ${wpe}s ($act) - escalate tier-$nextTier") | Out-Null
+                        Remove-SdtJob $je.Job
+                        $wt.State='pending'; $wt.Phase="retry tier-$nextTier"; $wt.Started=$null; $Session.Targets[$wi]=$wt
+                        $je.Tier=$nextTier; $je.StartTime=Get-Date; $je.LastPhase=''; $je.LastPhaseTime=Get-Date; $je.LastLog=(Get-Date).AddSeconds(-$LOG_EVERY)
+                        $je.Job = Invoke-ServerWorkerSafe $Session $Payload $ScriptDir $BuddyFrames $wi $cred $invoke $serverWorker $nextTier
+                        $jobMap[$wi] = $je
+                    }
+                    continue
                 }
                 if ($we -gt $HARD_SEC) {
                     $Session.LogTail.Add("[$(Get-Date -f 'HH:mm:ss')] [$($wt.Name)] HARD TIMEOUT ${we}s - killing") | Out-Null
@@ -2349,6 +2397,7 @@ function Start-DiscoveryRun {
                 }
             }
         }
+        } # end threaded path
 
         # ---------------------------------------------------------------
         # Post-session verification: confirm each target produced an
