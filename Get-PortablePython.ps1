@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 3.0
 <#
 .SYNOPSIS
     Downloads SDT dependencies: portable Python (for HTML reports) and
@@ -8,6 +8,16 @@
 #>
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Expand-ZipCompat([string]$ZipPath, [string]$Destination) {
+    if (-not (Test-Path $Destination)) { New-Item -ItemType Directory -Force -Path $Destination | Out-Null }
+    if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
+        Expand-Archive -Path $ZipPath -DestinationPath $Destination -Force
+    } else {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
+    }
+}
 
 Write-Host ""
 Write-Host "  SDT -- Dependencies Setup" -ForegroundColor Cyan
@@ -164,8 +174,7 @@ if (Test-Path (Join-Path $DEST_FOLDER "python.exe")) {
 } else {
     $ok = Get-FileWithProgress -Url $PY_URL -Dest $ZIP_TMP -Label "Python $PY_VERSION"
     if ($ok) {
-        New-Item -ItemType Directory -Path $DEST_FOLDER -Force | Out-Null
-        Expand-Archive -Path $ZIP_TMP -DestinationPath $DEST_FOLDER -Force
+        Expand-ZipCompat $ZIP_TMP $DEST_FOLDER
         Remove-Item $ZIP_TMP -Force -ErrorAction SilentlyContinue
         if (Test-Path (Join-Path $DEST_FOLDER "python.exe")) {
             Write-Host "  [OK] Portable Python ready." -ForegroundColor Green

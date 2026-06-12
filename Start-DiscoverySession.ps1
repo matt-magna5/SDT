@@ -571,6 +571,16 @@ Write-Host ""
 # DOWNLOAD HELPER - multi-method with live progress, self-healing fallbacks
 # -----------------------------------------------------------------------------
 
+function Expand-ZipCompat([string]$ZipPath, [string]$Destination) {
+    if (-not (Test-Path $Destination)) { New-Item -ItemType Directory -Force -Path $Destination | Out-Null }
+    if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
+        Expand-Archive -Path $ZipPath -DestinationPath $Destination -Force
+    } else {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
+    }
+}
+
 function Invoke-DownloadWithProgress {
     param([string]$Url, [string]$Dest, [string]$Label = 'Downloading', [int]$TimeoutSec = 120)
 
@@ -776,7 +786,7 @@ function Invoke-UpdateCheck {
 
         # Extract - unique folder avoids permission conflicts from prior runs
         try { if (Test-Path $extTmp) { Remove-Item $extTmp -Recurse -Force -EA Stop } } catch { }
-        Expand-Archive $zipTmp $extTmp -Force
+        Expand-ZipCompat $zipTmp $extTmp
         Remove-Item $zipTmp -Force -ErrorAction SilentlyContinue
 
         $srcDir = Get-ChildItem $extTmp -Directory | Select-Object -First 1
@@ -1033,7 +1043,7 @@ function Connect-VSphere {
             # Return connection context with version locked to the responding endpoint
             # All downstream calls (Get-VSphereVMs, Get-VSphereInventory, Disconnect-VSphere)
             # branch on $Conn.APIVer to ensure v6/v7 endpoints are never mixed.
-            return @{ OK=$true; Token=$token; Server=$Server; APIVer=$apiVer; SessionEndpoint=$apiPath }
+            return @{ OK=$true; Token=$token; Server=$Server; APIVer=$apiVer; SessionEndpoint=$apiPath; Cred=$Cred }
         } catch { $lastErr = $_.Exception.Message }
     }
     return @{ OK=$false; Error="Could not connect to vSphere REST API on $Server - $lastErr" }
@@ -1148,8 +1158,40 @@ function Get-VSphereInventory {
                 State      = $_.connection_state
                 PowerState = $_.power_state
                 MOID       = $_.host
+                Version    = $null
             }
         })
+
+        # Fetch per-host ESXi version by querying each host's appliance API directly.
+        # Uses the same credentials as vCenter (works in most environments where
+        # vCenter admin == ESXi root or SSO admin).
+        $hvIdx = 0
+        foreach ($h in $esxHosts) {
+            $hvIdx++
+            Write-Host ("`r    ESXi version $hvIdx/$($esxHosts.Count)  ") -NoNewline -ForegroundColor DarkCyan
+            try {
+                $hvConn = Connect-VSphere -Server $h.Name -Cred $Conn.Cred -EA Stop
+                if ($hvConn) {
+                    $hvHdr = if ($hvConn.APIVer -eq 'v7') { @{ 'vmware-api-session-id' = $hvConn.Token } } else { @{ 'vmware-api-session-id' = $hvConn.Token.value } }
+                    $hvBase = "https://$($h.Name)"
+                    $hvVer  = $null
+                    try {
+                        $hvVerUri = "$hvBase/api/appliance/system/version"
+                        $hvVerRaw = Invoke-VSphereRest -Uri $hvVerUri -Headers $hvHdr
+                        $hvVer = $hvVerRaw.version
+                    } catch {
+                        try {
+                            $hvVerUri = "$hvBase/rest/appliance/system/version"
+                            $hvVerRaw = Invoke-VSphereRest -Uri $hvVerUri -Headers $hvHdr
+                            $hvVer = $hvVerRaw.value.version
+                        } catch { }
+                    }
+                    $h.Version = $hvVer
+                    try { Disconnect-VSphere $hvConn } catch { }
+                }
+            } catch { }
+        }
+        Write-Host "`r                                    " -NoNewline
     } catch { B-Warn "  Hosts endpoint unavailable: $_" }
 
     # Per-VM detail

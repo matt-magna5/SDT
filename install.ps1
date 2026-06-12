@@ -37,7 +37,37 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
+# -- PowerShell version check --------------------------------------------------
+$script:PSMaj = $PSVersionTable.PSVersion.Major
+if ($script:PSMaj -lt 3) {
+    Write-Host ""
+    Write-Host "  [X] PowerShell $($PSVersionTable.PSVersion) is not supported." -ForegroundColor Red
+    Write-Host "      Minimum required: PS 3.0  |  Recommended: PS 5.1 or PS 7+" -ForegroundColor DarkRed
+    Write-Host "      Download PS 7: https://aka.ms/powershell" -ForegroundColor DarkGray
+    exit 1
+}
+if ($script:PSMaj -eq 3 -or $script:PSMaj -eq 4) {
+    Write-Host ""
+    Write-Host "  [!] PowerShell $($PSVersionTable.PSVersion) detected -- using .NET ZipFile fallback (Expand-Archive not available)." -ForegroundColor Yellow
+    Write-Host "      Everything will work. Recommend upgrading to PS 5.1+ eventually." -ForegroundColor DarkYellow
+    Write-Host ""
+} elseif ($script:PSMaj -ge 7) {
+    Write-Host "  [OK] PowerShell $($PSVersionTable.PSVersion) -- full compatibility." -ForegroundColor DarkGreen
+} else {
+    Write-Host "  [OK] PowerShell $($PSVersionTable.PSVersion) -- compatible." -ForegroundColor DarkGreen
+}
+
 function Say([string]$m, [string]$c='White') { if (-not $Quiet) { Write-Host "  $m" -ForegroundColor $c } }
+
+function Expand-ZipCompat([string]$ZipPath, [string]$Destination) {
+    if (-not (Test-Path $Destination)) { New-Item -ItemType Directory -Force -Path $Destination | Out-Null }
+    if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
+        Expand-Archive -Path $ZipPath -DestinationPath $Destination -Force
+    } else {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
+    }
+}
 
 Say ""
 Say "================================================================" DarkMagenta
@@ -125,7 +155,7 @@ if ($existing -eq $Version -and -not $Force) {
     Say "Downloading $Version ..." DarkCyan
     Invoke-WebRequest -Uri $url -OutFile $zipTmp -UseBasicParsing -TimeoutSec 120
     New-Item -ItemType Directory -Force -Path $extTmp | Out-Null
-    Expand-Archive -Path $zipTmp -DestinationPath $extTmp -Force
+    Expand-ZipCompat $zipTmp $extTmp
     Remove-Item $zipTmp -Force -EA 0
     $src = Get-ChildItem $extTmp -Directory | Select-Object -First 1
     if (-not $src) { throw "Extraction produced no folder" }
