@@ -62,7 +62,7 @@ if ($NonInteractive -or -not [Environment]::UserInteractive) {
 } else {
     $script:IsNonInteractive = $false
 }
-$script:ScriptVersion  = '3.13'
+$script:ScriptVersion  = '3.14'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
