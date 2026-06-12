@@ -62,12 +62,22 @@ if ($NonInteractive -or -not [Environment]::UserInteractive) {
 } else {
     $script:IsNonInteractive = $false
 }
-$script:ScriptVersion  = '3.14'
+$script:ScriptVersion  = '4.2.35'
 $script:StartTime      = Get-Date
 $script:CollectErrors  = [System.Collections.ArrayList]@()
 
 # Fix 1 -- TLS 1.2 for older .NET (ensures HTTPS downloads work on .NET 4.0 / PS 3/4)
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+function Expand-ZipCompat([string]$ZipPath, [string]$Destination) {
+    if (-not (Test-Path $Destination)) { New-Item -ItemType Directory -Force -Path $Destination | Out-Null }
+    if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
+        Expand-Archive -Path $ZipPath -DestinationPath $Destination -Force
+    } else {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
+    }
+}
 
 $script:IsHVGuest = [bool]($HyperVGuestVMId -or $HyperVGuestVMName)
 $script:IsRemote  = $script:IsHVGuest -or (
@@ -131,7 +141,7 @@ function Invoke-SelfUpdate {
         $extTmp = Join-Path $env:TEMP ("sdt-inv-upd-{0}-{1}" -f $latest, [guid]::NewGuid().ToString('N').Substring(0,6))
         Invoke-WebRequest -Uri $zipUrl -OutFile $zipTmp -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
         if (Test-Path $extTmp) { Remove-Item $extTmp -Recurse -Force -EA SilentlyContinue }
-        Expand-Archive $zipTmp $extTmp -Force
+        Expand-ZipCompat $zipTmp $extTmp
         Remove-Item $zipTmp -Force -ErrorAction SilentlyContinue
 
         $srcDir = Get-ChildItem $extTmp -Directory | Select-Object -First 1
