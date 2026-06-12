@@ -2159,7 +2159,7 @@ $safeResult = Invoke-StrictSanitize $safeResult
 # Serialize to JSON
 $json = $null
 $jsonErr = ''
-if ($PSMaj -ge 3) {
+if ($localPSMajor -ge 3) {
     foreach ($depth in @(20, 10, 6)) {
         try {
             $json = $safeResult | ConvertTo-Json -Depth $depth -ErrorAction Stop
@@ -2171,10 +2171,10 @@ if ($PSMaj -ge 3) {
         }
     }
 } else {
-    # PS 2.0 fallback
+    # PS 2.0 fallback - use New-Object (::new() syntax requires PS 5.0+)
     try {
         Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
-        $serializer = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
+        $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
         $serializer.MaxJsonLength = 50MB
         $json = $serializer.Serialize($safeResult)
     } catch { $jsonErr = $_.ToString() }
