@@ -142,7 +142,7 @@ _SI = None
 # ── Step 1: Login  ───────────────────────────────────────────────────────────
 
 def login(sess, host, user, pw):
-    """Returns (pc_ref, perf_ref, root_folder, lic_mgr_ref).
+    """Returns (pc_ref, perf_ref, root_folder, lic_mgr_ref, api_version, api_type).
 
     Uses pyVmomi's SmartConnect to do the auth handshake, then extracts the
     authenticated SOAP session cookie and splices it into our custom `sess`
@@ -201,12 +201,29 @@ def login(sess, host, user, pw):
     rf_ref   = content.rootFolder._moId        if content.rootFolder        else None
     lic_ref  = content.licenseManager._moId    if content.licenseManager    else None
 
+    # Extract API version + type now while we have the ServiceInstance.
+    # This is the canonical source - used downstream to route version-specific
+    # code paths explicitly instead of relying on try/except blind fallbacks.
+    # apiType is the important one: "VirtualCenter" vs "HostAgent" (standalone
+    # ESXi). Standalone ESXi has no day/week/month/year historical rollup
+    # intervals - only real-time (20s samples, ~1hr retention) - so a
+    # QueryPerf against a day-granularity intervalId silently returns zero
+    # data points on ESXi even though the same call works fine on vCenter.
+    try:
+        api_version = content.about.apiVersion  # e.g. "6.5", "6.7", "7.0.3", "8.0.0"
+    except Exception:
+        api_version = "0.0"
+    try:
+        api_type = content.about.apiType  # "VirtualCenter" or "HostAgent"
+    except Exception:
+        api_type = "VirtualCenter"  # assume the common case if we can't tell
+
     # Save ServiceInstance for inventory helpers to use pyVmomi directly
     global _SI
     _SI = si
 
     # Don't Disconnect - we want to keep the session alive for subsequent SOAP calls
-    return pc_ref, perf_ref, rf_ref, lic_ref
+    return pc_ref, perf_ref, rf_ref, lic_ref, api_version, api_type
 
 
 # ── pyVmomi inventory helpers - used by all get_* functions below ────────────
@@ -316,12 +333,8 @@ def get_vms(sess, host, pc_ref, root_folder):
 
 # ── Step 3: Host info + host-level perf ──────────────────────────────────────
 
-def get_host_info(sess, host_addr, pc_ref, root_folder):
-    """Return FIRST host hardware dict (pyVmomi-based)."""
-    hosts = _pv_get_all('HostSystem')
-    if not hosts:
-        return {}
-    h = hosts[0]
+def _build_host_dict(h):
+    """Build the hardware/quickStats dict for a single pyVmomi HostSystem object."""
     cores   = int(_pv_attr(h, 'hardware.cpuInfo.numCpuCores', 0) or 0)
     mhz_per = int(_pv_attr(h, 'summary.hardware.cpuMhz', 0) or 0)
     total_mhz  = cores * mhz_per
@@ -332,6 +345,7 @@ def get_host_info(sess, host_addr, pc_ref, root_folder):
     mem_pct = round(used_mem_mb / total_mem_mb * 100, 2) if total_mem_mb else 0
     return {
         "Name":        _pv_attr(h, 'name') or _pv_attr(h, 'summary.config.name', ''),
+        "MOID":        h._moId,
         "Model":       _pv_attr(h, 'hardware.systemInfo.model', ''),
         "Vendor":      _pv_attr(h, 'hardware.systemInfo.vendor', ''),
         "ServiceTag":  _pv_attr(h, 'hardware.systemInfo.serialNumber', ''),
@@ -346,6 +360,22 @@ def get_host_info(sess, host_addr, pc_ref, root_folder):
         "IOPS_95th":   0,
         "DiskKBps_95th": 0,
     }
+
+def get_all_hosts(sess, host_addr, pc_ref, root_folder):
+    """Return hardware dict for EVERY host under rootFolder (pyVmomi-based).
+
+    Previously only hosts[0] was ever collected, so a 4-host cluster reported
+    NumHosts=4 but ESXHosts had 1 entry. Enumerate the full list instead.
+    """
+    return [_build_host_dict(h) for h in _pv_get_all('HostSystem')]
+
+def get_host_info(sess, host_addr, pc_ref, root_folder):
+    """Return FIRST host hardware dict (pyVmomi-based). Kept for callers that
+    only need a single representative host (e.g. standalone-host fallback)."""
+    hosts = _pv_get_all('HostSystem')
+    if not hosts:
+        return {}
+    return _build_host_dict(hosts[0])
 
 # ── Step 4: Datastores ───────────────────────────────────────────────────────
 
@@ -523,36 +553,8 @@ _HOST_COUNTERS = [
     'disk.write.average',
 ]
 
-def query_perf(sess, host, perf_ref, moid, moid_type, counter_ids, days=90):
-    """Query historical perf for a VM or HostSystem. Returns {counter_key: [values]}."""
-    end_dt   = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=days)
-    INTERVAL = 86400  # daily samples for 90-day history
-
-    wanted = {k: counter_ids.get(k) for k in
-              (_VM_COUNTERS if moid_type == 'VirtualMachine' else _HOST_COUNTERS)}
-    wanted = {k: v for k, v in wanted.items() if v}
-    if not wanted:
-        return {}
-
-    metrics_xml = ''.join(
-        f'<vim25:metricId><vim25:counterId>{cid}</vim25:counterId>'
-        f'<vim25:instance></vim25:instance></vim25:metricId>'
-        for cid in wanted.values())
-
-    body = f'''<vim25:QueryPerf>
-      <vim25:_this type="PerformanceManager">{perf_ref}</vim25:_this>
-      <vim25:querySpec>
-        <vim25:entity type="{moid_type}">{moid}</vim25:entity>
-        <vim25:startTime>{start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")}</vim25:startTime>
-        <vim25:endTime>{end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")}</vim25:endTime>
-        <vim25:intervalId>{INTERVAL}</vim25:intervalId>
-        <vim25:format>normal</vim25:format>
-        {metrics_xml}
-      </vim25:querySpec>
-    </vim25:QueryPerf>'''
-
-    root = soap_req(sess, host, body)
+def _parse_perf_response(root, wanted):
+    """Parse a QueryPerf SOAP response into {counter_key: [values]}."""
     result = {}
     for entity_metric in list(root.iter(f'{{{NS}}}returnval')) + list(root.iter('returnval')):
         for series in list(entity_metric.iter(f'{{{NS}}}value')) + list(entity_metric.iter('value')):
@@ -575,6 +577,74 @@ def query_perf(sess, host, perf_ref, moid, moid_type, counter_ids, days=90):
             if vals:
                 result[ckey] = vals
     return result
+
+def _realtime_perf_body(perf_ref, moid, moid_type, metrics_xml):
+    """QueryPerf body for the real-time interval (20s samples, no start/end -
+    just the most recent maxSample points). Used for standalone ESXi, which
+    has no historical rollup intervals, and as a last-resort fallback."""
+    return f'''<vim25:QueryPerf>
+      <vim25:_this type="PerformanceManager">{perf_ref}</vim25:_this>
+      <vim25:querySpec>
+        <vim25:entity type="{moid_type}">{moid}</vim25:entity>
+        <vim25:maxSample>180</vim25:maxSample>
+        <vim25:intervalId>20</vim25:intervalId>
+        <vim25:format>normal</vim25:format>
+        {metrics_xml}
+      </vim25:querySpec>
+    </vim25:QueryPerf>'''
+
+def query_perf(sess, host, perf_ref, moid, moid_type, counter_ids, days=90, api_type='VirtualCenter'):
+    """Query historical perf for a VM or HostSystem. Returns {counter_key: [values]}.
+
+    Standalone ESXi (apiType == 'HostAgent') has no day/week/month/year
+    historical rollup intervals - only real-time (20s samples, ~1hr
+    retention). Requesting the day-granularity intervalId (86400, used
+    against vCenter) against a standalone host silently returns zero data
+    points for every counter, which is exactly the null CPU.P95/Memory.P95
+    bug reported after FBA (2026-05-19). Route real-time interval instead
+    when we know we're talking directly to ESXi, and fall back to it from
+    the vCenter path too if the historical query comes back empty (e.g. a
+    freshly built cluster that hasn't accumulated 24h of stats yet).
+    """
+    wanted = {k: counter_ids.get(k) for k in
+              (_VM_COUNTERS if moid_type == 'VirtualMachine' else _HOST_COUNTERS)}
+    wanted = {k: v for k, v in wanted.items() if v}
+    if not wanted:
+        return {}
+
+    metrics_xml = ''.join(
+        f'<vim25:metricId><vim25:counterId>{cid}</vim25:counterId>'
+        f'<vim25:instance></vim25:instance></vim25:metricId>'
+        for cid in wanted.values())
+
+    if api_type == 'HostAgent':
+        return _parse_perf_response(
+            soap_req(sess, host, _realtime_perf_body(perf_ref, moid, moid_type, metrics_xml)), wanted)
+
+    end_dt   = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+    INTERVAL = 86400  # daily samples for historical window
+
+    body = f'''<vim25:QueryPerf>
+      <vim25:_this type="PerformanceManager">{perf_ref}</vim25:_this>
+      <vim25:querySpec>
+        <vim25:entity type="{moid_type}">{moid}</vim25:entity>
+        <vim25:startTime>{start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")}</vim25:startTime>
+        <vim25:endTime>{end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")}</vim25:endTime>
+        <vim25:intervalId>{INTERVAL}</vim25:intervalId>
+        <vim25:format>normal</vim25:format>
+        {metrics_xml}
+      </vim25:querySpec>
+    </vim25:QueryPerf>'''
+
+    result = _parse_perf_response(soap_req(sess, host, body), wanted)
+    if result:
+        return result
+
+    # Historical query came back empty even though this is vCenter - fall
+    # back to real-time so we surface a snapshot instead of an all-null P95.
+    return _parse_perf_response(
+        soap_req(sess, host, _realtime_perf_body(perf_ref, moid, moid_type, metrics_xml)), wanted)
 
 # ── Step 9: Stats helpers ─────────────────────────────────────────────────────
 
@@ -667,17 +737,18 @@ def run(vcenter, username, password, days=90, output_dir='.'):
     sess.verify = False
 
     print(f"[1/8] Connecting to vCenter {vcenter}...")
-    pc_ref, perf_ref, root_folder, lic_ref = login(sess, vcenter, username, password)
-    print(f"      PropertyCollector={pc_ref}  PerfManager={perf_ref}")
+    pc_ref, perf_ref, root_folder, lic_ref, api_version, api_type = login(sess, vcenter, username, password)
+    print(f"      PropertyCollector={pc_ref}  PerfManager={perf_ref}  apiType={api_type}  apiVersion={api_version}")
 
     print(f"[2/8] VM inventory + storage + partition data...")
     vms = get_vms(sess, vcenter, pc_ref, root_folder)
     print(f"      {len(vms)} VMs found")
 
     print(f"[3/8] Host hardware + quickStats...")
-    host_info = get_host_info(sess, vcenter, pc_ref, root_folder)
+    host_list = get_all_hosts(sess, vcenter, pc_ref, root_folder)
+    host_info = host_list[0] if host_list else {}
     host_name = host_info.get('Name', vcenter)
-    print(f"      Host: {host_name}  Model: {host_info.get('Model','')}  "
+    print(f"      {len(host_list)} host(s). Primary: {host_name}  Model: {host_info.get('Model','')}  "
           f"CPU: {host_info.get('CPUUsagePct',0):.1f}%  Mem: {host_info.get('MemUsagePct',0):.1f}%")
 
     print(f"[4/8] Datastores...")
@@ -727,7 +798,7 @@ def run(vcenter, username, password, days=90, output_dir='.'):
             continue
         print(f"  {vm['Name']} ({vm['MOID']})...", end='', flush=True)
         try:
-            perf = query_perf(sess, vcenter, perf_ref, vm['MOID'], 'VirtualMachine', counter_ids, days)
+            perf = query_perf(sess, vcenter, perf_ref, vm['MOID'], 'VirtualMachine', counter_ids, days, api_type)
             pts = sum(len(v) for v in perf.values())
             print(f" {pts} data pts")
         except Exception as e:
@@ -735,23 +806,21 @@ def run(vcenter, username, password, days=90, output_dir='.'):
             perf = {}
         vm_results.append(build_vm_output(vm, perf))
 
-    # Host-level perf (for IOPS/throughput P95 on host and cluster)
-    print(f"  Host {host_name} perf...", end='', flush=True)
-    try:
-        host_moid = ''
-        # Get host MOID from one of our HostSystem queries
-        host_rows = retrieve_all(sess, vcenter, pc_ref, root_folder, 'HostSystem', ['name'])
-        host_moid = host_rows[0]['_moid'] if host_rows else ''
-        host_perf = query_perf(sess, vcenter, perf_ref, host_moid, 'HostSystem', counter_ids, days) if host_moid else {}
-        host_iops = iops_vals(host_perf)
-        host_tp   = throughput_kbps_p95(host_perf)
-        host_info['IOPS_95th']    = p95(host_iops) or 0
-        host_info['DiskKBps_95th'] = host_tp or 0
-        cluster['IOPS_95th']     = host_info['IOPS_95th']
-        cluster['DiskKBps_95th'] = host_info['DiskKBps_95th']
-        print(f" IOPS P95={host_info['IOPS_95th']}  DiskKBps P95={host_info['DiskKBps_95th']}")
-    except Exception as e:
-        print(f" ERR: {e}")
+    # Per-host perf (IOPS/throughput P95) - every host in host_list, not just
+    # the first. host_info is host_list[0] by reference, so updating it here
+    # also updates the entry that ends up in host_list/ESXHosts.
+    print(f"  Host perf ({len(host_list)} host(s))...")
+    for h in host_list:
+        try:
+            h_perf = query_perf(sess, vcenter, perf_ref, h['MOID'], 'HostSystem',
+                                 counter_ids, days, api_type) if h.get('MOID') else {}
+            h['IOPS_95th']     = p95(iops_vals(h_perf)) or 0
+            h['DiskKBps_95th'] = throughput_kbps_p95(h_perf) or 0
+            print(f"    {h['Name']}: IOPS P95={h['IOPS_95th']}  DiskKBps P95={h['DiskKBps_95th']}")
+        except Exception as e:
+            print(f"    {h.get('Name','?')}: ERR: {e}")
+    cluster['IOPS_95th']     = host_info.get('IOPS_95th', 0)
+    cluster['DiskKBps_95th'] = host_info.get('DiskKBps_95th', 0)
 
     # Fill cluster storage from datastores
     if not cluster.get('CapacityMiB'):
@@ -768,11 +837,12 @@ def run(vcenter, username, password, days=90, output_dir='.'):
         "_source":      f"collect_vsphere_perf.py via pyVmomi + SOAP - {days} days",
         "Server":       vcenter,
         "Version":      host_info.get('Hypervisor', '') if isinstance(host_info, dict) else '',
-        "APIVersion":   host_info.get('Hypervisor', '') if isinstance(host_info, dict) else '',
+        "APIVersion":   api_version,
+        "APIType":      api_type,
         "CollectedAt":  datetime.now().isoformat(),
         "DurationDays": days,
         "Host":         host_info,
-        "ESXHosts":     [host_info] if host_info else [],
+        "ESXHosts":     host_list,
         "Cluster":      cluster,
         "VMs":          vm_results,
         "Datastores":   datastores,

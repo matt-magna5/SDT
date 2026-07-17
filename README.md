@@ -2,10 +2,10 @@
 
 PowerShell-based server and VM discovery tool for presales cloud migration scoping. Connects to Hyper-V, ESXi, and vCenter environments, runs deep per-server discovery, and generates a branded HTML report for client presentations and internal SE use.
 
-**Download and extract in one shot — paste this into PowerShell on the target machine:**
+**One-time install one-liner — paste this into PowerShell on the target machine:**
 
 ```powershell
-iwr https://github.com/matt-magna5/SDT/archive/refs/tags/v3.0.zip -OutFile C:\Temp\sdt.zip; Expand-Archive C:\Temp\sdt.zip C:\Temp -Force; cd C:\Temp\sdt-3.0
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; iwr https://raw.githubusercontent.com/matt-magna5/SDT/main/install.ps1 -UseBasicParsing | iex
 ```
 
 Then run `.\Start-DiscoverySession.ps1` — everything else is automatic.
@@ -161,10 +161,10 @@ All LOB app keywords are stored in `detection_rules.json` and can be extended wi
 
 ### What YOU do (3 things total)
 
-**1. Download to the jump box — paste this into PowerShell:**
+**1. Install to the jump box — paste this into PowerShell:**
 
 ```powershell
-iwr https://github.com/matt-magna5/SDT/archive/refs/tags/v3.0.zip -OutFile C:\Temp\sdt.zip; Expand-Archive C:\Temp\sdt.zip C:\Temp -Force; cd C:\Temp\sdt-3.0
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; iwr https://raw.githubusercontent.com/matt-magna5/SDT/main/install.ps1 -UseBasicParsing | iex
 ```
 
 **2. Launch:**

@@ -16,12 +16,12 @@
 
 ## What YOU do
 
-### Step 1 — Download to the jump box
+### Step 1 — Install to the jump box
 
 Paste this into PowerShell on the target machine:
 
 ```powershell
-iwr https://github.com/matt-magna5/SDT/archive/refs/tags/v3.0.zip -OutFile C:\Temp\sdt.zip; Expand-Archive C:\Temp\sdt.zip C:\Temp -Force; cd C:\Temp\sdt-3.0
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; iwr https://raw.githubusercontent.com/matt-magna5/SDT/main/install.ps1 -UseBasicParsing | iex
 ```
 
 ### Step 2 — Launch
