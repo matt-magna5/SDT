@@ -1,5 +1,36 @@
 {
   "_version": "1.0",
+  "gpo_synopsis": {
+    "_note": "Plain-English descriptions for the linked-GPO deep-dive (AD tab). categories: token -> sentence, matched against the tokens the collector emits per GPO. admx_hints: [substring, sentence] matched against ADMX category names (admx:<name> tokens); first match wins. Extend freely, no code changes.",
+    "categories": {
+      "drive_maps": "Maps network drives for users.",
+      "folder_redirection": "Redirects user profile folders (Documents, Desktop, AppData, etc.) to network locations.",
+      "printers": "Deploys printers to users or computers.",
+      "scripts": "Runs logon/logoff/startup/shutdown scripts.",
+      "software_install": "Installs or assigns MSI software packages.",
+      "security_options": "Configures Windows security options (SMB signing, UAC, LSA, interactive logon, etc.).",
+      "account_policy": "Sets password, account-lockout, and Kerberos policy.",
+      "admx": "Configures registry-based administrative template policies."
+    },
+    "admx_hints": [
+      ["chrome", "Configures Google Chrome browser policy."],
+      ["google update", "Configures Google Update behavior."],
+      ["google", "Configures Google product policy (Chrome / Update)."],
+      ["edge", "Configures Microsoft Edge browser policy."],
+      ["internet explorer", "Configures Internet Explorer policy."],
+      ["office", "Configures Microsoft Office application policy."],
+      ["onedrive", "Configures OneDrive sync policy."],
+      ["windows update", "Configures Windows Update behavior."],
+      ["defender", "Configures Microsoft Defender Antivirus policy."],
+      ["firewall", "Configures Windows Defender Firewall."],
+      ["bitlocker", "Configures BitLocker drive encryption."],
+      ["remote desktop", "Configures Remote Desktop / RDS settings."],
+      ["control panel", "Restricts or configures Control Panel."],
+      ["start menu", "Configures the Start menu and taskbar."],
+      ["network", "Configures network / connection policy."],
+      ["power management", "Configures power management settings."]
+    ]
+  },
   "_notes": [
     "SDT Detection Rules \u2014 edit freely, no Python knowledge required.",
     "All keyword matching is case-insensitive substring match.",

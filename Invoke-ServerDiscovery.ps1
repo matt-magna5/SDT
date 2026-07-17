@@ -1849,6 +1849,347 @@ ORDER BY data_size_mb DESC
         return ,$printers
     }
 
+    # -- PRINT SERVER (shared queues + access ACL + GPP deploy cross-ref) -------
+
+    # Scan SYSVOL for Group Policy Preference printer deployments. Returns a
+    # map of printer sharename/path/name -> deploying GPO display name. Any
+    # domain member can read \\<domain>\SYSVOL, so this works off a DC too.
+    function Get-GPPrinterDeployments {
+        $map = @{}
+        try {
+            $dom = $env:USERDNSDOMAIN
+            if (-not $dom) { return $map }
+            $polRoot = "\\$dom\SYSVOL\$dom\Policies"
+            if (-not (Test-Path $polRoot -ErrorAction SilentlyContinue)) { return $map }
+            # GUID -> display name (best effort; falls back to the raw GUID)
+            $nameCache = @{}
+            try {
+                if (Get-Command Get-GPO -ErrorAction SilentlyContinue) {
+                    foreach ($g in (Get-GPO -All -ErrorAction Stop)) {
+                        $nameCache[("{$($g.Id)}").ToUpper()] = [string]$g.DisplayName
+                    }
+                }
+            } catch { }
+            $xmlFiles = Get-ChildItem -Path $polRoot -Recurse -Filter 'Printers.xml' -ErrorAction SilentlyContinue
+            foreach ($xf in $xmlFiles) {
+                $guid = ''
+                if ($xf.FullName -match '\\Policies\\(\{[0-9A-Fa-f-]+\})\\') { $guid = $Matches[1].ToUpper() }
+                $gpoName = if ($guid -and $nameCache.ContainsKey($guid)) { $nameCache[$guid] } elseif ($guid) { $guid } else { '(unknown GPO)' }
+                try {
+                    [xml]$x = Get-Content -Path $xf.FullName -ErrorAction Stop
+                    foreach ($node in $x.SelectNodes("//*[local-name()='SharedPrinter' or local-name()='PortPrinter' or local-name()='LocalPrinter']")) {
+                        $props = $node.SelectSingleNode("*[local-name()='Properties']")
+                        $pPath = if ($props) { [string]$props.getAttribute('path') } else { '' }
+                        $pName = [string]$node.getAttribute('name')
+                        foreach ($key in @($pPath, $pName)) {
+                            if ($key) { $map[$key.ToLower().TrimStart('\')] = $gpoName }
+                        }
+                    }
+                } catch { }
+            }
+        } catch { cb-Log "PrintServer" "GPP scan error: $_" }
+        return $map
+    }
+
+    # Classify a printer's access from its security descriptor.
+    # Returns @{ Access='open'|'restricted'|'unknown'; Groups=@(named trustees) }.
+    # "open"  = Everyone / Authenticated Users can print.
+    # "restricted" = only named security group(s) hold Print rights.
+    function Get-PrinterAccessSummary {
+        param($Printer, [bool]$UseGetPrinter)
+        $out = @{ Access='unknown'; Groups=@() }
+        $openTrustees   = @('everyone','authenticated users','domain users','all application packages')
+        $ignoreTrustees = @('administrators','system','creator owner','print operators',
+                            'server operators','nt service\trustedinstaller','trustedinstaller',
+                            'nt authority\system','builtin\administrators')
+        $named = [System.Collections.ArrayList]@()
+        $sawOpen = $false
+        try {
+            $sddl = ''
+            if ($UseGetPrinter) {
+                try {
+                    $full = Get-Printer -Name $Printer.Name -Full -ErrorAction Stop
+                    $sddl = [string]$full.PermissionSDDL
+                } catch { cb-Log "PrintServer" "Get-Printer -Full failed for $($Printer.Name): $_" }
+            }
+            if ($sddl -and (Get-Command ConvertFrom-SddlString -ErrorAction SilentlyContinue)) {
+                # Namespace-agnostic parse: each DACL entry looks like
+                # "DOMAIN\Group: AccessAllowed (Print, ...)".
+                $parsed = ConvertFrom-SddlString -Sddl $sddl -ErrorAction Stop
+                foreach ($ace in @($parsed.DiscretionaryAcl)) {
+                    $acct = ([string]$ace -split ':')[0].Trim()
+                    $short = ($acct -replace '^.*\\','').Trim()
+                    $lc = $short.ToLower()
+                    $lcFull = $acct.ToLower()
+                    if ($openTrustees -contains $lc)   { $sawOpen = $true; continue }
+                    if ($ignoreTrustees -contains $lc -or $ignoreTrustees -contains $lcFull) { continue }
+                    if ($short -and ($named -notcontains $short)) { [void]$named.Add($short) }
+                }
+            } else {
+                # Legacy WMI path: GetSecurityDescriptor -> DACL trustees.
+                try {
+                    $sd = $null
+                    if ($PSMaj -ge 3) {
+                        $sd = (Invoke-CimMethod -InputObject $Printer -MethodName GetSecurityDescriptor -ErrorAction Stop).Descriptor
+                    } else {
+                        $sd = $Printer.GetSecurityDescriptor().Descriptor
+                    }
+                    foreach ($ace in @($sd.DACL)) {
+                        $t = $ace.Trustee
+                        if (-not $t) { continue }
+                        $short = [string]$t.Name
+                        if (-not $short) { continue }
+                        $lc = $short.ToLower()
+                        if ($openTrustees -contains $lc)   { $sawOpen = $true; continue }
+                        if ($ignoreTrustees -contains $lc) { continue }
+                        if ($named -notcontains $short) { [void]$named.Add($short) }
+                    }
+                } catch { cb-Log "PrintServer" "WMI SD read failed for $($Printer.Name): $_" }
+            }
+        } catch { cb-Log "PrintServer" "ACL parse error for $($Printer.Name): $_" }
+
+        $out.Groups = @($named)
+        if ($named.Count -gt 0) { $out.Access = 'restricted' }
+        elseif ($sawOpen)       { $out.Access = 'open' }
+        else                    { $out.Access = 'unknown' }
+        return $out
+    }
+
+    function Collect-PrintServer {
+        Write-Host "  [PrintServer] Enumerating shared print queues + ACLs..." -ForegroundColor Gray
+        $result = @{ IsPrintServer=$false; DetectedBy=''; Queues=@(); Partial=$false }
+        try {
+            # Role signal (non-fatal if Get-WindowsFeature absent, e.g. client OS)
+            $hasRole = $false
+            try {
+                $feat = Get-WindowsFeature -Name 'Print-Server' -ErrorAction SilentlyContinue
+                if ($feat -and $feat.Installed) { $hasRole = $true; $result.DetectedBy = 'Print-Server role' }
+            } catch { }
+
+            # Shared queues: prefer Get-Printer (2012+), fall back to WMI.
+            $shared = @()
+            $useGetPrinter = $false
+            if (Get-Command Get-Printer -ErrorAction SilentlyContinue) {
+                try {
+                    $useGetPrinter = $true
+                    $shared = @(Get-Printer -ErrorAction Stop | Where-Object { $_.Shared -eq $true })
+                } catch { cb-Log "PrintServer" "Get-Printer failed: $_"; $useGetPrinter = $false }
+            }
+            if (-not $useGetPrinter) {
+                $wmi = Safe-WmiQuery "SELECT * FROM Win32_Printer WHERE Shared=TRUE" "PrintServer"
+                if ($wmi) { $shared = @($wmi | Where-Object { $_.Name -notmatch 'Fax|PDF|XPS|OneNote' }) }
+            }
+
+            if (-not $hasRole -and $shared.Count -eq 0) { return $result }  # not a print server
+            if (-not $result.DetectedBy) { $result.DetectedBy = 'Shared queues + Spooler' }
+            $result.IsPrintServer = $true
+
+            $depMap = Get-GPPrinterDeployments
+
+            foreach ($p in $shared) {
+                $pName  = [string]$p.Name
+                $share  = [string]$p.ShareName
+                $driver = if ($useGetPrinter) { [string]$p.DriverName } else { [string]$p.DriverName }
+                $port   = if ($useGetPrinter) { [string]$p.PortName }   else { [string]$p.PortName }
+
+                $acc = Get-PrinterAccessSummary -Printer $p -UseGetPrinter $useGetPrinter
+
+                # Cross-reference GPP deployment by share name or UNC path.
+                $deployGpo = ''
+                $unc = if ($share) { "\\$env:COMPUTERNAME\$share" } else { '' }
+                foreach ($cand in @($share, $pName, $unc)) {
+                    if (-not $cand) { continue }
+                    $k = $cand.ToLower().TrimStart('\')
+                    if ($depMap.ContainsKey($k)) { $deployGpo = $depMap[$k]; break }
+                }
+
+                if ($acc.Access -eq 'restricted' -and $acc.Groups.Count -gt 0) {
+                    cb-Flag 'info' "Restricted printer: $pName" "Print access limited to: $($acc.Groups -join ', '). These groups must be recreated in Entra/Intune (Universal Print) during migration."
+                }
+
+                $result.Queues += @{
+                    Name        = $pName
+                    ShareName   = $share
+                    Driver      = $driver
+                    Port        = $port
+                    Access      = $acc.Access
+                    AccessGroups = @($acc.Groups)
+                    DeployedByGPO = $deployGpo
+                }
+            }
+        } catch { cb-Log "PrintServer" "Outer error: $_"; $result.Partial = $true }
+        return $result
+    }
+
+    # -- GROUP POLICY (linked GPOs only, deep-dive) ----------------------------
+
+    # Parse a GPO report XML into category tokens (for the English synopsis) and
+    # raw setting rows (for the expand view). Namespace-agnostic via local-name().
+    function Parse-GPOReport {
+        param([xml]$Report)
+        $cats = [System.Collections.ArrayList]@()
+        $raw  = [System.Collections.ArrayList]@()
+        $addCat = { param($t) if ($t -and ($cats -notcontains $t)) { [void]$cats.Add($t) } }
+        # Null-safe child-node text: returns '' when the node is absent so a
+        # missing element never aborts the whole parse.
+        $nodeText = {
+            param($node, $xpath)
+            try { $n = $node.SelectSingleNode($xpath); if ($n) { return [string]$n.InnerText } } catch { }
+            return ''
+        }
+        try {
+            # ADMX / registry-based administrative templates
+            $admxCats = @{}
+            foreach ($pol in $Report.SelectNodes("//*[local-name()='Policy']")) {
+                $nm  = & $nodeText $pol "*[local-name()='Name']"
+                $st  = & $nodeText $pol "*[local-name()='State']"
+                $cat = & $nodeText $pol "*[local-name()='Category']"
+                if ($nm) {
+                    & $addCat 'admx'
+                    if ($cat) { $admxCats[$cat] = $true }
+                    if ($raw.Count -lt 400) {
+                        [void]$raw.Add(@{ Area='Administrative Templates'; Category=$cat; Name=$nm; Setting=$st })
+                    }
+                }
+            }
+            foreach ($ac in $admxCats.Keys) { & $addCat ("admx:" + $ac) }
+
+            # Group Policy Preferences: drive maps
+            foreach ($d in $Report.SelectNodes("//*[local-name()='DriveMapSettings']//*[local-name()='Drive']")) {
+                & $addCat 'drive_maps'
+                if ($raw.Count -lt 400) {
+                    $pr = $d.SelectSingleNode("*[local-name()='Properties']")
+                    $letter = if ($pr) { [string]$pr.getAttribute('letter') } else { '' }
+                    $path   = if ($pr) { [string]$pr.getAttribute('path') } else { '' }
+                    [void]$raw.Add(@{ Area='Drive Maps'; Category=''; Name=$letter; Setting=$path })
+                }
+            }
+
+            # Folder redirection
+            foreach ($f in $Report.SelectNodes("//*[local-name()='Folder' and ancestor::*[local-name()='FolderRedirection']]")) {
+                & $addCat 'folder_redirection'
+                if ($raw.Count -lt 400) {
+                    $id = [string]$f.getAttribute('Id')
+                    $loc = & $nodeText $f ".//*[local-name()='DestinationPath']"
+                    [void]$raw.Add(@{ Area='Folder Redirection'; Category=''; Name=$id; Setting=$loc })
+                }
+            }
+
+            # Printer deployment (inside a GPO)
+            foreach ($p in $Report.SelectNodes("//*[local-name()='SharedPrinter' or local-name()='PortPrinter']")) {
+                & $addCat 'printers'
+                if ($raw.Count -lt 400) {
+                    [void]$raw.Add(@{ Area='Printer Deployment'; Category=''; Name=[string]$p.getAttribute('name'); Setting='' })
+                }
+            }
+
+            # Scripts (logon/logoff/startup/shutdown)
+            foreach ($s in $Report.SelectNodes("//*[local-name()='Script']")) {
+                & $addCat 'scripts'
+                if ($raw.Count -lt 400) {
+                    $cmd = & $nodeText $s "*[local-name()='Command']"
+                    [void]$raw.Add(@{ Area='Scripts'; Category=''; Name=$cmd; Setting='' })
+                }
+            }
+
+            # Software installation (assigned/published MSI)
+            foreach ($m in $Report.SelectNodes("//*[local-name()='MsiApplication']")) {
+                & $addCat 'software_install'
+                if ($raw.Count -lt 400) {
+                    $nm = & $nodeText $m "*[local-name()='Name']"
+                    [void]$raw.Add(@{ Area='Software Installation'; Category=''; Name=$nm; Setting='' })
+                }
+            }
+
+            # Security options + account/password policy
+            if ($Report.SelectNodes("//*[local-name()='SecurityOptions']").Count -gt 0) { & $addCat 'security_options' }
+            if ($Report.SelectNodes("//*[local-name()='Account']").Count -gt 0)         { & $addCat 'account_policy' }
+            foreach ($so in $Report.SelectNodes("//*[local-name()='SecurityOptions']")) {
+                if ($raw.Count -lt 400) {
+                    $kn = & $nodeText $so "*[local-name()='KeyName']"
+                    $dn = & $nodeText $so "*[local-name()='Display']/*[local-name()='Name']"
+                    $soName = if ($dn) { $dn } else { $kn }
+                    [void]$raw.Add(@{ Area='Security Options'; Category=''; Name=$soName; Setting='' })
+                }
+            }
+            foreach ($ac in $Report.SelectNodes("//*[local-name()='Account']")) {
+                if ($raw.Count -lt 400) {
+                    $nm = [string]$ac.getAttribute('Name')
+                    $st = & $nodeText $ac "*[local-name()='SettingNumber']"
+                    [void]$raw.Add(@{ Area='Account Policy'; Category=''; Name=$nm; Setting=$st })
+                }
+            }
+        } catch { cb-Log "GPO" "Report parse error: $_" }
+        return @{ Categories = @($cats); Raw = @($raw) }
+    }
+
+    function Collect-GPODetails {
+        Write-Host "  [GPO] Enumerating linked GPOs..." -ForegroundColor Gray
+        $result = @{ Available=$false; TotalCount=0; LinkedCount=0; GPOs=@(); Partial=$false }
+        try {
+            if (-not (Get-Command Get-GPO -ErrorAction SilentlyContinue)) {
+                try { Import-Module GroupPolicy -ErrorAction Stop }
+                catch { cb-Log "GPO" "GroupPolicy module unavailable - skipping"; return $result }
+            }
+            $result.Available = $true
+            $all = @(Get-GPO -All -ErrorAction Stop)
+            $result.TotalCount = $all.Count
+
+            # Build GUID -> [links] by walking domain root + every OU (and sites).
+            $linkMap = @{}
+            $addLinks = {
+                param($targetDN)
+                try {
+                    $inh = Get-GPInheritance -Target $targetDN -ErrorAction Stop
+                    foreach ($lnk in $inh.GpoLinks) {
+                        $id = ("{$($lnk.GpoId)}").ToUpper()
+                        if (-not $linkMap.ContainsKey($id)) { $linkMap[$id] = [System.Collections.ArrayList]@() }
+                        [void]$linkMap[$id].Add(@{
+                            Target   = [string]$targetDN
+                            Enabled  = [bool]$lnk.Enabled
+                            Enforced = [bool]$lnk.Enforced
+                            Order    = [int]$lnk.Order
+                        })
+                    }
+                } catch { }
+            }
+            try {
+                $dom = Get-ADDomain -ErrorAction Stop
+                & $addLinks $dom.DistinguishedName
+                foreach ($ou in (Get-ADOrganizationalUnit -Filter * -ErrorAction Stop)) {
+                    & $addLinks $ou.DistinguishedName
+                }
+            } catch { cb-Log "GPO" "OU enumeration failed (need AD module on a DC): $_"; $result.Partial = $true }
+
+            $result.LinkedCount = $linkMap.Keys.Count
+
+            foreach ($g in $all) {
+                $gid = ("{$($g.Id)}").ToUpper()
+                if (-not $linkMap.ContainsKey($gid)) { continue }   # skip UNLINKED GPOs entirely
+                $links = @($linkMap[$gid] | ForEach-Object {
+                    @{ Target=$_.Target; Enabled=$_.Enabled; Enforced=$_.Enforced }
+                })
+                $cats = @(); $raw = @()
+                try {
+                    [xml]$rpt = Get-GPOReport -Guid $g.Id -ReportType Xml -ErrorAction Stop
+                    $parsed = Parse-GPOReport -Report $rpt
+                    $cats = $parsed.Categories
+                    $raw  = $parsed.Raw
+                } catch { cb-Log "GPO" "Report failed for $($g.DisplayName): $_" }
+
+                $result.GPOs += @{
+                    Name        = [string]$g.DisplayName
+                    Id          = $gid
+                    Status      = [string]$g.GpoStatus
+                    Links       = $links
+                    Categories  = $cats
+                    RawSettings = $raw
+                }
+            }
+        } catch { cb-Log "GPO" "Outer error: $_"; $result.Partial = $true }
+        return $result
+    }
+
     # -- ASSEMBLE & RETURN -----------------------------------------------------
 
     $Discovery = [ordered]@{
@@ -1876,6 +2217,8 @@ ORDER BY data_size_mb DESC
         Services   = Collect-Services
         EventLog   = Collect-EventLogSummary
         Printers   = Collect-Printers
+        PrintServer = Collect-PrintServer
+        GPO        = Collect-GPODetails
         Flags      = $cbFlags
         Errors     = $cbErrors
     }
@@ -1895,6 +2238,8 @@ ORDER BY data_size_mb DESC
         'Exchange' = @('DatabaseSizes')
         'HyperV'   = @('VMs','VirtualSwitches')
         'EventLog' = @('TopSources','RecentCritical')
+        'PrintServer' = @('Queues')
+        'GPO'      = @('GPOs')
     }
     foreach ($section in $arrayFields.Keys) {
         $sec = $Discovery[$section]

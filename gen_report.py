@@ -2404,7 +2404,198 @@ def build_ad_tab():
     else:
         out += '<div class="flag-info"><div class="flag-label">No business shares detected</div><div class="flag-detail">No non-admin SMB shares were detected on any in-scope server.</div></div>'
 
+    # -- Print-server printers (shared queues + access + deploying GPO) --------
+    out += render_printers_section()
+
+    # -- Group Policy (linked GPOs only, deep-dive) ---------------------------
+    out += render_gpo_section()
+
     out += '</div>'  # close padding wrapper
+    return out
+
+
+def _gpo_synopsis(categories):
+    """Turn the collector's category tokens into a plain-English synopsis using
+    the gpo_synopsis rules in detection_rules.json. Falls back gracefully."""
+    syn = RULES.get('gpo_synopsis', {}) or {}
+    cat_map    = syn.get('categories', {}) or {}
+    admx_hints = syn.get('admx_hints', []) or []
+    cats = [str(t) for t in (categories or [])]
+    # If any named ADMX area is present, suppress the generic 'admx' catch-all
+    # regardless of token order (the collector emits 'admx' before 'admx:<name>').
+    has_named_admx = any(t.startswith('admx:') for t in cats)
+    sentences = []
+    for tok in cats:
+        if tok.startswith('admx:'):
+            name = tok[5:]
+            matched = None
+            for pair in admx_hints:
+                if isinstance(pair, list) and len(pair) == 2 and pair[0].lower() in name.lower():
+                    matched = pair[1]; break
+            s = matched or f'Configures {name} (administrative template).'
+            if s not in sentences:
+                sentences.append(s)
+        elif tok in cat_map:
+            if tok == 'admx' and has_named_admx:
+                continue
+            s = cat_map[tok]
+            if s not in sentences:
+                sentences.append(s)
+    if not sentences:
+        return 'No recognized settings categories (expand for raw settings).'
+    return ' '.join(sentences)
+
+
+def render_printers_section():
+    """Print-server printers: shared queues, print-access flag (open vs named
+    security group), and the deploying GPO (if any). Auto-detected print
+    servers only."""
+    print_servers = []  # [(server_name, queues[])]
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d = srv.get('data', {}) or {}
+        ps = d.get('PrintServer')
+        if isinstance(ps, dict) and ps.get('IsPrintServer'):
+            queues = ps.get('Queues') if isinstance(ps.get('Queues'), list) else []
+            if queues:
+                print_servers.append((srv.get('name',''), queues))
+
+    out = '<div class="sub-title" style="margin-top:28px;">Print Server Queues</div>\n'
+    if not print_servers:
+        out += ('<div class="flag-info"><div class="flag-label">No print servers detected</div>'
+                '<div class="flag-detail">No in-scope server reported the Print Server role with shared queues. '
+                'If a print server exists, ensure it was in the discovery target list and WinRM reached it.</div></div>')
+        return out
+
+    total_q = sum(len(q) for _, q in print_servers)
+    restricted_n = sum(1 for _, qs in print_servers for q in qs if str(q.get('Access')) == 'restricted')
+    out += (f'<div style="font-size:8.5pt;color:#6b6080;margin-bottom:8px;">'
+            f'{total_q} shared queue(s) across {len(print_servers)} print server(s). '
+            f'{restricted_n} restricted to named security group(s) &mdash; these groups must be recreated in '
+            f'Entra ID / Universal Print during migration.</div>')
+    out += ('<table style="width:100%;"><tr>'
+            '<th>Printer</th><th>Print Server</th><th>Share</th><th>Access</th>'
+            '<th>Deployed By GPO</th></tr>')
+    ridx = 0
+    for nm, queues in print_servers:
+        for q in queues:
+            access = str(q.get('Access','unknown'))
+            groups = q.get('AccessGroups') if isinstance(q.get('AccessGroups'), list) else []
+            if access == 'open':
+                acc_html = '<span class="pill pill-green">Everyone / Authenticated Users</span>'
+            elif access == 'restricted':
+                gl = ', '.join(h(str(g)) for g in groups) if groups else 'named group'
+                acc_html = f'<span class="pill pill-yellow">Restricted</span> <span style="font-size:8.5pt;color:#271e41;">{gl}</span>'
+            else:
+                acc_html = '<span class="pill pill-gray">Unknown</span>'
+            gpo = q.get('DeployedByGPO','') or ''
+            gpo_html = f'<span class="pill pill-purple">{h(str(gpo))}</span>' if gpo else '<span style="color:#6b6080;font-size:8.5pt;">not GPO-deployed</span>'
+            bg = ' style="background:#f5f4f8"' if ridx % 2 else ''
+            out += (f'<tr{bg}><td><strong>{h(str(q.get("Name","")))}</strong></td>'
+                    f'<td>{h(nm)}</td>'
+                    f'<td style="font-family:monospace;font-size:8.5pt">{h(str(q.get("ShareName","") or ""))}</td>'
+                    f'<td>{acc_html}</td>'
+                    f'<td>{gpo_html}</td></tr>')
+            ridx += 1
+    out += '</table>'
+    return out
+
+
+def render_gpo_section():
+    """Linked GPOs only. Each: name + where-applied + plain-English synopsis,
+    collapsed by default; expand for the raw settings."""
+    gpos = {}       # id -> gpo dict (deduped across DCs)
+    total_seen = 0
+    linked_seen = 0
+    any_dc = False
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d = srv.get('data', {}) or {}
+        g = d.get('GPO')
+        if not isinstance(g, dict) or not g.get('Available'):
+            continue
+        any_dc = True
+        total_seen  = max(total_seen,  int(g.get('TotalCount',  0) or 0))
+        linked_seen = max(linked_seen, int(g.get('LinkedCount', 0) or 0))
+        for gp in (g.get('GPOs') or []):
+            if isinstance(gp, dict) and gp.get('Id'):
+                gpos.setdefault(str(gp['Id']), gp)
+
+    out = '<div class="sub-title" style="margin-top:28px;">Group Policy (Linked GPOs)</div>\n'
+    if not any_dc:
+        out += ('<div class="flag-info"><div class="flag-label">No GPO data collected</div>'
+                '<div class="flag-detail">GPO deep-dive requires the GroupPolicy + ActiveDirectory modules on a '
+                'reachable Domain Controller. Re-run discovery with a DC in scope and domain admin credentials.</div></div>')
+        return out
+
+    gpo_list = list(gpos.values())
+    gpo_list.sort(key=lambda x: str(x.get('Name','')).lower())
+    unlinked = max(0, total_seen - len(gpo_list))
+    out += (f'<div style="font-size:8.5pt;color:#6b6080;margin-bottom:10px;">'
+            f'{len(gpo_list)} linked GPO(s) shown. Unlinked GPOs ({unlinked} of {total_seen} total) are omitted '
+            f'&mdash; only policies actually applied somewhere matter for migration. Click a GPO to expand its raw settings.</div>')
+
+    def _target_pretty(dn):
+        dn = str(dn or '')
+        if dn.upper().startswith('DC='):
+            return '(Domain root) ' + '.'.join(p.split('=')[1] for p in dn.split(',') if p.upper().startswith('DC='))
+        # OU=Sales,OU=US,DC=... -> Sales > US
+        ous = [p.split('=',1)[1] for p in dn.split(',') if p.upper().startswith('OU=')]
+        return ' > '.join(reversed(ous)) if ous else dn
+
+    for gp in gpo_list:
+        name = str(gp.get('Name',''))
+        synopsis = _gpo_synopsis(gp.get('Categories'))
+        links = gp.get('Links') if isinstance(gp.get('Links'), list) else []
+        link_pills = ''
+        for lk in links[:12]:
+            tgt = _target_pretty(lk.get('Target'))
+            enf = ' &bull; enforced' if lk.get('Enforced') else ''
+            dis = '' if lk.get('Enabled', True) else ' (link disabled)'
+            cls = 'pill-purple' if lk.get('Enabled', True) else 'pill-gray'
+            link_pills += f'<span class="pill {cls}" style="margin:2px 4px 2px 0;">{h(tgt)}{enf}{dis}</span>'
+        if not link_pills:
+            link_pills = '<span style="color:#6b6080;font-size:8.5pt;">linked (target detail unavailable)</span>'
+
+        raw = gp.get('RawSettings') if isinstance(gp.get('RawSettings'), list) else []
+        # Raw settings table (inside the expand)
+        if raw:
+            raw_rows = ''
+            for i, r in enumerate(raw):
+                if not isinstance(r, dict): continue
+                bg = ' style="background:#faf9fc"' if i % 2 else ''
+                raw_rows += (f'<tr{bg}><td style="font-size:8pt;color:#6b6080;">{h(str(r.get("Area","")))}</td>'
+                             f'<td style="font-size:8pt;">{h(str(r.get("Category","") or ""))}</td>'
+                             f'<td style="font-size:8pt;"><strong>{h(str(r.get("Name","")))}</strong></td>'
+                             f'<td style="font-size:8pt;font-family:monospace;">{h(str(r.get("Setting","") or ""))}</td></tr>')
+            raw_html = ('<table style="width:100%;margin-top:8px;"><tr>'
+                        '<th>Area</th><th>Category</th><th>Setting</th><th>Value / State</th></tr>'
+                        f'{raw_rows}</table>')
+            if len(raw) >= 400:
+                raw_html += '<div style="font-size:8pt;color:#6b6080;margin-top:4px;">(raw settings capped at 400 rows)</div>'
+        else:
+            raw_html = ('<div style="font-size:8.5pt;color:#6b6080;margin-top:8px;">No individual settings parsed. '
+                        'The GPO may configure areas SDT does not yet itemize &mdash; review it directly in GPMC.</div>')
+
+        status = str(gp.get('Status',''))
+        status_note = ''
+        if 'AllSettingsDisabled' in status:
+            status_note = ' <span class="pill pill-gray">all settings disabled</span>'
+        elif 'UserSettingsDisabled' in status:
+            status_note = ' <span class="pill pill-gray">user half disabled</span>'
+        elif 'ComputerSettingsDisabled' in status:
+            status_note = ' <span class="pill pill-gray">computer half disabled</span>'
+
+        out += (
+            '<details style="border:1px solid #e5e1ee;border-radius:6px;margin-bottom:8px;padding:0;">'
+            '<summary style="cursor:pointer;padding:10px 12px;list-style:none;">'
+            f'<span style="font-weight:600;color:#271e41;">{h(name)}</span>{status_note}'
+            f'<div style="font-size:8.5pt;color:#5b4a78;margin-top:3px;">{h(synopsis)}</div>'
+            f'<div style="margin-top:6px;">{link_pills}</div>'
+            '</summary>'
+            f'<div style="padding:4px 12px 12px 12px;border-top:1px solid #efecf6;">{raw_html}</div>'
+            '</details>'
+        )
     return out
 
 

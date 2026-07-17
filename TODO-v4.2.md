@@ -72,21 +72,77 @@ Captured during the 2026-05-19/20 FBA assessment + HTML report redesign discussi
       a second domain\user/password pair on Setup, or (c) auto-detect
       target's domain via DNS and prompt for matching creds.
 
-## GPO deep-dive before Entra migration (flagged 2026-07-17, needs more review before speccing)
-- [ ] Matt wants GPO content reviewed in more depth pre-Entra-migration, not just a
-      count/inventory — the concern is settings with no Entra ID/Intune equivalent
-      getting silently dropped when on-prem DCs are decommissioned.
-- [ ] Candidate approach: `Invoke-ServerDiscovery.ps1` already touches AD (FSMO,
-      user/computer/OU counts) — extend to pull full GPO report (`Get-GPOReport`
-      -ReportType XML per GPO, or `Get-GPResultantSetOfPolicy`) and surface
-      settings by category (drive maps, printer deployment, folder redirection,
-      software install, security/password policy, logon scripts) so each can be
-      matched to an Entra/Intune equivalent or flagged as a gap.
-- [ ] Matt said he needs to review this more before it's fully spec'd — don't
-      build ahead of him; this entry is just to not lose the ask.
-- [ ] Related: also flag Windows 10/11 **Home** edition workstations during
-      discovery (Home can't Entra-join/Intune-enroll at all) — SDT already
-      collects `Win32_OperatingSystem.Caption` per server/workstation
+## GPO deep-dive before Entra migration (flagged 2026-07-17, spec'd 2026-07-17)
+
+Motivation: pre-Entra-migration, need GPO content reviewed in depth, not just a
+count/inventory — the concern is settings with no Entra ID/Intune equivalent
+getting silently dropped when on-prem DCs are decommissioned.
+
+### A. Print-server printers (new report section) — DECIDED 2026-07-17
+- [ ] PRIMARY TARGET: live, connected print queues actually hosted on a
+      **print server** — the real shared queues, not the general per-server
+      installed-printers list that already exists.
+- [ ] **Print server identification: auto-detect by role** — scan discovery
+      targets for the Print Server role / running Spooler with shared queues,
+      pull printers from those automatically. No extra SE prompt.
+- [ ] **Scope: shared/published queues only** — only queues actually shared
+      out to clients. Skip local/non-shared/orphaned queues.
+- [ ] **Access flag = queue Print permission (security ACL).** Read each
+      printer's security descriptor. If a **named security group** holds
+      `Print` rights (anything other than Everyone / Authenticated Users),
+      flag **restricted** and show the group name. Everyone / Authenticated
+      Users only = **open**. The queue ACL is the true access gate (not the
+      SMB share permission).
+- [ ] **Cross-reference GPO deployment: YES** — match each live queue against
+      GPP `Printers.xml` / Deployed Printers and show the deploying GPO next
+      to it (if any), for the Entra-migration mapping.
+- [ ] Clean output only — printer → print server → access flag → deploying
+      GPO. No raw ACL/XML dump in the default view.
+- [ ] Collection: `Get-Printer` (Shared eq true) + `Get-Printer | Get-Acl`
+      (or `Get-PrinterProperty` / Win32_Printer security descriptor) on each
+      auto-detected print server via the existing WinRM path in
+      Invoke-ServerDiscovery.ps1.
+
+### B. GPO applied inventory (new report section)
+- [ ] Only GPOs that are actually **linked** somewhere — unlinked/orphaned
+      GPOs are skipped entirely (don't care about those).
+- [ ] Per linked GPO, show: name, where it's linked (OU/domain/site path),
+      and a plain-English one-line synopsis of what it does (e.g. "Configures
+      Chrome — disables X, enforces Y").
+- [ ] UI: **collapsed by default** — just name + synopsis + applied-to.
+      **Expand** to reveal the raw GPO settings (actual registry.pol values,
+      true/false, full policy paths) for anyone who needs the specifics.
+- [ ] The English-synopsis needs a mapping layer from known GPO setting
+      categories (drive maps, printer deployment, folder redirection,
+      software install, security/password policy, logon scripts, Chrome/
+      browser ADMX, etc.) to a plain-language description — likely a
+      config-driven rule table in the `detection_rules.json` style rather
+      than hardcoded Python, so it's extensible without code changes.
+- [ ] Longer-term goal (not v1): match each surfaced setting to an Entra
+      ID/Intune equivalent, or flag it as a migration gap.
+
+### Build decisions — DECIDED 2026-07-17
+- [ ] **Build blind** — no live test domain available; write against documented
+      schema, syntax-check only, validate at next real engagement.
+- [ ] **Synopsis depth: known categories only** — map common categories (drive
+      maps, folder redirection, password/security policy, software install,
+      browser ADMX, logon scripts, printer deployment) to English; unknown
+      settings show raw-only. Extensible via detection_rules.json.
+- [ ] **Report placement: nested under the existing AD tab** as subsections
+      (not new top-level tabs).
+- [ ] **v1 scope: full vertical slice** — collector + detection_rules mapping
+      + report UI together, even though unverified against live data.
+
+### Implementation notes
+- [ ] `Invoke-ServerDiscovery.ps1` already touches AD (FSMO, user/computer/OU
+      counts) — extend to pull full GPO data (`Get-GPO -All`,
+      `Get-GPOReport -ReportType Xml` per linked GPO, `Get-GPInheritance`
+      per OU) rather than just counts.
+
+### Related
+- [ ] Also flag Windows 10/11 **Home** edition workstations during discovery
+      (Home can't Entra-join/Intune-enroll at all) — SDT already collects
+      `Win32_OperatingSystem.Caption` per server/workstation
       (Invoke-ServerDiscovery.ps1 ~line 596), just needs a `cb-Flag 'warning'`
       when Caption contains "Home".
 
