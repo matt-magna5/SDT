@@ -912,9 +912,12 @@ $CollectionBlock = {
                 $result.RIDMaster       = [string]$domain.RIDMaster
                 $result.SchemaMaster    = [string]$forest.SchemaMaster
             } catch { }
-            try { $result.UserCount     = (Get-ADUser     -Filter * -ErrorAction Stop).Count              } catch { }
-            try { $result.ComputerCount = (Get-ADComputer -Filter * -ErrorAction Stop).Count              } catch { }
-            try { $result.OUCount       = (Get-ADOrganizationalUnit -Filter * -ErrorAction Stop).Count    } catch { }
+            # Force array + [int] so the count is always a plain integer. A bare
+            # .Count on a scalar/AD result can serialize as an ADPropertyValueCollection
+            # object (renders as the .NET type name in the report) instead of a number.
+            try { $result.UserCount     = [int]@(Get-ADUser              -Filter * -ErrorAction Stop).Count } catch { }
+            try { $result.ComputerCount = [int]@(Get-ADComputer          -Filter * -ErrorAction Stop).Count } catch { }
+            try { $result.OUCount       = [int]@(Get-ADOrganizationalUnit -Filter * -ErrorAction Stop).Count } catch { }
             # Stale accounts (90 days inactive). CRITICAL: convert each result to
             # a plain hashtable BEFORE it enters $result. AD module returns .NET
             # types with PSParameterizedProperty indexer members that break JSON.

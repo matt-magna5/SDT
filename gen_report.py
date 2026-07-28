@@ -193,6 +193,28 @@ def _sql_year(ver, edition=''):
     ym = re.search(r'(20\d\d)', str(edition or ''))
     return f'SQL Server {ym.group(1)}' if ym else ''
 
+def _ad_count(val, default='-'):
+    """Sanitize an AD count stat for display. Older discovery runs sometimes
+    stored a stringified .NET object (e.g.
+    'Microsoft.ActiveDirectory.Management.ADPropertyValueCollection') instead
+    of an integer; render those as the fallback rather than leaking the type
+    name into the report."""
+    if isinstance(val, bool):
+        return default
+    if isinstance(val, int):
+        return str(val)
+    if isinstance(val, (list, tuple)):
+        return str(len(val))
+    s = str(val or '').strip()
+    if not s:
+        return default
+    if s.isdigit():
+        return s
+    # Anything that looks like a .NET type / object dump is unusable.
+    if ('.' in s and any(tok in s for tok in ('Microsoft.', 'System.', 'ADProperty', 'Collection'))):
+        return default
+    return s if len(s) <= 12 else default
+
 def as_list(v):
     if isinstance(v, dict): return [v]
     if isinstance(v, list):
@@ -1214,9 +1236,9 @@ def build_server_tab(srv):
         fl_d = str(ad.get('DomainFL', '')); fl_f = str(ad.get('ForestFL', ''))
         fy_d = (re.search(r'20\d\d', fl_d) or type('', (), {'group': lambda s,n: ''})()).group(0)
         fy_f = (re.search(r'20\d\d', fl_f) or type('', (), {'group': lambda s,n: ''})()).group(0)
-        uc = str(ad.get('UserCount', '') or '-')
-        cc = str(ad.get('ComputerCount', '') or '-')
-        ou = str(ad.get('OUCount', '') or '-')
+        uc = _ad_count(ad.get('UserCount'))
+        cc = _ad_count(ad.get('ComputerCount'))
+        ou = _ad_count(ad.get('OUCount'))
         pdce = ad.get('PDCEmulator', '')
         ridf = ad.get('RIDMaster', '')
         schema_m = ad.get('SchemaMaster', '')
@@ -2327,9 +2349,9 @@ def build_ad_tab():
     forest = _dn_to_fqdn(domain_info.get('ForestName', '') or domain_info.get('DomainName', ''))
     fl_d   = str(domain_info.get('DomainFL', '') or '')
     fl_f   = str(domain_info.get('ForestFL', '') or '')
-    uc     = domain_info.get('UserCount', '-')
-    cc     = domain_info.get('ComputerCount', '-')
-    ou     = domain_info.get('OUCount', '-')
+    uc     = _ad_count(domain_info.get('UserCount'))
+    cc     = _ad_count(domain_info.get('ComputerCount'))
+    ou     = _ad_count(domain_info.get('OUCount'))
 
     # Detect partial data — typically means DC WinRM failed and AD info came
     # from a domain-joined member server (limited AD query rights)
