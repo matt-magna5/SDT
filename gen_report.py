@@ -173,6 +173,26 @@ if LOGO_FILE and os.path.exists(LOGO_FILE):
 def h(s):
     return htmlmod.escape(str(s)) if s is not None else ''
 
+def _sql_year(ver, edition=''):
+    """Map a SQL Server version string (e.g. '12.0.6024.0') to its marketing
+    release name ('SQL Server 2014'). Falls back to any year already present in
+    the edition string, else ''. Keeps the SE from having to memorize the
+    internal major-version-to-year table."""
+    year_map = {
+        '16': 'SQL Server 2022', '15': 'SQL Server 2019', '14': 'SQL Server 2017',
+        '13': 'SQL Server 2016', '12': 'SQL Server 2014', '11': 'SQL Server 2012',
+        '9':  'SQL Server 2005', '8':  'SQL Server 2000',
+    }
+    m = re.match(r'\s*(\d+)\.(\d+)', str(ver or ''))
+    if m:
+        major, minor = m.group(1), m.group(2)
+        if major == '10':
+            return 'SQL Server 2008 R2' if minor == '50' else 'SQL Server 2008'
+        if major in year_map:
+            return year_map[major]
+    ym = re.search(r'(20\d\d)', str(edition or ''))
+    return f'SQL Server {ym.group(1)}' if ym else ''
+
 def as_list(v):
     if isinstance(v, dict): return [v]
     if isinstance(v, list):
@@ -1416,9 +1436,12 @@ def build_server_tab(srv):
                    f'<div class="flag-label">&#9888; SQL Server EOL / Near-EOL - Upgrade Required</div>'
                    f'<div class="flag-detail">{h(sql_edition)} reaches end of support {h(sql_eol_date)}. '
                    f'<strong>Not supported on Windows Server 2022.</strong> Must upgrade SQL to 2017+ before OS upgrade.</div></div>\n')
+        sql_release = _sql_year(sql_ver, sql_edition)
         rc += '<table><tr><th style="width:200px">Property</th><th>Value</th></tr>\n'
         rc += f'<tr><td><strong>Edition</strong></td><td>{h(sql_edition)}</td></tr>\n'
-        rc += f'<tr style="background:#f5f4f8"><td><strong>Version</strong></td><td><code>{h(sql_ver)}</code></td></tr>\n'
+        if sql_release:
+            rc += f'<tr style="background:#f5f4f8"><td><strong>Release</strong></td><td><strong>{h(sql_release)}</strong></td></tr>\n'
+        rc += f'<tr><td><strong>Version</strong></td><td><code>{h(sql_ver)}</code></td></tr>\n'
         rc += f'<tr><td><strong>Instance Name</strong></td><td><code>{h(sql_inst_name)}</code></td></tr>\n'
         rc += f'<tr style="background:#f5f4f8"><td><strong>EOL Date</strong></td><td>{h(sql_eol_date)} &nbsp;{pill(sql_eol_status or "Unknown", sql_eol_c)}</td></tr>\n'
         rc += f'<tr><td><strong>Service Account</strong></td><td><code>{h(sql_svc_acct)}</code></td></tr>\n'
@@ -1970,7 +1993,8 @@ def build_sql_tab():
                  f'<div style="font-size:9pt;color:#6b6080;margin-top:2px;">{h(s["ip"])}</div></div>\n'
                  f'<div style="text-align:right;">'
                  f'<div style="font-size:9pt;font-weight:700;color:#5b1fa4;">{h(ed)}</div>'
-                 f'<div style="font-size:8.5pt;color:#6b6080;">v{h(ver)} &middot; EOL {h(eol)} '
+                 + (f'<div style="font-size:9pt;font-weight:700;color:#271e41;">{h(_sql_year(ver, ed))}</div>' if _sql_year(ver, ed) else '')
+                 + f'<div style="font-size:8.5pt;color:#6b6080;">v{h(ver)} &middot; EOL {h(eol)} '
                  f'<span class="pill pill-{eol_color}" style="font-size:7.5pt;">{h(eol_s) or "-"}</span></div>'
                  f'<div style="font-size:8.5pt;color:#6b6080;margin-top:4px;">Service: {h(svc)}</div>'
                  f'</div></div>\n'
@@ -2028,8 +2052,15 @@ def build_eol_tab():
                 label_bits.append(plevel)
             if ver:
                 label_bits.append(ver)
+            label_str = ' '.join(label_bits)
+            # Ensure the marketing release year is present even when discovery
+            # only captured an internal version number.
+            if not re.search(r'20\d\d', label_str):
+                _yr = _sql_year(ver, sku)
+                if _yr:
+                    label_str = f'{_yr} ({label_str})' if label_str else _yr
             _eol_row(name, 'SQL Server',
-                     ' '.join(label_bits),
+                     label_str,
                      sql_inst.get('EOLDate', ''), sql_inst.get('EOLStatus', ''))
         # Exchange
         exch = d.get('Exchange', {})
