@@ -575,14 +575,139 @@ switch -Regex (`$Mode) {
         return
     }
     '^(uninstall|remove)$' {
-        `$path = Split-Path `$AppDir -Parent
-        Write-Host "Removing `$path ..." -ForegroundColor Yellow
-        Remove-Item `$path -Recurse -Force -EA 0
-        # Clean PATH
-        `$userPath = [Environment]::GetEnvironmentVariable('Path','User')
-        `$new = (`$userPath -split ';') | Where-Object { `$_ -and `$_ -notmatch 'Magna5\\SDT\\bin' } | ForEach-Object { `$_ }
-        [Environment]::SetEnvironmentVariable('Path', (`$new -join ';'), 'User')
-        Write-Host "Uninstalled." -ForegroundColor Green
+        # Full removal with an explicit, itemized checklist so the SE can prove
+        # to a client that the jump box was returned to its original state.
+        # 'sdt uninstall -y' / '-force' skips the confirmation prompt.
+        `$force = @(`$Rest) -match '^-{0,2}(y|yes|f|force)`$'
+        `$root  = Split-Path `$AppDir -Parent
+
+        function _Step(`$done, `$label, `$detail) {
+            `$mark = if (`$done) { '[x]' } else { '[ ]' }
+            `$col  = if (`$done) { 'Green' } else { 'DarkGray' }
+            Write-Host ("  {0} {1}" -f `$mark, `$label) -ForegroundColor `$col
+            if (`$detail) { Write-Host ("      {0}" -f `$detail) -ForegroundColor DarkGray }
+        }
+
+        Write-Host ""
+        Write-Host "  SDT UNINSTALL" -ForegroundColor Cyan
+        Write-Host "  ---------------------------------------------------------" -ForegroundColor DarkGray
+
+        # ---- Survey what exists BEFORE deleting, so we can report accurately ----
+        `$pyDir      = Join-Path `$AppDir 'python'
+        `$hasPython  = Test-Path `$pyDir
+        `$tempPats   = @('sdt-install-*','sdt-getpip-*.log','sdt-pipinst-*.log','sdt-session-creds.xml')
+        `$tempItems  = @()
+        foreach (`$p in `$tempPats) {
+            `$tempItems += @(Get-ChildItem -Path `$env:TEMP -Filter `$p -Force -EA 0)
+        }
+        `$credCache  = Join-Path `$env:TEMP 'sdt-session-creds.xml'
+        `$hasCred    = Test-Path `$credCache
+
+        # Discovery sessions / generated reports = CLIENT DATA. Enumerate before
+        # touching anything so the operator sees exactly what would be destroyed.
+        `$sessionDirs = @()
+        foreach (`$base in @(`$root, (Join-Path `$AppDir '_output'), `$PWD.Path, [Environment]::GetFolderPath('Desktop'))) {
+            if (`$base -and (Test-Path `$base)) {
+                `$sessionDirs += @(Get-ChildItem -Path `$base -Directory -Filter 'Discovery-Session-*' -EA 0)
+            }
+        }
+        `$sessionDirs = @(`$sessionDirs | Sort-Object FullName -Unique)
+        `$reportFiles = @()
+        foreach (`$d in `$sessionDirs) {
+            `$reportFiles += @(Get-ChildItem -Path `$d.FullName -Filter '*DiscoveryReport*.html' -Recurse -EA 0)
+        }
+
+        if (`$sessionDirs.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  CLIENT DATA FOUND - `$(`$sessionDirs.Count) discovery session folder(s), `$(`$reportFiles.Count) report(s):" -ForegroundColor Yellow
+            foreach (`$d in (`$sessionDirs | Select-Object -First 12)) {
+                Write-Host "      `$(`$d.FullName)" -ForegroundColor DarkYellow
+            }
+            if (`$sessionDirs.Count -gt 12) { Write-Host "      ... +`$(`$sessionDirs.Count - 12) more" -ForegroundColor DarkYellow }
+            Write-Host "  These contain collected client inventory data and generated reports." -ForegroundColor Gray
+            if (-not `$force) {
+                Write-Host ""
+                `$ans = Read-Host "  Delete these too? [y]es / [n]o - keep them / [c]ancel uninstall"
+                if (`$ans -imatch '^[Cc]') { Write-Host "  Cancelled - nothing removed." -ForegroundColor Yellow; return }
+                `$killData = (`$ans -imatch '^[Yy]')
+            } else { `$killData = `$true }
+        } else { `$killData = `$false }
+
+        Write-Host ""
+        Write-Host "  Removing:" -ForegroundColor White
+
+        # 1. Session data / reports (only if authorized)
+        `$dataRemoved = 0
+        if (`$killData) {
+            foreach (`$d in `$sessionDirs) {
+                try { Remove-Item `$d.FullName -Recurse -Force -EA Stop; `$dataRemoved++ } catch { }
+            }
+            _Step (`$dataRemoved -eq `$sessionDirs.Count) "Discovery sessions + generated reports" "`$dataRemoved of `$(`$sessionDirs.Count) folder(s) deleted"
+        } elseif (`$sessionDirs.Count -gt 0) {
+            _Step `$false "Discovery sessions + reports - KEPT at user request" "`$(`$sessionDirs.Count) folder(s) left in place"
+        }
+
+        # 2. Bundled Python + plink that SDT downloaded
+        if (`$hasPython) {
+            try { Remove-Item `$pyDir -Recurse -Force -EA Stop } catch { }
+            _Step (-not (Test-Path `$pyDir)) "Bundled Python 3.12 + plink.exe" "`$pyDir"
+        } else {
+            _Step `$true "Bundled Python - none was installed" ""
+        }
+
+        # 3. Temp files (installer zips, pip logs, and the CREDENTIAL CACHE)
+        `$tmpKilled = 0
+        foreach (`$t in `$tempItems) {
+            try { Remove-Item `$t.FullName -Recurse -Force -EA Stop; `$tmpKilled++ } catch { }
+        }
+        _Step (`$tmpKilled -eq @(`$tempItems).Count) "Temporary files (installer zips, logs)" "`$tmpKilled item(s) from `$env:TEMP"
+        if (`$hasCred) {
+            _Step (-not (Test-Path `$credCache)) "Cached session CREDENTIALS purged" "`$credCache"
+        } else {
+            _Step `$true "Cached session credentials - none present" ""
+        }
+
+        # 4. The install tree itself (app + bin + shim)
+        try { Remove-Item `$root -Recurse -Force -EA Stop } catch { }
+        `$rootGone = -not (Test-Path `$root)
+        _Step `$rootGone "Program files (app, bin, sdt command)" `$root
+        if (-not `$rootGone) {
+            Write-Host "      NOTE: some files were locked. Close any running SDT window and re-run." -ForegroundColor Yellow
+        }
+
+        # 5. PATH entry
+        `$pathCleaned = `$false
+        try {
+            `$userPath = [Environment]::GetEnvironmentVariable('Path','User')
+            `$new = (`$userPath -split ';') | Where-Object { `$_ -and `$_ -notmatch 'Magna5\\SDT\\bin' }
+            [Environment]::SetEnvironmentVariable('Path', (`$new -join ';'), 'User')
+            `$verify = [Environment]::GetEnvironmentVariable('Path','User')
+            `$pathCleaned = (`$verify -notmatch 'Magna5\\SDT\\bin')
+        } catch { }
+        _Step `$pathCleaned "PATH entry removed (user environment)" ""
+
+        # 6. Registry - SDT never writes any; state this explicitly so the
+        #    operator does not have to wonder.
+        _Step `$true "Registry - no keys were ever created by SDT" "nothing to remove"
+
+        # 7. Target servers - remind that WinRM/state is restored per-session
+        Write-Host ""
+        Write-Host "  Target servers:" -ForegroundColor White
+        _Step `$true "WinRM restored to original state after each discovery run" "handled per-session; nothing installed on targets"
+
+        Write-Host ""
+        Write-Host "  ---------------------------------------------------------" -ForegroundColor DarkGray
+        if (`$rootGone -and `$pathCleaned) {
+            Write-Host "  UNINSTALL COMPLETE - system returned to original state." -ForegroundColor Green
+        } else {
+            Write-Host "  UNINSTALL INCOMPLETE - see unchecked items above." -ForegroundColor Yellow
+        }
+        if (-not `$killData -and `$sessionDirs.Count -gt 0) {
+            Write-Host "  Client data was intentionally kept. Delete manually when done:" -ForegroundColor Yellow
+            foreach (`$d in (`$sessionDirs | Select-Object -First 5)) { Write-Host "    `$(`$d.FullName)" -ForegroundColor DarkYellow }
+        }
+        Write-Host "  Close and reopen your terminal for the PATH change to apply." -ForegroundColor DarkGray
+        Write-Host ""
         return
     }
 }
@@ -609,10 +734,16 @@ if (-not `$health.ok) {
     }
 }
 
+# Start-Process -ArgumentList does NOT quote array elements, so any path
+# containing a space (e.g. C:\Users\John Smith\AppData\...) is split into
+# separate tokens and the child process dies with "the file does not have a
+# '.ps1' extension". Every path handed to powershell.exe must be pre-quoted.
+function _Q { param([string]`$p) if (`$p -match '\s') { '"' + `$p + '"' } else { `$p } }
+
 `$updateResult = Invoke-SdtAutoUpdate
 if (`$updateResult -eq 'updated') {
     # Relaunch with the new version - this process has old code in memory
-    `$fwd = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `$PSCommandPath)
+    `$fwd = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (_Q `$PSCommandPath))
     if (`$Mode -and `$Mode -ne 'gui') { `$fwd += `$Mode }
     if (`$Rest) { `$fwd += @(`$Rest) }
     Start-Process powershell.exe -ArgumentList `$fwd
@@ -637,7 +768,7 @@ switch -Regex (`$Mode) {
     '^(newui|new-ui|ui2|dossier)$' {
         # Launch GUI with the dossier-style light UI (test/preview flag)
         `$guiScript = Join-Path `$AppDir 'Start-DiscoverySessionGUI.ps1'
-        `$psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `$guiScript, '-NewUI')
+        `$psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (_Q `$guiScript), '-NewUI')
         try {
             `$child = Start-Process powershell.exe -ArgumentList `$psArgs -PassThru
             Write-Host ("  [sdt] New UI launched in background (PID {0}). Browser will open shortly." -f `$child.Id) -ForegroundColor DarkGray
@@ -654,7 +785,7 @@ switch -Regex (`$Mode) {
         # Ctrl+C doesn't escape (only X works). The GUI script self-minimizes
         # its own console after startup, so the user just sees the browser.
         `$guiScript = Join-Path `$AppDir 'Start-DiscoverySessionGUI.ps1'
-        `$psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `$guiScript)
+        `$psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (_Q `$guiScript))
         if (`$RestArr.Count -gt 0) { `$psArgs += `$RestArr }
         try {
             `$child = Start-Process powershell.exe -ArgumentList `$psArgs -PassThru

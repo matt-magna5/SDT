@@ -362,7 +362,9 @@ def derive_role_label(srv):
     elif isinstance(sql, list):
         _sq = next((x for x in sql if isinstance(x, dict)), {})
         sql_inst = _sq.get('Instances', {}) if _sq else {}
-    has_sql = isinstance(sql_inst, dict) and bool(sql_inst.get('Edition', ''))
+    # as_list handles both the single-instance dict and the multi-instance list;
+    # the old isinstance(dict) test silently dropped the multi-instance case.
+    has_sql = any(i.get('Edition') for i in as_list(sql_inst))
 
     if exch_ok: return 'Exchange Server'
     if has_adds:
@@ -428,8 +430,12 @@ def build_flags(srv):
             f'No security patches after end-of-support. Upgrade to Windows Server 2022.'))
 
     for d in as_list(data.get('Disks', [])):
-        pct = d.get('UsedPct', 0); drv = d.get('Drive', '?')
-        free = d.get('FreeGB', 0); total = d.get('TotalGB', 0)
+        # Coerce with `or 0`: a key present with a null value bypasses the .get
+        # default, and `None >= 85` / f'{None:.1f}' both raise TypeError. There
+        # is no try/except around the tab build, so one bad disk row would kill
+        # the entire report after a multi-hour scan.
+        pct = float(d.get('UsedPct', 0) or 0); drv = d.get('Drive', '?')
+        free = float(d.get('FreeGB', 0) or 0); total = float(d.get('TotalGB', 0) or 0)
         if pct >= 85:
             flags.append(('critical', f'Disk {drv} Near Capacity',
                 f'{name} {drv}: {pct}% used - only {free:.1f} GB free of {total:.1f} GB. Risk of service disruption.'))
@@ -442,7 +448,7 @@ def build_flags(srv):
             f'{name}: SMB 1.0 is the attack vector for WannaCry/NotPetya/EternalBlue ransomware. '
             f'Disable: Remove-WindowsFeature FS-SMB1'))
 
-    ram_t = hw.get('RAMTotalGB', 0); ram_f = hw.get('RAMAvailGB', 0)
+    ram_t = hw.get('RAMTotalGB', 0) or 0; ram_f = hw.get('RAMAvailGB', 0) or 0
     if ram_t > 0 and (1 - ram_f / ram_t) > 0.80:
         pct = int((1 - ram_f / ram_t) * 100)
         flags.append(('warning', f'High Memory Utilization ({pct}%)',
@@ -941,7 +947,7 @@ def build_server_tab(srv):
     ad_sbr_mini = ''
     if has_adds and isinstance(ad, dict) and ad.get('Installed'):
         fl_raw = str(ad.get('DomainFL', ad.get('ForestFL', '')))
-        fl_yr  = (re.search(r'20\d\d', fl_raw) or type('', (), {'group': lambda s,n: fl_raw})()).group(0) if fl_raw else ''
+        fl_yr  = (re.search(r'20\d\d', fl_raw) or type('', (), {'group': lambda s,n: ''})()).group(0) if fl_raw else ''
         fl_lbl = f'Windows Server {fl_yr}' if fl_yr else fl_raw
         _stale_raw = ad.get('StaleUsers', '')
         stale_u = len(_stale_raw) if isinstance(_stale_raw, list) else (int(_stale_raw) if str(_stale_raw).isdigit() else 0)
@@ -967,8 +973,8 @@ def build_server_tab(srv):
 
     # -- STORAGE MINI-BOX (SBR left) -------------------------------------------
     disk_rows_s = ''.join(
-        stor_row(d.get('Drive','?'), d.get('Label','') or '', d.get('TotalGB',0),
-                 d.get('FreeGB',0), d.get('UsedPct',0))
+        stor_row(d.get('Drive','?'), d.get('Label','') or '', d.get('TotalGB',0) or 0,
+                 d.get('FreeGB',0) or 0, d.get('UsedPct',0) or 0)
         for d in disks)
     storage_mini = mini_box('Storage',
         '<table style="width:100%;border-collapse:collapse;">'
@@ -1478,9 +1484,9 @@ def build_server_tab(srv):
     # -- DISK STORAGE CARD -----------------------------------------------------
     disk_body = '<table><tr><th>Drive</th><th>Label</th><th>Filesystem</th><th>Total (GB)</th><th>Used (GB)</th><th>Free (GB)</th><th style="min-width:140px">Utilization</th></tr>\n'
     for d in disks:
-        pct      = d.get('UsedPct', 0)
-        total_gb = d.get('TotalGB', 0)
-        free_gb  = d.get('FreeGB', 0)
+        pct      = float(d.get('UsedPct', 0) or 0)
+        total_gb = float(d.get('TotalGB', 0) or 0)
+        free_gb  = float(d.get('FreeGB', 0) or 0)
         used_gb  = round(total_gb - free_gb, 2)
         pc  = 'red' if pct >= 85 else ('yellow' if pct >= 70 else 'green')
         c   = '#d63638' if pct >= 85 else ('#f5a623' if pct >= 70 else '#20c800')
@@ -1707,9 +1713,10 @@ def build_hv_tab():
             host_type  = 'ESXi'
             hs         = hvi.get('HostSummary', {}) or {}
             model      = hs.get('Model', first_host.get('Model', '-'))
-            mfg        = hs.get('Manufacturer', first_host.get('Manufacturer', ''))
+            # collect_vsphere_perf.py emits Vendor/Cores (not Manufacturer/CPUCores)
+            mfg        = hs.get('Manufacturer') or first_host.get('Manufacturer') or first_host.get('Vendor', '')
             cpu_model  = hs.get('CPUModel', first_host.get('CPUModel', '-'))
-            cpu_cores  = hs.get('CPUCores', first_host.get('CPUCores', '?'))
+            cpu_cores  = hs.get('CPUCores') or first_host.get('CPUCores') or first_host.get('Cores', '?')
             cpu_log    = hs.get('CPULogical', cpu_cores)
             ram_gb     = float(hs.get('TotalRAMgb', first_host.get('RAMgb', 0)) or 0)
             vols       = []
@@ -1731,7 +1738,7 @@ def build_hv_tab():
         vms        = hvi.get('VMs', [])
 
         # Aggregate totals
-        host_vcpu = sum(v.get('vCPU', 0) or 0 for v in vms)
+        host_vcpu = sum(int(v.get('vCPU', v.get('vCPUs', 0)) or 0) for v in vms)
         host_ram  = sum(float(v.get('RAMgb', 0) or 0) for v in vms)
         running   = sum(1 for v in vms if v.get('State', '') in ('Running', 'POWERED_ON'))
         total_vcpu += host_vcpu; total_ram += host_ram
@@ -1743,6 +1750,8 @@ def build_hv_tab():
             disks     = [d for d in (vm.get('Disks', []) or []) if isinstance(d, dict)]
             # vSphere uses CapacityGB; Hyper-V uses SizeGB
             disk_gb   = sum(float(d.get('CapacityGB', d.get('SizeGB', 0)) or 0) for d in disks)
+            if not disk_gb:
+                disk_gb = float(vm.get('DiskCapGB', 0) or 0)   # vSphere root-level total
             disk_used = sum(float(d.get('UsedGB', 0) or 0) for d in disks)
             disk_str  = f'{disk_gb:.0f} GB' + (f' / {disk_used:.0f} GB used' if disk_used else '')
             # vSphere uses PowerState; Hyper-V uses State
@@ -1788,8 +1797,8 @@ def build_hv_tab():
                 pc  = 'red' if pct >= 85 else ('yellow' if pct >= 70 else 'green')
                 vol_rows += (f'<tr><td style="padding:5px 10px;font-family:monospace">{h(vol.get("Drive",""))}</td>'
                             f'<td style="padding:5px 10px;font-size:8.5pt;color:#6b6080">{h(vol.get("Label",""))}</td>'
-                            f'<td style="padding:5px 10px">{float(vol.get("TotalGB",0)):.0f} GB</td>'
-                            f'<td style="padding:5px 10px">{float(vol.get("FreeGB",0)):.0f} GB free</td>'
+                            f'<td style="padding:5px 10px">{float(vol.get("TotalGB",0) or 0):.0f} GB</td>'
+                            f'<td style="padding:5px 10px">{float(vol.get("FreeGB",0) or 0):.0f} GB free</td>'
                             f'<td style="padding:5px 10px">{pill(f"{pct:.0f}%", pc)}{disk_bar(pct)}</td></tr>\n')
 
         hv_anchor   = hv_name.lower().replace('.', '').replace('-', '')
@@ -1922,9 +1931,14 @@ def build_sql_tab():
         sql_raw = data.get('SQL', {})
         if isinstance(sql_raw, list): sql_raw = sql_raw[0] if sql_raw else {}
         if not isinstance(sql_raw, dict): continue
-        inst = sql_raw.get('Instances', {})
-        if not isinstance(inst, dict) or not inst.get('InstanceName'): continue
-        sql_servers.append({'server': srv['name'], 'ip': srv.get('ip',''), 'sql': sql_raw, 'inst': inst})
+        for inst in as_list(sql_raw.get('Instances', {})):
+            if not inst.get('InstanceName') and not inst.get('Edition'): continue
+            label = srv['name']
+            _in = str(inst.get('InstanceName', '') or '')
+            # Disambiguate when one server hosts several named instances
+            if _in and _in.upper() not in ('MSSQLSERVER', 'DEFAULT'):
+                label = srv['name'] + '\\' + _in
+            sql_servers.append({'server': label, 'ip': srv.get('ip',''), 'sql': sql_raw, 'inst': inst})
 
     if not sql_servers:
         return None
@@ -2209,12 +2223,18 @@ def build_private_cloud_tab():
             nm = vm.get('Name', '')
             if nm.upper() in _excluded: continue  # explicitly excluded from scope
             if nm.upper() in merged: continue  # already have better WinRM data
-            cores = int(vm.get('vCPU', 0) or 0)
+            # Hyper-V inventory emits 'vCPU'; vSphere emits 'vCPUs'. Reading only
+            # 'vCPU' silently sized every vSphere VM at 0 cores / 0 GB disk, which
+            # deflates the Commvault + private-cloud totals quoted to the client.
+            cores = int(vm.get('vCPU', vm.get('vCPUs', 0)) or 0)
             ram   = round(float(vm.get('RAMgb', vm.get('RAMAllocatedGB', 0)) or 0), 1)
             vm_disks = as_list(vm.get('Disks', []))
             # vSphere uses CapacityGB; Hyper-V uses TotalGB
             total_disk = round(sum(float(dk.get('CapacityGB', dk.get('TotalGB', 0)) or 0)
                                    for dk in vm_disks if isinstance(dk, dict)), 1)
+            if not total_disk:
+                # vSphere carries the total at the VM root instead of a Disks[] list
+                total_disk = round(float(vm.get('DiskCapGB', 0) or 0), 1)
             merged[nm.upper()] = (nm, cores, ram, total_disk, 0.0, 'Hypervisor', 'Virtual')
 
     if not merged:
@@ -2504,10 +2524,12 @@ def render_printers_section():
     security group), and the deploying GPO (if any). Auto-detected print
     servers only."""
     print_servers = []  # [(server_name, queues[])]
+    _ps_partial = False
     for srv in servers:
         if srv.get('os_type') == 'linux': continue
         d = srv.get('data', {}) or {}
         ps = d.get('PrintServer')
+        if isinstance(ps, dict) and ps.get('Partial'): _ps_partial = True
         if isinstance(ps, dict) and ps.get('IsPrintServer'):
             queues = ps.get('Queues') if isinstance(ps.get('Queues'), list) else []
             if queues:
@@ -2520,6 +2542,11 @@ def render_printers_section():
                 'If a print server exists, ensure it was in the discovery target list and WinRM reached it.</div></div>')
         return out
 
+    if _ps_partial:
+        out += ('<div class="flag-warning" style="margin-bottom:12px;">'
+                '<div class="flag-label">Partial Print Server Data</div>'
+                '<div class="flag-detail">Print queue collection was incomplete (ACL read denied or the '
+                'SYSVOL scan timed out). Access flags below may be missing.</div></div>')
     total_q = sum(len(q) for _, q in print_servers)
     restricted_n = sum(1 for _, qs in print_servers for q in qs if str(q.get('Access')) == 'restricted')
     out += (f'<div style="font-size:8.5pt;color:#6b6080;margin-bottom:8px;">'
@@ -2561,6 +2588,7 @@ def render_gpo_section():
     total_seen = 0
     linked_seen = 0
     any_dc = False
+    _gpo_partial = False
     for srv in servers:
         if srv.get('os_type') == 'linux': continue
         d = srv.get('data', {}) or {}
@@ -2568,6 +2596,7 @@ def render_gpo_section():
         if not isinstance(g, dict) or not g.get('Available'):
             continue
         any_dc = True
+        if g.get('Partial'): _gpo_partial = True
         total_seen  = max(total_seen,  int(g.get('TotalCount',  0) or 0))
         linked_seen = max(linked_seen, int(g.get('LinkedCount', 0) or 0))
         for gp in (g.get('GPOs') or []):
@@ -2581,6 +2610,12 @@ def render_gpo_section():
                 'reachable Domain Controller. Re-run discovery with a DC in scope and domain admin credentials.</div></div>')
         return out
 
+    if _gpo_partial:
+        out += ('<div class="flag-warning" style="margin-bottom:12px;">'
+                '<div class="flag-label">Partial GPO Data</div>'
+                '<div class="flag-detail">GPO collection hit a size or time limit, or some OUs could not be '
+                'read with the discovery account. Links and settings below may be incomplete - '
+                'verify in GPMC before relying on this for migration scope.</div></div>')
     gpo_list = list(gpos.values())
     gpo_list.sort(key=lambda x: str(x.get('Name','')).lower())
     unlinked = max(0, total_seen - len(gpo_list))
@@ -2701,9 +2736,13 @@ def build_summary_tab():
             physical_n += 1
         ad = d.get('AD');
         if isinstance(ad, dict) and ad.get('Installed'): dc_count += 1
+        # SQL Edition lives inside the Instances collection, not at the section
+        # root. Reading it off the root made this count 0 on every report.
         sql_ = d.get('SQL')
         if isinstance(sql_, list) and sql_: sql_ = sql_[0]
-        if isinstance(sql_, dict) and sql_.get('Edition'): sql_count += 1
+        if isinstance(sql_, dict):
+            _insts = as_list(sql_.get('Instances', {}))
+            if any(i.get('Edition') for i in _insts): sql_count += 1
         shares_raw = d.get('FileShares') or d.get('Shares') or {}
         sh_list = shares_raw.get('Shares') if isinstance(shares_raw, dict) else shares_raw
         if isinstance(sh_list, list):
@@ -2727,7 +2766,7 @@ def build_summary_tab():
         # high disk
         for dk in d.get('Disks', []) or []:
             if not isinstance(dk, dict): continue
-            if dk.get('UsedPct', 0) >= 85:
+            if float(dk.get('UsedPct', 0) or 0) >= 85:
                 high_disk.append(f'{nm}:{dk.get("Drive","?")} ({dk.get("UsedPct")}%)')
 
     out  = '<div style="padding:24px;">'
@@ -2837,9 +2876,16 @@ BUCKET_ORDER = ['Domain Controllers','Exchange','SQL Servers','RDS / Terminal',
 
 # Index tabs by bucket
 _by_bucket = {}
-_srv_by_id = {s['id']: s for s in servers}
+# Mirror the id self-heal used in build_server_tab/build_linux_tab: manifest
+# entries from the GUI recovery path (or a hand-edited manifest) may omit
+# 'id'. A bare s['id'] here would KeyError and kill the ENTIRE report.
+def _srv_id(s):
+    return (s.get('id')
+            or re.sub(r'[^a-z0-9]+', '-', str(s.get('name', '')).lower()).strip('-')
+            or 'server')
+_srv_by_id = {_srv_id(s): s for s in servers}
 for t in tabs:
-    s = _srv_by_id.get(t['id'], {})
+    s = _srv_by_id.get(t.get('id'), {})
     is_linux = s.get('os_type') == 'linux'
     b = _bucket(t.get('role_label',''), is_linux)
     _by_bucket.setdefault(b, []).append((t, is_linux))

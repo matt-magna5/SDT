@@ -578,6 +578,12 @@ def _parse_perf_response(root, wanted):
                 result[ckey] = vals
     return result
 
+# vSphere perf interval lengths, in seconds. These matter for more than the
+# query: SUMMATION counters accumulate over the whole interval, so converting
+# them to a per-second rate requires dividing by exactly these values.
+REALTIME_INTERVAL_SEC   = 20      # real-time rollup (~1hr retention)
+HISTORICAL_INTERVAL_SEC = 86400   # daily rollup
+
 def _realtime_perf_body(perf_ref, moid, moid_type, metrics_xml):
     """QueryPerf body for the real-time interval (20s samples, no start/end -
     just the most recent maxSample points). Used for standalone ESXi, which
@@ -618,12 +624,14 @@ def query_perf(sess, host, perf_ref, moid, moid_type, counter_ids, days=90, api_
         for cid in wanted.values())
 
     if api_type == 'HostAgent':
-        return _parse_perf_response(
+        r = _parse_perf_response(
             soap_req(sess, host, _realtime_perf_body(perf_ref, moid, moid_type, metrics_xml)), wanted)
+        r['_interval_sec'] = REALTIME_INTERVAL_SEC
+        return r
 
     end_dt   = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=days)
-    INTERVAL = 86400  # daily samples for historical window
+    INTERVAL = HISTORICAL_INTERVAL_SEC  # daily samples for historical window
 
     body = f'''<vim25:QueryPerf>
       <vim25:_this type="PerformanceManager">{perf_ref}</vim25:_this>
@@ -639,12 +647,15 @@ def query_perf(sess, host, perf_ref, moid, moid_type, counter_ids, days=90, api_
 
     result = _parse_perf_response(soap_req(sess, host, body), wanted)
     if result:
+        result['_interval_sec'] = INTERVAL
         return result
 
     # Historical query came back empty even though this is vCenter - fall
     # back to real-time so we surface a snapshot instead of an all-null P95.
-    return _parse_perf_response(
+    r = _parse_perf_response(
         soap_req(sess, host, _realtime_perf_body(perf_ref, moid, moid_type, metrics_xml)), wanted)
+    r['_interval_sec'] = REALTIME_INTERVAL_SEC
+    return r
 
 # ── Step 9: Stats helpers ─────────────────────────────────────────────────────
 
@@ -687,11 +698,23 @@ def mem_stats_kb(vals, ram_mb):
     return stats4([min(v / ram_kb * 100, 100) for v in vals])
 
 def iops_vals(perf):
+    """Combined read+write IOPS as a per-second RATE.
+
+    disk.numberRead/numberWrite are SUMMATION counters: each sample is the
+    total operation COUNT accumulated over the interval, not a rate. At the
+    daily historical interval that is a full day of operations, so returning
+    the raw value reported IOPS inflated by up to 86,400x in client sizing
+    reports. Divide by the interval length to get true ops/sec -- the same
+    normalization cpu_ready_p95() already applies to cpu.ready.summation.
+    """
+    interval = perf.get('_interval_sec', HISTORICAL_INTERVAL_SEC) or HISTORICAL_INTERVAL_SEC
     reads  = perf.get('disk.numberRead.summation', [])
     writes = perf.get('disk.numberWrite.summation', [])
     if reads and writes:
-        return [r + w for r, w in zip(reads, writes)]
-    return reads or writes
+        combined = [r + w for r, w in zip(reads, writes)]
+    else:
+        combined = reads or writes
+    return [v / float(interval) for v in combined]
 
 def throughput_kbps_p95(perf):
     r = perf.get('disk.read.average', [])
@@ -709,7 +732,11 @@ def build_vm_output(vm, perf):
     iops_v  = iops_vals(perf)
 
     cpu_s = cpu_stats(cpu_v)
-    cpu_s['Ready_P95'] = cpu_ready_p95(ready_v, vm['vCPUs'])
+    # Use the interval the perf query ACTUALLY used -- the realtime fallback
+    # (standalone ESXi, or an empty historical window) yields 20s samples, and
+    # assuming 86400s there understates CPU Ready by 4,320x.
+    _ivl = perf.get('_interval_sec', HISTORICAL_INTERVAL_SEC) or HISTORICAL_INTERVAL_SEC
+    cpu_s['Ready_P95'] = cpu_ready_p95(ready_v, vm['vCPUs'], _ivl)
 
     return {
         "Name":           vm['Name'],

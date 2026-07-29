@@ -1873,7 +1873,28 @@ ORDER BY data_size_mb DESC
                     }
                 }
             } catch { }
-            $xmlFiles = Get-ChildItem -Path $polRoot -Recurse -Filter 'Printers.xml' -ErrorAction SilentlyContinue
+            # A recursive scan of \\<domain>\SYSVOL is a NETWORK walk that can run
+            # for many minutes on a large or slowly-replicating SYSVOL (WAN-linked
+            # DC, years of accumulated GPOs). Unbounded, it hangs the entire remote
+            # discovery job and every server queued behind it. Time-box it the same
+            # way the file-share size scan and event-log read are boxed.
+            $xmlFiles = @()
+            try {
+                $sysvolJob = Start-Job -ScriptBlock {
+                    param($root)
+                    Get-ChildItem -Path $root -Recurse -Filter 'Printers.xml' -ErrorAction SilentlyContinue |
+                        Select-Object -ExpandProperty FullName
+                } -ArgumentList $polRoot
+                if (Wait-Job $sysvolJob -Timeout 45) {
+                    $paths = Receive-Job $sysvolJob -ErrorAction SilentlyContinue
+                    if ($paths) { $xmlFiles = @($paths | ForEach-Object { [PSCustomObject]@{ FullName = $_ } }) }
+                } else {
+                    Stop-Job $sysvolJob -ErrorAction SilentlyContinue
+                    cb-Log "PrintServer" "SYSVOL GPP scan timed out after 45s - GPO deployment cross-reference skipped"
+                }
+                Remove-Job $sysvolJob -Force -ErrorAction SilentlyContinue
+            } catch { cb-Log "PrintServer" "SYSVOL scan job failed: $_" }
+
             foreach ($xf in $xmlFiles) {
                 $guid = ''
                 if ($xf.FullName -match '\\Policies\\(\{[0-9A-Fa-f-]+\})\\') { $guid = $Matches[1].ToUpper() }
@@ -2139,6 +2160,16 @@ ORDER BY data_size_mb DESC
             $result.TotalCount = $all.Count
 
             # Build GUID -> [links] by walking domain root + every OU (and sites).
+            # Both Get-GPInheritance (per OU) and Get-GPOReport (per GPO) are slow
+            # synchronous calls. On a domain with thousands of OUs this becomes
+            # tens of minutes, so the walk is bounded by BOTH an OU cap and an
+            # overall wall-clock budget; exceeding either marks the data Partial
+            # rather than hanging the run.
+            $MAX_OUS       = 750
+            $GPO_BUDGET_S  = 120
+            $gpoSw         = [System.Diagnostics.Stopwatch]::StartNew()
+            $inhFailures   = 0
+
             $linkMap = @{}
             $addLinks = {
                 param($targetDN)
@@ -2154,18 +2185,42 @@ ORDER BY data_size_mb DESC
                             Order    = [int]$lnk.Order
                         })
                     }
-                } catch { }
+                } catch {
+                    # Don't swallow silently: if the account can't read GP
+                    # inheritance, EVERY call fails and the section renders empty
+                    # with no explanation of why.
+                    $script:_gpoInhErr = $_.ToString()
+                    return $false
+                }
+                return $true
             }
             try {
                 $dom = Get-ADDomain -ErrorAction Stop
-                & $addLinks $dom.DistinguishedName
-                foreach ($ou in (Get-ADOrganizationalUnit -Filter * -ErrorAction Stop)) {
-                    & $addLinks $ou.DistinguishedName
+                if (-not (& $addLinks $dom.DistinguishedName)) { $inhFailures++ }
+
+                $ous = @(Get-ADOrganizationalUnit -Filter * -ResultPageSize 256 -ErrorAction Stop)
+                if ($ous.Count -gt $MAX_OUS) {
+                    cb-Log "GPO" "Domain has $($ous.Count) OUs - capping link enumeration at $MAX_OUS"
+                    $result.Partial = $true
+                    $ous = $ous | Select-Object -First $MAX_OUS
+                }
+                foreach ($ou in $ous) {
+                    if ($gpoSw.Elapsed.TotalSeconds -gt $GPO_BUDGET_S) {
+                        cb-Log "GPO" "OU link walk exceeded ${GPO_BUDGET_S}s budget - stopping early (partial links)"
+                        $result.Partial = $true
+                        break
+                    }
+                    if (-not (& $addLinks $ou.DistinguishedName)) { $inhFailures++ }
+                }
+                if ($inhFailures -gt 0) {
+                    cb-Log "GPO" "Get-GPInheritance failed on $inhFailures target(s). Last error: $($script:_gpoInhErr)"
+                    if ($inhFailures -ge $ous.Count) { $result.Partial = $true }
                 }
             } catch { cb-Log "GPO" "OU enumeration failed (need AD module on a DC): $_"; $result.Partial = $true }
 
             $result.LinkedCount = $linkMap.Keys.Count
 
+            $reportBudgetS = $GPO_BUDGET_S + 180   # allow more time for the reports themselves
             foreach ($g in $all) {
                 $gid = ("{$($g.Id)}").ToUpper()
                 if (-not $linkMap.ContainsKey($gid)) { continue }   # skip UNLINKED GPOs entirely
@@ -2173,12 +2228,19 @@ ORDER BY data_size_mb DESC
                     @{ Target=$_.Target; Enabled=$_.Enabled; Enforced=$_.Enforced }
                 })
                 $cats = @(); $raw = @()
-                try {
-                    [xml]$rpt = Get-GPOReport -Guid $g.Id -ReportType Xml -ErrorAction Stop
-                    $parsed = Parse-GPOReport -Report $rpt
-                    $cats = $parsed.Categories
-                    $raw  = $parsed.Raw
-                } catch { cb-Log "GPO" "Report failed for $($g.DisplayName): $_" }
+                if ($gpoSw.Elapsed.TotalSeconds -gt $reportBudgetS) {
+                    # Still record the GPO + where it's linked; just skip the
+                    # expensive per-GPO settings report.
+                    cb-Log "GPO" "Report budget exhausted - settings detail skipped for $($g.DisplayName) and beyond"
+                    $result.Partial = $true
+                } else {
+                    try {
+                        [xml]$rpt = Get-GPOReport -Guid $g.Id -ReportType Xml -ErrorAction Stop
+                        $parsed = Parse-GPOReport -Report $rpt
+                        $cats = $parsed.Categories
+                        $raw  = $parsed.Raw
+                    } catch { cb-Log "GPO" "Report failed for $($g.DisplayName): $_" }
+                }
 
                 $result.GPOs += @{
                     Name        = [string]$g.DisplayName

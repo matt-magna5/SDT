@@ -53,6 +53,55 @@ Captured during the 2026-05-19/20 FBA assessment + HTML report redesign discussi
 - [ ] Exclude AS/400, Linux appliances, vCenter mgmt infra by default
       (with override)
 
+## Stability pass 2026-07-29 (full code review) -- FIXED
+- [x] **Non-domain-joined Hyper-V host creds** -- a workgroup HV host running
+      domain-joined guests needs TWO credential sets. Added an optional second
+      credential set + per-target override map + automatic auth-failure retry.
+      Also fixes the multi-domain item below.
+- [x] `sdt uninstall` now removes temp files, cached CREDENTIALS, bundled
+      Python/plink, session data (with confirmation), PATH entry -- and prints
+      an itemized checklist of what was removed.
+- [x] gen_report.py: `_srv_by_id` bare KeyError on a manifest without `id`
+      (killed the ENTIRE report); Summary "SQL Servers" count always 0;
+      servers with 2+ SQL instances dropped from the SQL tab entirely;
+      vSphere VMs sized at 0 vCPU / 0 GB in Private Cloud + Commvault totals
+      (producer emits `vCPUs`, consumer read `vCPU`); vSphere host Vendor /
+      Cores blank; null disk/RAM values crashing the whole report.
+- [x] collect_vsphere_perf.py: **IOPS inflated up to 86,400x** -- summation
+      counters were never divided by the sample interval. CPU Ready understated
+      4,320x when the realtime fallback interval was used.
+- [x] GPO/SYSVOL collection could hang the whole remote job: recursive SYSVOL
+      scan now time-boxed (45s), OU link walk capped (750 OUs / 120s budget),
+      per-GPO report budget, and Get-GPInheritance failures are now logged
+      instead of silently swallowed.
+- [x] install.ps1: `Start-Process -ArgumentList` did not quote paths, so SDT
+      silently failed to launch on any profile path containing a space
+      (e.g. C:\Users\John Smith\...). Verified empirically.
+- [x] Get-PortablePython.ps1: a stalled download was treated as SUCCESS,
+      accepting truncated python.exe/plink.exe. Now treated as failure, and
+      every method validates a minimum file size before accepting.
+- [x] GPO/PrintServer `Partial` flags are now surfaced as report banners.
+
+### Reviewed and found NOT to be bugs (do not re-fix)
+- ConvertTo-Json does NOT collapse single-element arrays in the patterns this
+  codebase uses (`@()`-wrapped, `+=` on a hashtable member, ArrayList) --
+  verified empirically on PS 5.1. PrintServer/GPO arrays serialize correctly.
+- `_spin -stallSec` does not throw / kill the certutil fallback; extra args
+  land in `$args` harmlessly. (The value WAS being ignored -- now a real param.)
+
+### Still open from the review (not yet done)
+- [ ] parse_ntnx_collector.py output is invisible to gen_report.py: it writes
+      `_type: "vSpherePerf"` + `vsphere-perf-*.json`, but gen_report.py only
+      ingests filenames containing "inventory" with `_type` of
+      `vSphereInventory`/`HyperVInventory`. Nutanix-sourced engagements get an
+      empty Hypervisor tab. Needs a deliberate schema-alignment pass
+      (also: ESXHosts, vCPU vs vCPUs, Disks[], CapacityMiB).
+- [ ] Host CPU/Mem % come from instantaneous quickStats, not the N-day P95
+      window used for VMs -- a host collected at 2am looks idle.
+- [ ] p95() returns the raw max for samples <= 20 (realtime fallback).
+- [ ] Plaintext creds appear in process listings (plink `-pw`, python `--pass`).
+      `--pass-env`/`SDT_HV_PASS` already exist; the launcher should use them.
+
 ## Underlying bugs
 - [ ] **collect_vsphere_perf.py returning nulls for CPU.P95 / Memory.P95**
       — observed in FBA session (2026-05-19). SDT's own perf collector

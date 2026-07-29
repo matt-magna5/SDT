@@ -1,4 +1,4 @@
-#Requires -Version 3.0
+﻿#Requires -Version 3.0
 <#
 .SYNOPSIS
     Downloads SDT dependencies: portable Python (for HTML reports) and
@@ -25,7 +25,24 @@ Write-Host ("  " + "=" * 40) -ForegroundColor DarkCyan
 Write-Host ""
 
 function Get-FileWithProgress {
-    param([string]$Url, [string]$Dest, [string]$Label, [int]$TimeoutSec = 120)
+    param([string]$Url, [string]$Dest, [string]$Label, [int]$TimeoutSec = 120,
+          [int]$MinBytes = 0)
+
+    # A partially-written file is worse than no file: a truncated python.exe or
+    # plink.exe fails later with a cryptic "not a valid Win32 application".
+    # Every method routes its result through this so a short file is rejected
+    # and the next method gets a turn.
+    function _Validate([string]$path, [int]$min, [string]$lbl) {
+        if (-not (Test-Path $path)) { return $false }
+        $len = (Get-Item $path -EA SilentlyContinue).Length
+        if ($min -gt 0 -and $len -lt $min) {
+            Write-Host ("`r  {0}  TRUNCATED ({1} KB < {2} KB expected) - discarding  " -f `
+                        $lbl, [math]::Round($len/1KB,0), [math]::Round($min/1KB,0)) -ForegroundColor Yellow
+            Remove-Item $path -Force -EA SilentlyContinue
+            return $false
+        }
+        return ($len -gt 0)
+    }
 
     try {
         $allTls = [enum]::GetValues([Net.SecurityProtocolType]) | Where-Object { $_ -match 'Tls' }
@@ -65,10 +82,10 @@ function Get-FileWithProgress {
         $outFile.Close(); $inStream.Close(); $client.Dispose()
         $avg = [math]::Round($totalRead/1KB/([DateTime]::Now-$startTime).TotalSeconds,0)
         Write-Host ("`r  {0}  Done  {1} MB  avg {2} KB/s                    " -f $Label,[math]::Round($totalRead/1MB,1),$avg) -ForegroundColor Green
-        return $true
+        if (_Validate $Dest $MinBytes $Label) { return $true }
     } catch { Write-Host "`r  Method 1 failed - trying WebClient...                 " -ForegroundColor DarkGray }
 
-    function _spin($job, $destPath, $lbl) {
+    function _spin($job, $destPath, $lbl, $stallSec = 45) {
         $sp = @('|','/','-','\'); $i = 0
         $lastSz = -1; $lastGrowth = [DateTime]::Now; $everHadBytes = $false
         while (-not $job.HasExited) {
@@ -76,19 +93,19 @@ function Get-FileWithProgress {
             if ($sz -gt 0) { $everHadBytes = $true }
             if ($sz -gt $lastSz) { $lastSz = $sz; $lastGrowth = [DateTime]::Now }
             $waited = ([DateTime]::Now - $lastGrowth).TotalSeconds
-            if ($everHadBytes -and $sz -gt 102400 -and $waited -gt 5) {
+            # A download that stopped growing is NOT proof it finished -- a slow or
+            # throttled link routinely pauses between writes. Only the job actually
+            # exiting proves completion (handled after this loop). Treat a long
+            # no-growth window as a STALL (failure) so the caller falls through to
+            # the next method, instead of accepting a truncated file as success.
+            if ($everHadBytes -and $waited -gt $stallSec) {
                 Stop-Job $job -EA SilentlyContinue
-                Write-Host ("`r  {0}  Done  {1} MB                              " -f $lbl, [math]::Round($sz/1MB,1)) -ForegroundColor Green
-                return $true
+                Write-Host ("`r  {0}  stalled at {1} MB - trying next method...   " -f $lbl, [math]::Round($sz/1MB,1)) -ForegroundColor DarkGray
+                return $false
             }
             if (-not $everHadBytes -and $waited -gt 10) {
                 Stop-Job $job -EA SilentlyContinue
                 Write-Host ("`r  {0}  no response - skipping...                 " -f $lbl) -ForegroundColor DarkGray
-                return $false
-            }
-            if ($everHadBytes -and $waited -gt 60) {
-                Stop-Job $job -EA SilentlyContinue
-                Write-Host ("`r  {0}  stalled mid-transfer - skipping...        " -f $lbl) -ForegroundColor DarkGray
                 return $false
             }
             Write-Host ("`r  {0}  {1}  {2} MB   " -f $lbl, $sp[$i%4], [math]::Round($sz/1MB,1)) -NoNewline -ForegroundColor Cyan
@@ -96,7 +113,7 @@ function Get-FileWithProgress {
         }
         $sz = if (Test-Path $destPath) { [math]::Round((Get-Item $destPath).Length/1MB,1) } else { 0 }
         Write-Host ("`r  {0}  Done  {1} MB                              " -f $lbl, $sz) -ForegroundColor Green
-        return $true
+        return $true   # caller validates size before accepting
     }
 
     # Method 2: WebClient
@@ -113,7 +130,7 @@ function Get-FileWithProgress {
         $ok = _spin $job $Dest $Label
         Receive-Job $job -EA SilentlyContinue | Out-Null
         Remove-Job $job -Force -EA SilentlyContinue
-        if ($ok -and (Test-Path $Dest)) { return $true }
+        if ($ok -and (_Validate $Dest $MinBytes $Label)) { return $true }
     } catch { }
     Write-Host "`r  Method 2 failed - trying Invoke-WebRequest...         " -ForegroundColor DarkGray
 
@@ -129,7 +146,7 @@ function Get-FileWithProgress {
         $ok = _spin $job $Dest $Label
         Receive-Job $job -EA SilentlyContinue | Out-Null
         Remove-Job $job -Force -EA SilentlyContinue
-        if ($ok -and (Test-Path $Dest)) { return $true }
+        if ($ok -and (_Validate $Dest $MinBytes $Label)) { return $true }
     } catch { }
     Write-Host "`r  Method 3 failed - trying BITS...                      " -ForegroundColor DarkGray
 
@@ -141,7 +158,7 @@ function Get-FileWithProgress {
             $ok = _spin $job $Dest $Label
             Receive-Job $job -EA SilentlyContinue | Out-Null
             Remove-Job $job -Force -EA SilentlyContinue
-            if ($ok -and (Test-Path $Dest)) { return $true }
+            if ($ok -and (_Validate $Dest $MinBytes $Label)) { return $true }
         } catch { }
         Write-Host "`r  Method 4 failed - trying certutil...                  " -ForegroundColor DarkGray
     }
@@ -152,10 +169,8 @@ function Get-FileWithProgress {
         $job = Start-Job -ScriptBlock { param($u,$d) & certutil.exe -urlcache -split -f $u $d 2>&1 } -ArgumentList $Url, $Dest
         _spin $job $Dest $Label -stallSec 20 | Out-Null
         Remove-Job $job -Force -EA SilentlyContinue
-        if (Test-Path $Dest) {
-            & certutil.exe -urlcache -f $Url delete 2>&1 | Out-Null
-            return $true
-        }
+        & certutil.exe -urlcache -f $Url delete 2>&1 | Out-Null
+        if (_Validate $Dest $MinBytes $Label) { return $true }
     } catch { }
 
     Write-Host "  [FAIL] All download methods failed for: $Label" -ForegroundColor Red
@@ -172,7 +187,7 @@ $ZIP_TMP     = Join-Path $env:TEMP "sdt-py-embed.zip"
 if (Test-Path (Join-Path $DEST_FOLDER "python.exe")) {
     Write-Host "  [OK] Portable Python already installed." -ForegroundColor Green
 } else {
-    $ok = Get-FileWithProgress -Url $PY_URL -Dest $ZIP_TMP -Label "Python $PY_VERSION"
+    $ok = Get-FileWithProgress -Url $PY_URL -Dest $ZIP_TMP -Label "Python $PY_VERSION" -MinBytes 8000000
     if ($ok) {
         Expand-ZipCompat $ZIP_TMP $DEST_FOLDER
         Remove-Item $ZIP_TMP -Force -ErrorAction SilentlyContinue
@@ -192,7 +207,7 @@ $PLINK_DEST = Join-Path $PSScriptRoot "plink.exe"
 if (Test-Path $PLINK_DEST) {
     Write-Host "  [OK] plink.exe already present." -ForegroundColor Green
 } else {
-    $ok = Get-FileWithProgress -Url $PLINK_URL -Dest $PLINK_DEST -Label "plink.exe"
+    $ok = Get-FileWithProgress -Url $PLINK_URL -Dest $PLINK_DEST -Label "plink.exe" -MinBytes 300000
     if (-not $ok) {
         Write-Host "         Linux SSH discovery will not be available without it." -ForegroundColor DarkGray
     }

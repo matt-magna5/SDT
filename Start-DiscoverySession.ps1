@@ -35,6 +35,65 @@ $script:SessionErrors   = [System.Collections.ArrayList]@()
 $script:DomainCred      = $null
 $script:vSphereSources = [System.Collections.ArrayList]@()
 
+# -- MULTI-CREDENTIAL SUPPORT -------------------------------------------------
+# SDT historically took ONE credential set. That breaks two real scenarios:
+#   1. A non-domain-joined (workgroup) Hyper-V host running domain-joined
+#      guests -- the host needs .\LocalAdmin, the guests need DOMAIN\user.
+#   2. An environment spanning multiple untrusted AD domains.
+# $script:AltCred is an optional second credential set, and
+# $script:TargetCredMap holds per-target overrides (target -> PSCredential)
+# that take precedence over both.
+$script:AltCred            = $null
+$script:TargetCredMap      = @{}
+$script:HVHostIsWorkgroup  = $false
+
+function Test-LocalMachineDomainJoined {
+    <#  Returns $true when THIS machine is joined to an AD domain, $false for a
+        workgroup box, and $null when it cannot be determined.  #>
+    try {
+        $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop
+        return [bool]$cs.PartOfDomain
+    } catch {
+        try {
+            $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+            return [bool]$cs.PartOfDomain
+        } catch { return $null }
+    }
+}
+
+function Get-CredForTarget {
+    <#  Resolve which credential to use for a given target. Per-target override
+        wins, then the primary credential set.  #>
+    param([string]$Target)
+    if ($Target) {
+        foreach ($k in $script:TargetCredMap.Keys) {
+            if ($k -and $Target -ieq $k) { return $script:TargetCredMap[$k] }
+        }
+    }
+    return $script:DomainCred
+}
+
+function Set-CredForTarget {
+    param([string]$Target, $Cred)
+    if ($Target -and $Cred) { $script:TargetCredMap[$Target] = $Cred }
+}
+
+function Test-IsAuthFailure {
+    <#  Heuristic: does this error text look like an authentication/authorization
+        rejection (as opposed to a network/timeout failure)? Used to decide
+        whether retrying with the alternate credential set is worth doing.  #>
+    param([string]$ErrorText)
+    if (-not $ErrorText) { return $false }
+    $patterns = @(
+        'access is denied', 'accessdenied', 'logon failure', 'authentication',
+        'unauthorized', 'bad username or password', 'user name or password',
+        'account is not authorized', '5985.*denied', 'winrm.*denied',
+        'credential', 'not have permission', '0x80070005', '0x8009030e'
+    )
+    foreach ($p in $patterns) { if ($ErrorText -imatch $p) { return $true } }
+    return $false
+}
+
 # -- COMPANION SOURCE PATHS ---------------------------------------------------
 # Ordered list of locations to search for Invoke-ServerDiscovery when the
 # local copy is missing or truncated (RDP/SMB clipboard truncation is common).
@@ -1684,7 +1743,10 @@ function Invoke-Cleanup {
         Write-Host ""; B-Warn "Restoring WinRM states before exit..."
         foreach ($e in $script:WinRMRestoreMap.GetEnumerator()) {
             if (-not $e.Value.WasAlreadyOn) {
-                Restore-WinRMState -Target $e.Key -Cred $script:DomainCred -Orig $e.Value.OriginalState
+                # Use the per-target credential that actually enabled WinRM -- the
+                # primary set may not authenticate against a workgroup/other-domain
+                # host, and a rejected restore leaves WinRM ON for the client.
+                Restore-WinRMState -Target $e.Key -Cred (Get-CredForTarget -Target $e.Key) -Orig $e.Value.OriginalState
             }
         }
         B-OK "WinRM cleanup complete."
@@ -1768,6 +1830,30 @@ function Add-HypervisorSource {
 
                 if ($pf.IsHost) {
                     B-OK "Hyper-V host confirmed ($($pf.PassCount)/4 signals). Running locally -- no creds needed."
+
+                    # A Hyper-V host is frequently NOT domain-joined even when every
+                    # guest on it is. In that case one credential set cannot cover
+                    # both: the host needs a LOCAL admin, the guests need DOMAIN creds.
+                    # Detect it here and capture the host's local admin separately.
+                    $domJoined = Test-LocalMachineDomainJoined
+                    $src.IsDomainJoined = $domJoined
+                    if ($domJoined -eq $false) {
+                        Write-Host ""
+                        B-Warn "This Hyper-V host is NOT domain-joined (workgroup: $env:COMPUTERNAME)."
+                        Write-Host "  The host itself is discovered LOCALLY, so it needs no credentials." -ForegroundColor Gray
+                        Write-Host "  Its GUESTS may still be domain-joined and WILL need domain creds." -ForegroundColor Gray
+                        Write-Host "  You'll be asked for the GUEST/server credentials next -- enter the" -ForegroundColor Gray
+                        Write-Host "  DOMAIN\user there, not the host's local admin." -ForegroundColor Cyan
+                        Write-Host ""
+                        Write-Host "  If some guests are ALSO workgroup machines, answer YES to the" -ForegroundColor DarkGray
+                        Write-Host "  'second credential set' prompt that follows and supply .\Administrator." -ForegroundColor DarkGray
+                        $script:HVHostIsWorkgroup = $true
+                    } elseif ($domJoined -eq $true) {
+                        Write-Host "    Host is domain-joined." -ForegroundColor DarkGray
+                    } else {
+                        Write-Host "    Could not determine domain membership (proceeding)." -ForegroundColor DarkGray
+                    }
+
                     $hvProceed = $true
                     break
                 }
@@ -1852,6 +1938,38 @@ if (-not $_credReused) {
         if (-not $script:DomainCred) { throw "No credentials" }
         B-OK "Server creds loaded: $($script:DomainCred.UserName)"
     } catch { B-Err "No credentials entered - cannot proceed"; exit 1 }
+}
+
+# -- OPTIONAL SECOND CREDENTIAL SET -------------------------------------------
+# Covers mixed environments that a single cred set cannot authenticate against:
+#   - a workgroup Hyper-V host (or workgroup guests) alongside domain servers
+#   - two AD domains with no trust between them
+# When a target rejects the primary creds with an AUTH error, discovery
+# automatically retries with this set and remembers which one worked.
+Write-Host ""
+if ($script:HVHostIsWorkgroup) {
+    Write-Host "  A non-domain-joined Hyper-V host was detected earlier." -ForegroundColor Yellow
+    Write-Host "  If ANY target needs different credentials (workgroup guests, a" -ForegroundColor Gray
+    Write-Host "  second domain), add a second credential set now." -ForegroundColor Gray
+    $_altAns  = Read-Safe "  Add a second credential set? [Y/n]"
+    $_wantAlt = -not ($_altAns -imatch '^[Nn]')      # default YES in this case
+} else {
+    Write-Host "  Do any targets need DIFFERENT credentials?" -ForegroundColor White
+    Write-Host "  (workgroup/non-domain servers, or a second untrusted AD domain)" -ForegroundColor DarkGray
+    $_altAns  = Read-Safe "  Add a second credential set? [y/N]"
+    $_wantAlt = ($_altAns -imatch '^[Yy]')           # default NO
+}
+
+if ($_wantAlt) {
+    try {
+        $script:AltCred = Get-Credential -Message "SECOND credential set -- e.g. .\Administrator or OTHERDOMAIN\user"
+        if ($script:AltCred) {
+            B-OK "Alternate creds loaded: $($script:AltCred.UserName)"
+            Write-Host "  Targets that reject the primary creds will auto-retry with this set." -ForegroundColor DarkGray
+        } else {
+            B-Line "No alternate credentials entered - continuing with one set."
+        }
+    } catch { B-Line "Alternate credential prompt skipped - continuing with one set." }
 }
 
 # -----------------------------------------------------------------------------
@@ -2612,19 +2730,39 @@ foreach ($row in $autoRows) {
     # -- LOCAL vs REMOTE -------------------------------------------------------
     $isLocal = ($row.ConnectMethod -eq 'LOCAL')
 
+    # Resolve which credential set this target should use. A per-target override
+    # (learned from a previous successful alt-cred retry) wins over the primary.
+    $tgtCred = Get-CredForTarget -Target $target
+
     if ($isLocal) {
         # Running on the machine itself - no WinRM, no creds
         B-OK "LOCAL target - running discovery in-process (no WinRM needed)"
         Write-Log 'INFO' $row.DisplayName "LOCAL run - no WinRM needed"
     } else {
         # -- WinRM Bootstrap ---------------------------------------------------
-        $ws = Get-WinRMStateViaWMI -Target $target -Cred $script:DomainCred
+        $ws = Get-WinRMStateViaWMI -Target $target -Cred $tgtCred
+
+        # If the WMI probe was rejected on auth grounds and we have a second
+        # credential set, retry the probe with it before giving up. This is the
+        # workgroup-Hyper-V / untrusted-second-domain case.
+        if ((-not $ws.OK) -and $script:AltCred -and (Test-IsAuthFailure $ws.Error)) {
+            B-Warn "    Primary creds rejected by $target - retrying with alternate set..."
+            Write-Log 'INFO' $row.DisplayName "Primary creds auth-failed, trying alternate: $($ws.Error)"
+            $wsAlt = Get-WinRMStateViaWMI -Target $target -Cred $script:AltCred
+            if ($wsAlt.OK) {
+                $ws = $wsAlt
+                $tgtCred = $script:AltCred
+                Set-CredForTarget -Target $target -Cred $script:AltCred
+                B-OK "    Alternate creds accepted by $target ($($script:AltCred.UserName))"
+                Write-Log 'OK' $row.DisplayName "Alternate creds accepted: $($script:AltCred.UserName)"
+            }
+        }
         $weEnabled = $false
 
         if ($ws.OK -and -not $ws.Running) {
             B-Warn "WinRM OFF on $target - enabling temporarily via WMI..."
             Write-Log 'INFO' $row.DisplayName "WinRM was OFF - attempting WMI bootstrap"
-            if (Enable-WinRMViaWMI -Target $target -Cred $script:DomainCred) {
+            if (Enable-WinRMViaWMI -Target $target -Cred $tgtCred) {
                 $weEnabled = $true
                 $script:WinRMRestoreMap[$target] = @{ WasAlreadyOn=$false; OriginalState=$ws }
                 B-OK "WinRM enabled on $target - will restore when done"
@@ -2674,30 +2812,67 @@ foreach ($row in $autoRows) {
                 $psDirectOK = $false
                 try {
                     Write-Host "    [Discovery] Trying PowerShell Direct (VMName=$($hvGuestInfo.VMName))..." -ForegroundColor DarkCyan
-                    & $DiscoveryScript -HyperVGuestVMName $hvGuestInfo.VMName -Credential $script:DomainCred -OutputPath $sessionFolder
+                    & $DiscoveryScript -HyperVGuestVMName $hvGuestInfo.VMName -Credential $tgtCred -OutputPath $sessionFolder
                     $psDirectOK = $true
                     Write-Log 'INFO' $row.DisplayName "PowerShell Direct path completed"
                 } catch {
                     $psErr = $_.ToString()
                     B-Warn "    PS Direct failed ($psErr) -- falling back to WinRM"
                     Write-Log 'WARN' $row.DisplayName "PS Direct failed: $psErr"
+                    # A workgroup Hyper-V host running domain-joined guests (or the
+                    # reverse) fails PS Direct on credentials, not transport. Retry
+                    # PS Direct once with the alternate set before dropping to WinRM.
+                    if ($script:AltCred -and (Test-IsAuthFailure $psErr)) {
+                        try {
+                            Write-Host "    [Discovery] Retrying PowerShell Direct with alternate creds..." -ForegroundColor DarkCyan
+                            & $DiscoveryScript -HyperVGuestVMName $hvGuestInfo.VMName -Credential $script:AltCred -OutputPath $sessionFolder
+                            $psDirectOK = $true
+                            $tgtCred = $script:AltCred
+                            Set-CredForTarget -Target $target -Cred $script:AltCred
+                            B-OK "    Alternate creds worked for $($row.DisplayName)"
+                            Write-Log 'OK' $row.DisplayName "PS Direct succeeded with alternate creds"
+                        } catch {
+                            Write-Log 'WARN' $row.DisplayName "PS Direct alt-cred retry also failed: $_"
+                        }
+                    }
                 }
                 if ($psDirectOK) {
                     $ok = $true
                 } else {
                     # ---- Leg 2: WinRM by IP/name ----
-                    & $DiscoveryScript -ComputerName $target -Credential $script:DomainCred -OutputPath $sessionFolder
+                    & $DiscoveryScript -ComputerName $target -Credential $tgtCred -OutputPath $sessionFolder
                     $ok = $true
                 }
             }
             else {
-                & $DiscoveryScript -ComputerName $target -Credential $script:DomainCred -OutputPath $sessionFolder
+                & $DiscoveryScript -ComputerName $target -Credential $tgtCred -OutputPath $sessionFolder
                 $ok = $true
             }
         } catch {
             $discError = $_.ToString()
-            B-Err "Discovery script exception on $target`: $discError"
-            Write-Log 'FAIL' $row.DisplayName "Discovery script threw exception: $discError"
+            # Last-chance retry: primary creds rejected on auth grounds and a
+            # second credential set is available.
+            if ($script:AltCred -and (Test-IsAuthFailure $discError) -and
+                ($tgtCred -ne $script:AltCred) -and -not $isLocal) {
+                B-Warn "    Auth failure on $target - retrying discovery with alternate creds..."
+                Write-Log 'INFO' $row.DisplayName "Discovery auth-failed, retrying with alternate creds"
+                try {
+                    & $DiscoveryScript -ComputerName $target -Credential $script:AltCred -OutputPath $sessionFolder
+                    $ok = $true
+                    $discError = ''
+                    $tgtCred = $script:AltCred
+                    Set-CredForTarget -Target $target -Cred $script:AltCred
+                    B-OK "    Alternate creds accepted by $target"
+                    Write-Log 'OK' $row.DisplayName "Discovery succeeded with alternate creds"
+                } catch {
+                    $discError = $_.ToString()
+                    B-Err "Discovery failed on $target with BOTH credential sets: $discError"
+                    Write-Log 'FAIL' $row.DisplayName "Both credential sets failed: $discError"
+                }
+            } else {
+                B-Err "Discovery script exception on $target`: $discError"
+                Write-Log 'FAIL' $row.DisplayName "Discovery script threw exception: $discError"
+            }
         }
 
         # Find output JSON
@@ -2723,7 +2898,9 @@ foreach ($row in $autoRows) {
         if (-not $isLocal -and $weEnabled) {
             Write-Host ""
             try {
-                Restore-WinRMState -Target $target -Cred $script:DomainCred -Orig $ws
+                # Must restore with the SAME creds that enabled it, or the restore
+                # is rejected and we leave WinRM turned on for the client.
+                Restore-WinRMState -Target $target -Cred (Get-CredForTarget -Target $target) -Orig $ws
                 $script:WinRMRestoreMap.Remove($target)
             } catch {
                 Write-Log 'WARN' $target "WinRM restore failed in finally block: $_"
