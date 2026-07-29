@@ -2477,14 +2477,166 @@ def build_ad_tab():
     else:
         out += '<div class="flag-info"><div class="flag-label">No business shares detected</div><div class="flag-detail">No non-admin SMB shares were detected on any in-scope server.</div></div>'
 
-    # -- Print-server printers (shared queues + access + deploying GPO) --------
-    out += render_printers_section()
-
-    # -- Group Policy (linked GPOs only, deep-dive) ---------------------------
-    out += render_gpo_section()
+    # Group Policy and Printers now live in their own top-level tabs (they are
+    # scoping/billing surfaces in their own right, not AD trivia). Cross-link
+    # rather than duplicating the content here.
+    _gpo_n = _count_linked_gpos()
+    _prn_n = _count_shared_queues()
+    if _gpo_n or _prn_n:
+        out += '<div class="sub-title" style="margin-top:24px;">Group Policy &amp; Printing</div>\n'
+        bits = []
+        if _gpo_n:
+            bits.append(f'<a href="#" onclick="showTab(\'gpo\');return false;" style="color:#5b1fa4;font-weight:600;text-decoration:none;">'
+                        f'{_gpo_n} linked GPO(s) &rarr; Group Policy tab</a>')
+        if _prn_n:
+            bits.append(f'<a href="#" onclick="showTab(\'printers\');return false;" style="color:#5b1fa4;font-weight:600;text-decoration:none;">'
+                        f'{_prn_n} shared print queue(s) &rarr; Printers tab</a>')
+        out += ('<div style="font-size:9pt;color:#6b6080;">'
+                + ' &nbsp;&bull;&nbsp; '.join(bits) + '</div>\n')
 
     out += '</div>'  # close padding wrapper
     return out
+
+
+# -- SHARED GPO / PRINTER DATA COLLECTION -------------------------------------
+# Both the standalone tabs and the AD cross-links read from these, so the
+# traversal of every server's discovery JSON lives in exactly one place.
+
+def _collect_gpo_data():
+    """Return (gpo_list, meta). Deduplicates GPOs seen across multiple DCs."""
+    gpos = {}
+    meta = {'any_dc': False, 'partial': False, 'total': 0, 'linked': 0,
+            'diags': [], 'methods': []}
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d = srv.get('data', {}) or {}
+        g = d.get('GPO')
+        if not isinstance(g, dict):
+            continue
+        # Capture diagnostics BEFORE the Available gate: they exist precisely
+        # when collection failed, which is the case we most need to explain.
+        _m = str(g.get('Method', '') or '')
+        if _m and _m not in meta['methods']: meta['methods'].append(_m)
+        for _d in (g.get('Diagnostics') or []):
+            _t = f"{srv.get('name','')}: {_d}"
+            if _t not in meta['diags']: meta['diags'].append(_t)
+        if not g.get('Available'):
+            continue
+        meta['any_dc'] = True
+        if g.get('Partial'): meta['partial'] = True
+        meta['total']  = max(meta['total'],  int(g.get('TotalCount', 0) or 0))
+        meta['linked'] = max(meta['linked'], int(g.get('LinkedCount', 0) or 0))
+        for gp in as_list(g.get('GPOs', [])):
+            if gp.get('Id'):
+                gpos.setdefault(str(gp['Id']), gp)
+    out = list(gpos.values())
+    out.sort(key=lambda x: str(x.get('Name', '')).lower())
+    return out, meta
+
+
+def _collect_print_data():
+    """Return (print_servers, meta) where print_servers is [(name, queues)]."""
+    ps_list = []
+    meta = {'partial': False, 'any': False, 'diags': [], 'methods': []}
+    for srv in servers:
+        if srv.get('os_type') == 'linux': continue
+        d = srv.get('data', {}) or {}
+        ps = d.get('PrintServer')
+        if not isinstance(ps, dict): continue
+        if ps.get('Partial'): meta['partial'] = True
+        _m = str(ps.get('Method', '') or '')
+        if _m and _m not in meta['methods']: meta['methods'].append(_m)
+        for _d in (ps.get('Diagnostics') or []):
+            _t = f"{srv.get('name','')}: {_d}"
+            if _t not in meta['diags']: meta['diags'].append(_t)
+        if ps.get('IsPrintServer'):
+            meta['any'] = True
+            queues = as_list(ps.get('Queues', []))
+            if queues:
+                ps_list.append((srv.get('name', ''), queues, ps.get('DetectedBy', '')))
+    return ps_list, meta
+
+
+def _count_linked_gpos():
+    return len(_collect_gpo_data()[0])
+
+
+def _count_shared_queues():
+    return sum(len(q) for _, q, _ in _collect_print_data()[0])
+
+
+def _gpo_complexity(gp):
+    """Score a GPO's migration effort so complex policies can be priced.
+
+    Effort tracks how much work it is to reproduce a policy in Intune/Entra:
+    the number of distinct settings, how many different areas it spans, how
+    many places it is linked, and whether it uses areas with no clean cloud
+    equivalent (logon scripts, drive maps, deployed printers).
+    """
+    raw   = as_list(gp.get('RawSettings', []))
+    cats_raw = gp.get('Categories')
+    cats  = [cats_raw] if isinstance(cats_raw, str) else list(cats_raw or [])
+    links = as_list(gp.get('Links', []))
+
+    n_set   = len(raw)
+    n_area  = len({str(r.get('Area', '')) for r in raw if r.get('Area')})
+    n_link  = len(links)
+
+    # Areas that do NOT map cleanly to Intune/Entra - these drive real effort.
+    HARD = {'scripts', 'drive_maps', 'folder_redirection', 'software_install', 'printers'}
+    hard_hits = sorted({c for c in cats if c in HARD})
+
+    score = n_set + (n_area * 3) + (n_link * 2) + (len(hard_hits) * 8)
+    if score >= 45 or n_set >= 40 or len(hard_hits) >= 3:
+        band, color = 'Complex', 'red'
+    elif score >= 15 or n_set >= 12 or hard_hits:
+        band, color = 'Moderate', 'yellow'
+    else:
+        band, color = 'Simple', 'green'
+    return {'score': score, 'band': band, 'color': color, 'settings': n_set,
+            'areas': n_area, 'links': n_link, 'hard': hard_hits}
+
+
+def _diag_panel(diags, methods, what):
+    """Explain an empty/partial section instead of leaving a blank tab. The
+    collector records exactly which method it used and why each one failed."""
+    if not diags and not methods:
+        return ''
+    out = ('<details style="margin-top:14px;border:1px solid #e5e1ee;border-radius:6px;">'
+           '<summary style="cursor:pointer;padding:8px 12px;font-size:8.5pt;color:#5b1fa4;'
+           'font-weight:600;list-style:none;">Why does this look like this? '
+           f'({what} collection diagnostics)</summary>'
+           '<div style="padding:8px 12px 12px 12px;border-top:1px solid #efecf6;">')
+    if methods:
+        out += (f'<div style="font-size:8.5pt;margin-bottom:6px;">Collected via: '
+                f'<strong>{h(", ".join(methods))}</strong></div>')
+    if diags:
+        out += '<ul style="font-size:8pt;color:#6b6080;margin:0;padding-left:18px;">'
+        for d in diags[:40]:
+            out += f'<li>{h(str(d))}</li>'
+        out += '</ul>'
+    out += '</div></details>'
+    return out
+
+
+def _gpo_target_pretty(dn):
+    """Render a GPO link target readably: an OU path or the domain root,
+    rather than a raw distinguished name."""
+    dn = str(dn or '')
+    if dn.upper().startswith('DC='):
+        return '(Domain root) ' + '.'.join(p.split('=')[1] for p in dn.split(',')
+                                           if p.upper().startswith('DC='))
+    ous = [p.split('=', 1)[1] for p in dn.split(',') if p.upper().startswith('OU=')]
+    return ' > '.join(reversed(ous)) if ous else dn
+
+
+_HARD_LABEL = {
+    'scripts':            'logon/startup scripts',
+    'drive_maps':         'mapped drives',
+    'folder_redirection': 'folder redirection',
+    'software_install':   'MSI software deployment',
+    'printers':           'printer deployment',
+}
 
 
 def _gpo_synopsis(categories):
@@ -2519,138 +2671,203 @@ def _gpo_synopsis(categories):
     return ' '.join(sentences)
 
 
-def render_printers_section():
-    """Print-server printers: shared queues, print-access flag (open vs named
-    security group), and the deploying GPO (if any). Auto-detected print
-    servers only."""
-    print_servers = []  # [(server_name, queues[])]
-    _ps_partial = False
-    for srv in servers:
-        if srv.get('os_type') == 'linux': continue
-        d = srv.get('data', {}) or {}
-        ps = d.get('PrintServer')
-        if isinstance(ps, dict) and ps.get('Partial'): _ps_partial = True
-        if isinstance(ps, dict) and ps.get('IsPrintServer'):
-            queues = ps.get('Queues') if isinstance(ps.get('Queues'), list) else []
-            if queues:
-                print_servers.append((srv.get('name',''), queues))
+def build_printers_tab():
+    """Standalone Printers tab: every print server, its shared queues, who is
+    allowed to print (open vs named security group), and which GPO deploys the
+    printer. Access groups are the thing that has to be rebuilt in Entra /
+    Universal Print, so they are surfaced up front, not buried."""
+    print_servers, meta = _collect_print_data()
 
-    out = '<div class="sub-title" style="margin-top:28px;">Print Server Queues</div>\n'
     if not print_servers:
-        out += ('<div class="flag-info"><div class="flag-label">No print servers detected</div>'
-                '<div class="flag-detail">No in-scope server reported the Print Server role with shared queues. '
-                'If a print server exists, ensure it was in the discovery target list and WinRM reached it.</div></div>')
-        return out
+        body = ('<div class="flag-info"><div class="flag-label">No print servers detected</div>'
+                '<div class="flag-detail">No in-scope server reported the Print Server role with shared '
+                'queues. If a print server exists, make sure it was included in the discovery target list '
+                'and that WinRM reached it. Print queues are collected from the server hosting them, not '
+                'from workstations.</div></div>')
+        body += _diag_panel(meta['diags'], meta['methods'], 'print server')
+        return f'<div style="padding:24px;">{body}</div>'
 
-    if _ps_partial:
-        out += ('<div class="flag-warning" style="margin-bottom:12px;">'
+    all_q       = [q for _, qs, _ in print_servers for q in qs]
+    total_q     = len(all_q)
+    restricted  = [q for q in all_q if str(q.get('Access')) == 'restricted']
+    open_q      = [q for q in all_q if str(q.get('Access')) == 'open']
+    unknown_q   = [q for q in all_q if str(q.get('Access')) not in ('open', 'restricted')]
+    gpo_deployed = [q for q in all_q if q.get('DeployedByGPO')]
+
+    # Every distinct security group that gates a printer - this is the list that
+    # has to exist in Entra before Universal Print can reproduce the mapping.
+    all_groups = []
+    for q in restricted:
+        g = q.get('AccessGroups')
+        glist = [g] if isinstance(g, str) else (g if isinstance(g, list) else [])
+        for x in glist:
+            if x and str(x) not in all_groups:
+                all_groups.append(str(x))
+
+    out  = '<div style="padding:24px;">'
+    if meta['partial']:
+        out += ('<div class="flag-warning" style="margin-bottom:16px;">'
                 '<div class="flag-label">Partial Print Server Data</div>'
-                '<div class="flag-detail">Print queue collection was incomplete (ACL read denied or the '
-                'SYSVOL scan timed out). Access flags below may be missing.</div></div>')
-    total_q = sum(len(q) for _, q in print_servers)
-    restricted_n = sum(1 for _, qs in print_servers for q in qs if str(q.get('Access')) == 'restricted')
-    out += (f'<div style="font-size:8.5pt;color:#6b6080;margin-bottom:8px;">'
-            f'{total_q} shared queue(s) across {len(print_servers)} print server(s). '
-            f'{restricted_n} restricted to named security group(s) &mdash; these groups must be recreated in '
-            f'Entra ID / Universal Print during migration.</div>')
-    out += ('<table style="width:100%;"><tr>'
-            '<th>Printer</th><th>Print Server</th><th>Share</th><th>Access</th>'
-            '<th>Deployed By GPO</th></tr>')
-    ridx = 0
-    for nm, queues in print_servers:
-        for q in queues:
-            access = str(q.get('Access','unknown'))
-            groups = q.get('AccessGroups') if isinstance(q.get('AccessGroups'), list) else []
+                '<div class="flag-detail">Queue collection was incomplete (ACL read denied, or the SYSVOL '
+                'scan for GPO-deployed printers timed out). Access flags below may be missing.</div></div>')
+
+    out += (f'<div class="stat-grid">'
+            f'<div class="stat-box"><div class="stat-num">{len(print_servers)}</div><div class="stat-lbl">Print Servers</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{total_q}</div><div class="stat-lbl">Shared Queues</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{len(restricted)}</div><div class="stat-lbl">Restricted by Group</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{len(gpo_deployed)}</div><div class="stat-lbl">GPO-Deployed</div></div>'
+            f'</div>\n')
+
+    # Migration callout - the actual work item this tab exists to surface
+    if all_groups:
+        out += ('<div class="flag-warning" style="margin-top:16px;">'
+                '<div class="flag-label">Security groups gating printer access &mdash; must exist in Entra ID</div>'
+                '<div class="flag-detail">These groups control who can print. Each one has to be recreated '
+                '(or synced) and re-assigned in Universal Print / Intune before these printers work the same '
+                f'way after migration:<br><strong>{h(", ".join(all_groups))}</strong></div></div>\n')
+
+    # ---- Per print server ----
+    for nm, queues, detected in print_servers:
+        rest_n = sum(1 for q in queues if str(q.get('Access')) == 'restricted')
+        out += (f'<div class="sub-title" style="margin-top:24px;">{h(nm)}</div>\n'
+                f'<div style="font-size:8.5pt;color:#6b6080;margin-bottom:8px;">'
+                f'{len(queues)} shared queue(s), {rest_n} restricted'
+                + (f' &nbsp;&bull;&nbsp; detected via {h(str(detected))}' if detected else '')
+                + '</div>\n')
+        out += ('<table style="width:100%;"><tr>'
+                '<th>Printer</th><th>Share</th><th>Driver</th><th>Port / Host</th>'
+                '<th>Who Can Print</th><th>Deployed By GPO</th></tr>')
+        for i, q in enumerate(queues):
+            access = str(q.get('Access', 'unknown'))
+            g = q.get('AccessGroups')
+            groups = [g] if isinstance(g, str) else (g if isinstance(g, list) else [])
             if access == 'open':
                 acc_html = '<span class="pill pill-green">Everyone / Authenticated Users</span>'
             elif access == 'restricted':
-                gl = ', '.join(h(str(g)) for g in groups) if groups else 'named group'
-                acc_html = f'<span class="pill pill-yellow">Restricted</span> <span style="font-size:8.5pt;color:#271e41;">{gl}</span>'
+                gl = ', '.join(h(str(x)) for x in groups) if groups else 'named group'
+                acc_html = (f'<span class="pill pill-yellow">Restricted</span> '
+                            f'<div style="font-size:8pt;color:#271e41;margin-top:3px;">{gl}</div>')
             else:
                 acc_html = '<span class="pill pill-gray">Unknown</span>'
-            gpo = q.get('DeployedByGPO','') or ''
-            gpo_html = f'<span class="pill pill-purple">{h(str(gpo))}</span>' if gpo else '<span style="color:#6b6080;font-size:8.5pt;">not GPO-deployed</span>'
-            bg = ' style="background:#f5f4f8"' if ridx % 2 else ''
+            gpo = q.get('DeployedByGPO', '') or ''
+            gpo_html = (f'<span class="pill pill-purple">{h(str(gpo))}</span>' if gpo
+                        else '<span style="color:#6b6080;font-size:8pt;">not GPO-deployed</span>')
+            bg = ' style="background:#f5f4f8"' if i % 2 else ''
             out += (f'<tr{bg}><td><strong>{h(str(q.get("Name","")))}</strong></td>'
-                    f'<td>{h(nm)}</td>'
-                    f'<td style="font-family:monospace;font-size:8.5pt">{h(str(q.get("ShareName","") or ""))}</td>'
+                    f'<td style="font-family:monospace;font-size:8.5pt">{h(str(q.get("ShareName","") or "-"))}</td>'
+                    f'<td style="font-size:8.5pt;color:#6b6080;">{h(str(q.get("Driver","") or "-"))}</td>'
+                    f'<td style="font-family:monospace;font-size:8pt;color:#6b6080;">{h(str(q.get("Port","") or "-"))}</td>'
                     f'<td>{acc_html}</td>'
                     f'<td>{gpo_html}</td></tr>')
-            ridx += 1
-    out += '</table>'
+        out += '</table>\n'
+
+    if unknown_q:
+        out += ('<div class="flag-info" style="margin-top:16px;"><div class="flag-label">'
+                f'{len(unknown_q)} queue(s) with unreadable permissions</div>'
+                '<div class="flag-detail">The print queue security descriptor could not be read with the '
+                'discovery account. Re-run with an account holding Manage Printers rights on the print '
+                'server to resolve who can print.</div></div>')
+
+    out += _diag_panel(meta['diags'], meta['methods'], 'print server')
+    out += '</div>'
     return out
 
 
-def render_gpo_section():
-    """Linked GPOs only. Each: name + where-applied + plain-English synopsis,
-    collapsed by default; expand for the raw settings."""
-    gpos = {}       # id -> gpo dict (deduped across DCs)
-    total_seen = 0
-    linked_seen = 0
-    any_dc = False
-    _gpo_partial = False
-    for srv in servers:
-        if srv.get('os_type') == 'linux': continue
-        d = srv.get('data', {}) or {}
-        g = d.get('GPO')
-        if not isinstance(g, dict) or not g.get('Available'):
-            continue
-        any_dc = True
-        if g.get('Partial'): _gpo_partial = True
-        total_seen  = max(total_seen,  int(g.get('TotalCount',  0) or 0))
-        linked_seen = max(linked_seen, int(g.get('LinkedCount', 0) or 0))
-        for gp in (g.get('GPOs') or []):
-            if isinstance(gp, dict) and gp.get('Id'):
-                gpos.setdefault(str(gp['Id']), gp)
+def build_gpo_tab():
+    """Standalone Group Policy tab.
 
-    out = '<div class="sub-title" style="margin-top:28px;">Group Policy (Linked GPOs)</div>\n'
-    if not any_dc:
-        out += ('<div class="flag-info"><div class="flag-label">No GPO data collected</div>'
-                '<div class="flag-detail">GPO deep-dive requires the GroupPolicy + ActiveDirectory modules on a '
-                'reachable Domain Controller. Re-run discovery with a DC in scope and domain admin credentials.</div></div>')
-        return out
+    Only GPOs that are actually LINKED somewhere are shown - unlinked policies
+    are noise for migration scoping. Each GPO carries a migration-complexity
+    band so the effort to reproduce it in Intune/Entra can be priced, since
+    complex policies are billable work rather than a like-for-like move.
+    """
+    gpo_list, meta = _collect_gpo_data()
 
-    if _gpo_partial:
-        out += ('<div class="flag-warning" style="margin-bottom:12px;">'
+    if not meta['any_dc'] or not gpo_list:
+        body = ('<div class="flag-info"><div class="flag-label">No Group Policy data collected</div>'
+                '<div class="flag-detail">The GPO deep-dive requires the GroupPolicy and ActiveDirectory '
+                'modules on a reachable Domain Controller. Re-run discovery with a DC in scope, using an '
+                'account that can read Group Policy inheritance.</div></div>')
+        body += _diag_panel(meta['diags'], meta['methods'], 'GPO')
+        return f'<div style="padding:24px;">{body}</div>'
+
+    scored = [(gp, _gpo_complexity(gp)) for gp in gpo_list]
+    n_complex  = sum(1 for _, c in scored if c['band'] == 'Complex')
+    n_moderate = sum(1 for _, c in scored if c['band'] == 'Moderate')
+    n_simple   = sum(1 for _, c in scored if c['band'] == 'Simple')
+    total_settings = sum(c['settings'] for _, c in scored)
+    unlinked = max(0, meta['total'] - len(gpo_list))
+
+    out  = '<div style="padding:24px;">'
+    if meta['partial']:
+        out += ('<div class="flag-warning" style="margin-bottom:16px;">'
                 '<div class="flag-label">Partial GPO Data</div>'
                 '<div class="flag-detail">GPO collection hit a size or time limit, or some OUs could not be '
-                'read with the discovery account. Links and settings below may be incomplete - '
-                'verify in GPMC before relying on this for migration scope.</div></div>')
-    gpo_list = list(gpos.values())
-    gpo_list.sort(key=lambda x: str(x.get('Name','')).lower())
-    unlinked = max(0, total_seen - len(gpo_list))
-    out += (f'<div style="font-size:8.5pt;color:#6b6080;margin-bottom:10px;">'
-            f'{len(gpo_list)} linked GPO(s) shown. Unlinked GPOs ({unlinked} of {total_seen} total) are omitted '
-            f'&mdash; only policies actually applied somewhere matter for migration. Click a GPO to expand its raw settings.</div>')
+                'read with the discovery account. Links and settings below may be incomplete &mdash; verify '
+                'in GPMC before using this for final migration scope.</div></div>')
 
-    def _target_pretty(dn):
-        dn = str(dn or '')
-        if dn.upper().startswith('DC='):
-            return '(Domain root) ' + '.'.join(p.split('=')[1] for p in dn.split(',') if p.upper().startswith('DC='))
-        # OU=Sales,OU=US,DC=... -> Sales > US
-        ous = [p.split('=',1)[1] for p in dn.split(',') if p.upper().startswith('OU=')]
-        return ' > '.join(reversed(ous)) if ous else dn
+    out += (f'<div class="stat-grid">'
+            f'<div class="stat-box"><div class="stat-num">{len(gpo_list)}</div><div class="stat-lbl">Linked GPOs</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{total_settings}</div><div class="stat-lbl">Total Settings</div></div>'
+            f'<div class="stat-box"><div class="stat-num" style="color:#d63638;">{n_complex}</div><div class="stat-lbl">Complex</div></div>'
+            f'<div class="stat-box"><div class="stat-num" style="color:#bd8600;">{n_moderate}</div><div class="stat-lbl">Moderate</div></div>'
+            f'<div class="stat-box"><div class="stat-num" style="color:#2a7d2e;">{n_simple}</div><div class="stat-lbl">Simple</div></div>'
+            f'</div>\n')
 
-    for gp in gpo_list:
-        name = str(gp.get('Name',''))
+    out += (f'<div style="font-size:8.5pt;color:#6b6080;margin-top:10px;">'
+            f'Showing only GPOs that are actually linked to a domain, site, or OU. '
+            f'{unlinked} of {meta["total"]} total GPO(s) are unlinked and excluded &mdash; they apply to '
+            f'nothing and do not need to be migrated.</div>\n')
+
+    # ---- Migration effort summary (the billing surface) ----
+    hard_index = {}
+    for gp, c in scored:
+        for hkey in c['hard']:
+            hard_index.setdefault(hkey, []).append(str(gp.get('Name', '')))
+    if hard_index:
+        out += '<div class="sub-title" style="margin-top:24px;">Migration Effort &mdash; Areas With No Direct Intune Equivalent</div>\n'
+        out += ('<div style="font-size:8.5pt;color:#6b6080;margin-bottom:8px;">These policy areas do not '
+                'move like-for-like to Intune/Entra and typically require redesign or a replacement '
+                'mechanism. They are the main driver of GPO migration effort.</div>\n')
+        out += '<table style="width:100%;"><tr><th style="width:230px">Policy Area</th><th>GPOs</th></tr>'
+        for hkey, names in sorted(hard_index.items(), key=lambda kv: -len(kv[1])):
+            label = _HARD_LABEL.get(hkey, hkey)
+            out += (f'<tr><td><strong>{h(label)}</strong> '
+                    f'<span class="pill pill-yellow">{len(names)}</span></td>'
+                    f'<td style="font-size:8.5pt;">{h(", ".join(names[:14]))}'
+                    + (f' &hellip; +{len(names)-14} more' if len(names) > 14 else '')
+                    + '</td></tr>')
+        out += '</table>\n'
+
+    # ---- Full GPO list, hardest first so scoping starts at the top ----
+    out += '<div class="sub-title" style="margin-top:24px;">All Linked GPOs</div>\n'
+    out += ('<div style="font-size:8.5pt;color:#6b6080;margin-bottom:10px;">'
+            'Sorted by migration complexity. Click any GPO to expand its full setting list.</div>\n')
+
+    band_rank = {'Complex': 0, 'Moderate': 1, 'Simple': 2}
+    scored.sort(key=lambda t: (band_rank[t[1]['band']], -t[1]['score'], str(t[0].get('Name', '')).lower()))
+
+    for gp, c in scored:
+        name     = str(gp.get('Name', ''))
         synopsis = _gpo_synopsis(gp.get('Categories'))
-        links = gp.get('Links') if isinstance(gp.get('Links'), list) else []
+        links    = as_list(gp.get('Links', []))
+
         link_pills = ''
         for lk in links[:12]:
-            tgt = _target_pretty(lk.get('Target'))
+            tgt = _gpo_target_pretty(lk.get('Target'))
             enf = ' &bull; enforced' if lk.get('Enforced') else ''
             dis = '' if lk.get('Enabled', True) else ' (link disabled)'
             cls = 'pill-purple' if lk.get('Enabled', True) else 'pill-gray'
             link_pills += f'<span class="pill {cls}" style="margin:2px 4px 2px 0;">{h(tgt)}{enf}{dis}</span>'
+        if len(links) > 12:
+            link_pills += f'<span style="font-size:8pt;color:#6b6080;">+{len(links)-12} more link(s)</span>'
         if not link_pills:
             link_pills = '<span style="color:#6b6080;font-size:8.5pt;">linked (target detail unavailable)</span>'
 
-        raw = gp.get('RawSettings') if isinstance(gp.get('RawSettings'), list) else []
-        # Raw settings table (inside the expand)
+        raw = as_list(gp.get('RawSettings', []))
         if raw:
             raw_rows = ''
             for i, r in enumerate(raw):
-                if not isinstance(r, dict): continue
                 bg = ' style="background:#faf9fc"' if i % 2 else ''
                 raw_rows += (f'<tr{bg}><td style="font-size:8pt;color:#6b6080;">{h(str(r.get("Area","")))}</td>'
                              f'<td style="font-size:8pt;">{h(str(r.get("Category","") or ""))}</td>'
@@ -2660,12 +2877,13 @@ def render_gpo_section():
                         '<th>Area</th><th>Category</th><th>Setting</th><th>Value / State</th></tr>'
                         f'{raw_rows}</table>')
             if len(raw) >= 400:
-                raw_html += '<div style="font-size:8pt;color:#6b6080;margin-top:4px;">(raw settings capped at 400 rows)</div>'
+                raw_html += '<div style="font-size:8pt;color:#6b6080;margin-top:4px;">(setting list capped at 400 rows)</div>'
         else:
-            raw_html = ('<div style="font-size:8.5pt;color:#6b6080;margin-top:8px;">No individual settings parsed. '
-                        'The GPO may configure areas SDT does not yet itemize &mdash; review it directly in GPMC.</div>')
+            raw_html = ('<div style="font-size:8.5pt;color:#6b6080;margin-top:8px;">No individual settings were '
+                        'parsed. The GPO may configure areas SDT does not itemize yet, or the settings report '
+                        'was skipped for time &mdash; review it directly in GPMC.</div>')
 
-        status = str(gp.get('Status',''))
+        status = str(gp.get('Status', ''))
         status_note = ''
         if 'AllSettingsDisabled' in status:
             status_note = ' <span class="pill pill-gray">all settings disabled</span>'
@@ -2674,16 +2892,28 @@ def render_gpo_section():
         elif 'ComputerSettingsDisabled' in status:
             status_note = ' <span class="pill pill-gray">computer half disabled</span>'
 
+        hard_note = ''
+        if c['hard']:
+            hard_note = ('<div style="font-size:8pt;color:#bd8600;margin-top:4px;">Needs redesign for Intune: '
+                         + h(', '.join(_HARD_LABEL.get(x, x) for x in c['hard'])) + '</div>')
+
         out += (
-            '<details style="border:1px solid #e5e1ee;border-radius:6px;margin-bottom:8px;padding:0;">'
+            '<details style="border:1px solid #e5e1ee;border-radius:6px;margin-bottom:8px;">'
             '<summary style="cursor:pointer;padding:10px 12px;list-style:none;">'
+            f'<span class="pill pill-{c["color"]}" style="margin-right:8px;">{c["band"]}</span>'
             f'<span style="font-weight:600;color:#271e41;">{h(name)}</span>{status_note}'
+            f'<span style="font-size:8pt;color:#6b6080;margin-left:8px;">'
+            f'{c["settings"]} setting(s) &bull; {c["areas"]} area(s) &bull; {c["links"]} link(s)</span>'
             f'<div style="font-size:8.5pt;color:#5b4a78;margin-top:3px;">{h(synopsis)}</div>'
+            f'{hard_note}'
             f'<div style="margin-top:6px;">{link_pills}</div>'
             '</summary>'
             f'<div style="padding:4px 12px 12px 12px;border-top:1px solid #efecf6;">{raw_html}</div>'
             '</details>'
         )
+
+    out += _diag_panel(meta['diags'], meta['methods'], 'GPO')
+    out += '</div>'
     return out
 
 
@@ -2838,6 +3068,8 @@ eol_tab_html  = build_eol_tab()
 cloud_tab_html = build_private_cloud_tab()
 summary_tab_html = build_summary_tab()
 ad_tab_html    = build_ad_tab()
+gpo_tab_html   = build_gpo_tab()
+printers_tab_html = build_printers_tab()
 
 # -- LOGO ----------------------------------------------------------------------
 if LOGO_B64:
@@ -2908,6 +3140,12 @@ for bucket in BUCKET_ORDER:
     server_tab_buttons += '</div>\n'
 
 env_tab_buttons = ''  # goes into top tab-nav
+_gpo_all, _gpo_meta = _collect_gpo_data()
+_prn_all, _prn_meta = _collect_print_data()
+# Render the tab when there is data OR when the collector explained a failure,
+# so an empty section always says WHY instead of vanishing from the nav.
+_has_gpo_data     = bool(_gpo_all) or _gpo_meta['any_dc'] or bool(_gpo_meta['diags'])
+_has_printer_data = bool(_prn_all) or bool(_prn_meta['diags'])
 _has_hyperv  = any(h.get('_type') == 'HyperVInventory'   for h in hv_inventories)
 _has_vsphere = any(h.get('_type') == 'vSphereInventory'  for h in hv_inventories)
 # Fall back to manifest hv_type hint when no inventory file was collected
@@ -2922,6 +3160,12 @@ env_tab_buttons += f'<button class="tab-btn" data-tab="tab-virt" onclick="showTa
 env_tab_buttons += '<button class="tab-btn" data-tab="tab-ad" onclick="showTab(\'ad\')">Active Directory</button>\n'
 if sql_tab_html:
     env_tab_buttons += '<button class="tab-btn" data-tab="tab-sql" onclick="showTab(\'sql\')">SQL</button>\n'
+# Group Policy + Printers sit next to SQL: both are migration-scoping and
+# billing surfaces in their own right, not Active Directory sub-details.
+if _has_gpo_data:
+    env_tab_buttons += '<button class="tab-btn" data-tab="tab-gpo" onclick="showTab(\'gpo\')">Group Policy</button>\n'
+if _has_printer_data:
+    env_tab_buttons += '<button class="tab-btn" data-tab="tab-printers" onclick="showTab(\'printers\')">Printers</button>\n'
 env_tab_buttons += '<button class="tab-btn" data-tab="tab-eol" onclick="showTab(\'eol\')" style="border-top:3px solid #d63638;">EOL</button>\n'
 env_tab_buttons += '<button class="tab-btn" data-tab="tab-cloud" onclick="showTab(\'cloud\')" style="border-top:3px solid #5b1fa4;">Private Cloud + Commvault</button>\n'
 
@@ -2932,6 +3176,10 @@ for t in tabs:
     tab_contents += f'<div id="tab-{t["id"]}" class="tab-content">\n{t["tab_html"]}\n</div>\n'
 tab_contents += f'<div id="tab-virt" class="tab-content">\n{virt_tab_html}\n</div>\n'
 tab_contents += f'<div id="tab-ad" class="tab-content">\n{ad_tab_html}\n</div>\n'
+if _has_gpo_data:
+    tab_contents += f'<div id="tab-gpo" class="tab-content">\n{gpo_tab_html}\n</div>\n'
+if _has_printer_data:
+    tab_contents += f'<div id="tab-printers" class="tab-content">\n{printers_tab_html}\n</div>\n'
 if sql_tab_html:
     tab_contents += f'<div id="tab-sql" class="tab-content">\n{sql_tab_html}\n</div>\n'
 tab_contents += f'<div id="tab-eol" class="tab-content"><div style="padding:24px;">{eol_tab_html}</div></div>\n'

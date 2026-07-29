@@ -1936,7 +1936,47 @@ ORDER BY data_size_mb DESC
                     $sddl = [string]$full.PermissionSDDL
                 } catch { cb-Log "PrintServer" "Get-Printer -Full failed for $($Printer.Name): $_" }
             }
-            if ($sddl -and (Get-Command ConvertFrom-SddlString -ErrorAction SilentlyContinue)) {
+            # Manual SDDL parse - ConvertFrom-SddlString is PS 5.1+ only, so on
+            # Server 2012/2012R2 (PS 3/4) it does not exist. Parse the DACL ACEs
+            # directly and translate SIDs, which works on every version.
+            if ($sddl -and -not (Get-Command ConvertFrom-SddlString -ErrorAction SilentlyContinue)) {
+                try {
+                    $dacl = ''
+                    $mD = [regex]::Match($sddl, 'D:(.*?)(?=S:|$)')
+                    if ($mD.Success) { $dacl = $mD.Groups[1].Value }
+                    foreach ($ace in [regex]::Matches($dacl, '\(([^)]*)\)')) {
+                        $parts = $ace.Groups[1].Value -split ';'
+                        if ($parts.Count -lt 6) { continue }
+                        $trustee = $parts[5]
+                        if (-not $trustee) { continue }
+                        $acct = $trustee
+                        # Well-known SDDL aliases first, then real SID translation
+                        switch ($trustee) {
+                            'WD' { $acct = 'Everyone' }
+                            'AU' { $acct = 'Authenticated Users' }
+                            'BA' { $acct = 'Administrators' }
+                            'SY' { $acct = 'SYSTEM' }
+                            'PU' { $acct = 'Power Users' }
+                            'CO' { $acct = 'CREATOR OWNER' }
+                            'DU' { $acct = 'Domain Users' }
+                            default {
+                                if ($trustee -match '^S-1-') {
+                                    try {
+                                        $sidObj = New-Object System.Security.Principal.SecurityIdentifier($trustee)
+                                        $acct = $sidObj.Translate([System.Security.Principal.NTAccount]).Value
+                                    } catch { $acct = $trustee }
+                                }
+                            }
+                        }
+                        $short = ($acct -replace '^.*\','').Trim()
+                        $lc = $short.ToLower()
+                        if ($openTrustees -contains $lc)   { $sawOpen = $true; continue }
+                        if ($ignoreTrustees -contains $lc) { continue }
+                        if ($short -and ($named -notcontains $short)) { [void]$named.Add($short) }
+                    }
+                } catch { cb-Log "PrintServer" "Manual SDDL parse failed for $($Printer.Name): $_" }
+            }
+            elseif ($sddl -and (Get-Command ConvertFrom-SddlString -ErrorAction SilentlyContinue)) {
                 # Namespace-agnostic parse: each DACL entry looks like
                 # "DOMAIN\Group: AccessAllowed (Print, ...)".
                 $parsed = ConvertFrom-SddlString -Sddl $sddl -ErrorAction Stop
@@ -1981,32 +2021,95 @@ ORDER BY data_size_mb DESC
 
     function Collect-PrintServer {
         Write-Host "  [PrintServer] Enumerating shared print queues + ACLs..." -ForegroundColor Gray
-        $result = @{ IsPrintServer=$false; DetectedBy=''; Queues=@(); Partial=$false }
+        $result = @{ IsPrintServer=$false; DetectedBy=''; Queues=@(); Partial=$false
+                     Method=''; Diagnostics=@() }
+        $pdiag = [System.Collections.ArrayList]@()
+        $pnote = { param($m) [void]$pdiag.Add([string]$m); cb-Log "PrintServer" $m }
         try {
-            # Role signal (non-fatal if Get-WindowsFeature absent, e.g. client OS)
+            # ---- Role signal. Get-WindowsFeature needs the ServerManager module
+            # and is absent on client OS / some Core installs, so treat it as a
+            # hint only, never a gate.
             $hasRole = $false
             try {
+                if ($PSMaj -ge 4) { Import-Module ServerManager -ErrorAction SilentlyContinue }
                 $feat = Get-WindowsFeature -Name 'Print-Server' -ErrorAction SilentlyContinue
                 if ($feat -and $feat.Installed) { $hasRole = $true; $result.DetectedBy = 'Print-Server role' }
             } catch { }
+            # Registry role hint - works with no modules at all
+            if (-not $hasRole) {
+                try {
+                    if (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers' -ErrorAction SilentlyContinue) {
+                        $spooler = Get-Service -Name Spooler -ErrorAction SilentlyContinue
+                        if ($spooler -and $spooler.Status -eq 'Running') { $hasRole = $false }  # hint only
+                    }
+                } catch { }
+            }
 
-            # Shared queues: prefer Get-Printer (2012+), fall back to WMI.
+            # ---- Shared queue enumeration: three independent methods so this
+            # works on 2012 (no PrintManagement) through 2025.
             $shared = @()
             $useGetPrinter = $false
+
+            # Method 1: Get-Printer (PrintManagement module, 2012+)
             if (Get-Command Get-Printer -ErrorAction SilentlyContinue) {
                 try {
-                    $useGetPrinter = $true
                     $shared = @(Get-Printer -ErrorAction Stop | Where-Object { $_.Shared -eq $true })
-                } catch { cb-Log "PrintServer" "Get-Printer failed: $_"; $useGetPrinter = $false }
-            }
-            if (-not $useGetPrinter) {
-                $wmi = Safe-WmiQuery "SELECT * FROM Win32_Printer WHERE Shared=TRUE" "PrintServer"
-                if ($wmi) { $shared = @($wmi | Where-Object { $_.Name -notmatch 'Fax|PDF|XPS|OneNote' }) }
+                    $useGetPrinter = $true
+                    $result.Method = 'Get-Printer'
+                } catch { & $pnote "Get-Printer failed ($($_.Exception.Message.Trim())) - trying WMI" }
+            } else {
+                & $pnote "Get-Printer not available on this OS - using WMI"
             }
 
-            if (-not $hasRole -and $shared.Count -eq 0) { return $result }  # not a print server
+            # Method 2: WMI Win32_Printer (every version incl. 2008 R2)
+            if (-not $shared.Count) {
+                $wmi = Safe-WmiQuery "SELECT * FROM Win32_Printer WHERE Shared=TRUE" "PrintServer"
+                if (-not $wmi) { $wmi = Safe-Wmi Win32_Printer "PrintServer" | Where-Object { $_.Shared } }
+                if ($wmi) {
+                    $shared = @($wmi | Where-Object { $_.Name -notmatch 'Fax|PDF|XPS|OneNote' })
+                    $useGetPrinter = $false
+                    if ($shared.Count) { $result.Method = 'WMI Win32_Printer' }
+                }
+            }
+
+            # Method 3: registry (spooler present but WMI/cmdlet both blocked)
+            if (-not $shared.Count) {
+                try {
+                    $regBase = 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers'
+                    if (Test-Path $regBase -ErrorAction SilentlyContinue) {
+                        $regPrinters = Get-ChildItem $regBase -ErrorAction SilentlyContinue
+                        $fromReg = @()
+                        foreach ($rp in $regPrinters) {
+                            $props = Get-ItemProperty $rp.PSPath -ErrorAction SilentlyContinue
+                            $attr  = [int]($props.Attributes | Select-Object -First 1)
+                            # bit 3 (0x8) = shared
+                            if ($attr -band 8) {
+                                $fromReg += [PSCustomObject]@{
+                                    Name       = $rp.PSChildName
+                                    ShareName  = [string]$props.'Share Name'
+                                    DriverName = [string]$props.'Printer Driver'
+                                    PortName   = [string]$props.Port
+                                    Shared     = $true
+                                }
+                            }
+                        }
+                        if ($fromReg.Count) {
+                            $shared = $fromReg
+                            $result.Method = 'Registry (WMI + cmdlet unavailable)'
+                            & $pnote "Enumerated $($fromReg.Count) shared queue(s) from the registry"
+                        }
+                    }
+                } catch { & $pnote "Registry printer enumeration failed: $($_.Exception.Message.Trim())" }
+            }
+
+            if (-not $hasRole -and $shared.Count -eq 0) {
+                & $pnote "No shared print queues and no Print-Server role - not a print server"
+                $result.Diagnostics = @($pdiag)
+                return $result
+            }
             if (-not $result.DetectedBy) { $result.DetectedBy = 'Shared queues + Spooler' }
             $result.IsPrintServer = $true
+            & $pnote "Found $($shared.Count) shared queue(s) via $($result.Method)"
 
             $depMap = Get-GPPrinterDeployments
 
@@ -2041,7 +2144,8 @@ ORDER BY data_size_mb DESC
                     DeployedByGPO = $deployGpo
                 }
             }
-        } catch { cb-Log "PrintServer" "Outer error: $_"; $result.Partial = $true }
+        } catch { & $pnote "Outer error: $($_.Exception.Message.Trim())"; $result.Partial = $true }
+        $result.Diagnostics = @($pdiag)
         return $result
     }
 
@@ -2148,112 +2252,276 @@ ORDER BY data_size_mb DESC
     }
 
     function Collect-GPODetails {
+        <#
+            Collect every LINKED GPO, with a self-healing method chain so this
+            works on Server 2012 through 2025 and on DCs, member servers, and
+            Server Core alike.
+
+              Method A  GroupPolicy module (Get-GPO / Get-GPInheritance /
+                        Get-GPOReport). Richest data. Needs RSAT-GPMC, which
+                        is present on most DCs but NOT on member servers or
+                        many Core installs.
+              Method B  Raw ADSI/LDAP. Reads the groupPolicyContainer objects
+                        under CN=Policies,CN=System and the gPLink attribute on
+                        the domain root / every OU / every site. Requires NO
+                        modules at all - any domain member can do this.
+              Method C  SYSVOL folder inspection per GPO GUID. Infers which
+                        policy areas a GPO configures from the folders/files
+                        present (Scripts, Preferences\Drives, Registry.pol...).
+                        Used to fill in settings detail when Get-GPOReport is
+                        unavailable.
+
+            The previous version bailed out entirely when Get-GPO was missing,
+            which is why real engagements came back with an empty GPO section
+            and no explanation. Whatever happens now, Diagnostics records WHY.
+        #>
         Write-Host "  [GPO] Enumerating linked GPOs..." -ForegroundColor Gray
-        $result = @{ Available=$false; TotalCount=0; LinkedCount=0; GPOs=@(); Partial=$false }
+        $result = @{
+            Available=$false; TotalCount=0; LinkedCount=0; GPOs=@(); Partial=$false
+            Method=''; Diagnostics=@()
+        }
+        $diag = [System.Collections.ArrayList]@()
+        $note = { param($m) [void]$diag.Add([string]$m); cb-Log "GPO" $m }
+
+        $MAX_OUS      = 750
+        $GPO_BUDGET_S = 120
+        $gpoSw        = [System.Diagnostics.Stopwatch]::StartNew()
+
+        # ---------- domain context (needed by every method) ----------
+        $domainDN = ''
+        $domainDNS = ''
         try {
-            if (-not (Get-Command Get-GPO -ErrorAction SilentlyContinue)) {
-                try { Import-Module GroupPolicy -ErrorAction Stop }
-                catch { cb-Log "GPO" "GroupPolicy module unavailable - skipping"; return $result }
-            }
-            $result.Available = $true
-            $all = @(Get-GPO -All -ErrorAction Stop)
-            $result.TotalCount = $all.Count
+            $rootDSE   = [ADSI]"LDAP://RootDSE"
+            $domainDN  = [string]$rootDSE.defaultNamingContext
+            $cfgDN     = [string]$rootDSE.configurationNamingContext
+        } catch { $cfgDN = '' }
+        if (-not $domainDN) {
+            & $note "Not domain-joined or LDAP RootDSE unreachable - no Group Policy to collect"
+            $result.Diagnostics = @($diag); return $result
+        }
+        try { $domainDNS = $env:USERDNSDOMAIN } catch { }
+        if (-not $domainDNS) {
+            $domainDNS = (($domainDN -split ',') | Where-Object { $_ -match '^DC=' } |
+                          ForEach-Object { $_.Substring(3) }) -join '.'
+        }
 
-            # Build GUID -> [links] by walking domain root + every OU (and sites).
-            # Both Get-GPInheritance (per OU) and Get-GPOReport (per GPO) are slow
-            # synchronous calls. On a domain with thousands of OUs this becomes
-            # tens of minutes, so the walk is bounded by BOTH an OU cap and an
-            # overall wall-clock budget; exceeding either marks the data Partial
-            # rather than hanging the run.
-            $MAX_OUS       = 750
-            $GPO_BUDGET_S  = 120
-            $gpoSw         = [System.Diagnostics.Stopwatch]::StartNew()
-            $inhFailures   = 0
-
-            $linkMap = @{}
-            $addLinks = {
-                param($targetDN)
-                try {
-                    $inh = Get-GPInheritance -Target $targetDN -ErrorAction Stop
-                    foreach ($lnk in $inh.GpoLinks) {
-                        $id = ("{$($lnk.GpoId)}").ToUpper()
-                        if (-not $linkMap.ContainsKey($id)) { $linkMap[$id] = [System.Collections.ArrayList]@() }
-                        [void]$linkMap[$id].Add(@{
-                            Target   = [string]$targetDN
-                            Enabled  = [bool]$lnk.Enabled
-                            Enforced = [bool]$lnk.Enforced
-                            Order    = [int]$lnk.Order
-                        })
-                    }
-                } catch {
-                    # Don't swallow silently: if the account can't read GP
-                    # inheritance, EVERY call fails and the section renders empty
-                    # with no explanation of why.
-                    $script:_gpoInhErr = $_.ToString()
-                    return $false
+        # ---------- helper: parse a gPLink attribute string ----------
+        # Format: [LDAP://cn={GUID},cn=policies,cn=system,DC=x;FLAGS] repeated.
+        # FLAGS: 0 = enabled, 1 = disabled, 2 = enforced, 3 = disabled+enforced
+        $parseGPLink = {
+            param([string]$gpLink, [string]$targetDN)
+            $out = @()
+            if (-not $gpLink) { return $out }
+            foreach ($m in [regex]::Matches($gpLink, '\[LDAP://([^;]+);(\d+)\]')) {
+                $dn    = $m.Groups[1].Value
+                $flags = [int]$m.Groups[2].Value
+                $g = [regex]::Match($dn, '\{[0-9A-Fa-f-]+\}')
+                if (-not $g.Success) { continue }
+                $out += @{
+                    Guid     = $g.Value.ToUpper()
+                    Target   = $targetDN
+                    Enabled  = (($flags -band 1) -eq 0)
+                    Enforced = (($flags -band 2) -ne 0)
                 }
-                return $true
             }
+            return $out
+        }
+
+        # ---------- METHOD A: GroupPolicy module ----------
+        $haveGPModule = $false
+        if (Get-Command Get-GPO -ErrorAction SilentlyContinue) { $haveGPModule = $true }
+        else {
+            try { Import-Module GroupPolicy -ErrorAction Stop; $haveGPModule = $true }
+            catch { & $note "GroupPolicy module not available ($($_.Exception.Message.Trim())) - falling back to LDAP" }
+        }
+
+        # ---------- Build GUID -> display name, and GUID -> links ----------
+        $nameMap = @{}     # {GUID} -> display name
+        $linkMap = @{}     # {GUID} -> list of link hashtables
+
+        if ($haveGPModule) {
             try {
-                $dom = Get-ADDomain -ErrorAction Stop
-                if (-not (& $addLinks $dom.DistinguishedName)) { $inhFailures++ }
+                $all = @(Get-GPO -All -ErrorAction Stop)
+                foreach ($g in $all) { $nameMap[("{$($g.Id)}").ToUpper()] = [string]$g.DisplayName }
+                $result.TotalCount = $all.Count
+                $result.Method = 'GroupPolicy module'
+            } catch {
+                & $note "Get-GPO -All failed: $($_.Exception.Message.Trim())"
+                $haveGPModule = $false
+            }
+        }
 
-                $ous = @(Get-ADOrganizationalUnit -Filter * -ResultPageSize 256 -ErrorAction Stop)
-                if ($ous.Count -gt $MAX_OUS) {
-                    cb-Log "GPO" "Domain has $($ous.Count) OUs - capping link enumeration at $MAX_OUS"
-                    $result.Partial = $true
-                    $ous = $ous | Select-Object -First $MAX_OUS
+        # LDAP enumeration of GPOs - always run when the module path didn't
+        # produce names, and used as the authoritative link source either way
+        # (gPLink is cheap to read and needs no modules).
+        if (-not $nameMap.Count) {
+            try {
+                $polDN = "CN=Policies,CN=System,$domainDN"
+                $searcher = New-Object System.DirectoryServices.DirectorySearcher
+                $searcher.SearchRoot = [ADSI]"LDAP://$polDN"
+                $searcher.Filter     = '(objectClass=groupPolicyContainer)'
+                $searcher.PageSize   = 200
+                [void]$searcher.PropertiesToLoad.Add('displayname')
+                [void]$searcher.PropertiesToLoad.Add('cn')
+                foreach ($r in $searcher.FindAll()) {
+                    $cn = [string]$r.Properties['cn'][0]
+                    $dn = if ($r.Properties['displayname'].Count) { [string]$r.Properties['displayname'][0] } else { $cn }
+                    if ($cn) { $nameMap[$cn.ToUpper()] = $dn }
                 }
-                foreach ($ou in $ous) {
-                    if ($gpoSw.Elapsed.TotalSeconds -gt $GPO_BUDGET_S) {
-                        cb-Log "GPO" "OU link walk exceeded ${GPO_BUDGET_S}s budget - stopping early (partial links)"
-                        $result.Partial = $true
-                        break
-                    }
-                    if (-not (& $addLinks $ou.DistinguishedName)) { $inhFailures++ }
-                }
-                if ($inhFailures -gt 0) {
-                    cb-Log "GPO" "Get-GPInheritance failed on $inhFailures target(s). Last error: $($script:_gpoInhErr)"
-                    if ($inhFailures -ge $ous.Count) { $result.Partial = $true }
-                }
-            } catch { cb-Log "GPO" "OU enumeration failed (need AD module on a DC): $_"; $result.Partial = $true }
+                $searcher.Dispose()
+                $result.TotalCount = $nameMap.Count
+                if (-not $result.Method) { $result.Method = 'LDAP (no GroupPolicy module)' }
+                & $note "LDAP enumeration found $($nameMap.Count) GPO object(s)"
+            } catch {
+                & $note "LDAP GPO enumeration failed: $($_.Exception.Message.Trim())"
+            }
+        }
 
-            $result.LinkedCount = $linkMap.Keys.Count
-
-            $reportBudgetS = $GPO_BUDGET_S + 180   # allow more time for the reports themselves
-            foreach ($g in $all) {
-                $gid = ("{$($g.Id)}").ToUpper()
-                if (-not $linkMap.ContainsKey($gid)) { continue }   # skip UNLINKED GPOs entirely
-                $links = @($linkMap[$gid] | ForEach-Object {
-                    @{ Target=$_.Target; Enabled=$_.Enabled; Enforced=$_.Enforced }
-                })
-                $cats = @(); $raw = @()
-                if ($gpoSw.Elapsed.TotalSeconds -gt $reportBudgetS) {
-                    # Still record the GPO + where it's linked; just skip the
-                    # expensive per-GPO settings report.
-                    cb-Log "GPO" "Report budget exhausted - settings detail skipped for $($g.DisplayName) and beyond"
-                    $result.Partial = $true
-                } else {
-                    try {
-                        [xml]$rpt = Get-GPOReport -Guid $g.Id -ReportType Xml -ErrorAction Stop
-                        $parsed = Parse-GPOReport -Report $rpt
-                        $cats = $parsed.Categories
-                        $raw  = $parsed.Raw
-                    } catch { cb-Log "GPO" "Report failed for $($g.DisplayName): $_" }
+        # ---------- Link discovery: gPLink on domain root + OUs + sites ----------
+        # This is module-free and is the piece that makes 'which GPOs actually
+        # apply' work on a member server or Core install.
+        $ouCount = 0
+        try {
+            # Domain root
+            try {
+                $rootObj = [ADSI]"LDAP://$domainDN"
+                foreach ($lk in (& $parseGPLink ([string]$rootObj.gPLink) $domainDN)) {
+                    if (-not $linkMap.ContainsKey($lk.Guid)) { $linkMap[$lk.Guid] = @() }
+                    $linkMap[$lk.Guid] += $lk
                 }
+            } catch { & $note "Could not read gPLink on domain root: $($_.Exception.Message.Trim())" }
 
-                $result.GPOs += @{
-                    Name        = [string]$g.DisplayName
-                    Id          = $gid
-                    Status      = [string]$g.GpoStatus
-                    Links       = $links
-                    Categories  = $cats
-                    RawSettings = $raw
+            # Every OU
+            $ouSearcher = New-Object System.DirectoryServices.DirectorySearcher
+            $ouSearcher.SearchRoot = [ADSI]"LDAP://$domainDN"
+            $ouSearcher.Filter     = '(objectClass=organizationalUnit)'
+            $ouSearcher.PageSize   = 200
+            [void]$ouSearcher.PropertiesToLoad.Add('gplink')
+            [void]$ouSearcher.PropertiesToLoad.Add('distinguishedname')
+            foreach ($r in $ouSearcher.FindAll()) {
+                if ($ouCount -ge $MAX_OUS) { & $note "OU cap ($MAX_OUS) reached - link data may be partial"; $result.Partial = $true; break }
+                if ($gpoSw.Elapsed.TotalSeconds -gt $GPO_BUDGET_S) { & $note "OU link walk exceeded ${GPO_BUDGET_S}s - stopping early"; $result.Partial = $true; break }
+                $ouCount++
+                $odn = [string]$r.Properties['distinguishedname'][0]
+                $gpl = if ($r.Properties['gplink'].Count) { [string]$r.Properties['gplink'][0] } else { '' }
+                foreach ($lk in (& $parseGPLink $gpl $odn)) {
+                    if (-not $linkMap.ContainsKey($lk.Guid)) { $linkMap[$lk.Guid] = @() }
+                    $linkMap[$lk.Guid] += $lk
                 }
             }
-        } catch { cb-Log "GPO" "Outer error: $_"; $result.Partial = $true }
+            $ouSearcher.Dispose()
+
+            # Sites (live in the configuration partition)
+            if ($cfgDN) {
+                try {
+                    $siteSearcher = New-Object System.DirectoryServices.DirectorySearcher
+                    $siteSearcher.SearchRoot = [ADSI]"LDAP://CN=Sites,$cfgDN"
+                    $siteSearcher.Filter     = '(objectClass=site)'
+                    [void]$siteSearcher.PropertiesToLoad.Add('gplink')
+                    [void]$siteSearcher.PropertiesToLoad.Add('distinguishedname')
+                    foreach ($r in $siteSearcher.FindAll()) {
+                        $sdn = [string]$r.Properties['distinguishedname'][0]
+                        $gpl = if ($r.Properties['gplink'].Count) { [string]$r.Properties['gplink'][0] } else { '' }
+                        foreach ($lk in (& $parseGPLink $gpl $sdn)) {
+                            if (-not $linkMap.ContainsKey($lk.Guid)) { $linkMap[$lk.Guid] = @() }
+                            $linkMap[$lk.Guid] += $lk
+                        }
+                    }
+                    $siteSearcher.Dispose()
+                } catch { }
+            }
+            & $note "Scanned $ouCount OU(s); found links for $($linkMap.Keys.Count) GPO(s)"
+        } catch {
+            & $note "OU/site link enumeration failed: $($_.Exception.Message.Trim())"
+            $result.Partial = $true
+        }
+
+        if (-not $nameMap.Count -and -not $linkMap.Keys.Count) {
+            & $note "No GPO data obtainable by any method"
+            $result.Diagnostics = @($diag)
+            return $result
+        }
+        $result.Available   = $true
+        $result.LinkedCount = $linkMap.Keys.Count
+        if (-not $result.TotalCount) { $result.TotalCount = $nameMap.Count }
+
+        # ---------- Per-GPO detail ----------
+        $reportBudgetS = $GPO_BUDGET_S + 180
+        $sysvolRoot = "\\$domainDNS\SYSVOL\$domainDNS\Policies"
+
+        foreach ($guid in $linkMap.Keys) {
+            $links = @($linkMap[$guid] | ForEach-Object {
+                @{ Target=$_.Target; Enabled=$_.Enabled; Enforced=$_.Enforced }
+            })
+            $dispName = if ($nameMap.ContainsKey($guid)) { $nameMap[$guid] } else { $guid }
+
+            $cats = @(); $raw = @(); $status = ''
+            $gotDetail = $false
+
+            # Preferred: full settings report via the module
+            if ($haveGPModule -and $gpoSw.Elapsed.TotalSeconds -le $reportBudgetS) {
+                try {
+                    $bare = $guid.Trim('{','}')
+                    [xml]$rpt = Get-GPOReport -Guid $bare -ReportType Xml -ErrorAction Stop
+                    $parsed = Parse-GPOReport -Report $rpt
+                    $cats = $parsed.Categories
+                    $raw  = $parsed.Raw
+                    $gotDetail = $true
+                } catch {
+                    & $note "Get-GPOReport failed for $dispName - using SYSVOL inspection"
+                }
+            }
+
+            # Fallback: infer configured areas from the GPO's SYSVOL folder.
+            # No modules needed and works on every Windows Server version.
+            if (-not $gotDetail) {
+                try {
+                    $gpDir = Join-Path $sysvolRoot $guid
+                    if (Test-Path $gpDir -ErrorAction SilentlyContinue) {
+                        $probe = @(
+                            @{ Path='Machine\Registry.pol';               Cat='admx';               Area='Administrative Templates (Computer)' },
+                            @{ Path='User\Registry.pol';                  Cat='admx';               Area='Administrative Templates (User)' },
+                            @{ Path='Machine\Preferences\Drives';         Cat='drive_maps';         Area='Drive Maps' },
+                            @{ Path='User\Preferences\Drives';            Cat='drive_maps';         Area='Drive Maps' },
+                            @{ Path='Machine\Preferences\Printers';       Cat='printers';           Area='Printer Deployment' },
+                            @{ Path='User\Preferences\Printers';          Cat='printers';           Area='Printer Deployment' },
+                            @{ Path='Machine\Scripts';                    Cat='scripts';            Area='Scripts' },
+                            @{ Path='User\Scripts';                       Cat='scripts';            Area='Scripts' },
+                            @{ Path='Machine\Applications';               Cat='software_install';   Area='Software Installation' },
+                            @{ Path='Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf'; Cat='security_options'; Area='Security Settings' },
+                            @{ Path='Machine\Documents & Settings\fdeploy1.ini';        Cat='folder_redirection'; Area='Folder Redirection' },
+                            @{ Path='User\Documents & Settings\fdeploy1.ini';           Cat='folder_redirection'; Area='Folder Redirection' }
+                        )
+                        foreach ($pr in $probe) {
+                            $full = Join-Path $gpDir $pr.Path
+                            if (Test-Path $full -ErrorAction SilentlyContinue) {
+                                if ($cats -notcontains $pr.Cat) { $cats += $pr.Cat }
+                                $raw += @{ Area=$pr.Area; Category=''; Name='(present in SYSVOL)'; Setting='detected' }
+                            }
+                        }
+                        if ($cats.Count) { $gotDetail = $true }
+                    }
+                } catch { }
+            }
+
+            $result.GPOs += @{
+                Name        = [string]$dispName
+                Id          = [string]$guid
+                Status      = [string]$status
+                Links       = $links
+                Categories  = @($cats)
+                RawSettings = @($raw)
+                DetailLevel = $(if ($gotDetail -and $haveGPModule) { 'full' } elseif ($gotDetail) { 'sysvol-inferred' } else { 'links-only' })
+            }
+        }
+
+        if (-not $result.GPOs.Count) {
+            & $note "GPO objects found but none are linked anywhere"
+        }
+        $result.Diagnostics = @($diag)
         return $result
     }
+
 
     # -- ASSEMBLE & RETURN -----------------------------------------------------
 
