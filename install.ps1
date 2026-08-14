@@ -638,13 +638,32 @@ switch -Regex (`$Mode) {
 
         # 1. Session data / reports (only if authorized)
         `$dataRemoved = 0
+        `$rescuedTo   = ''
         if (`$killData) {
             foreach (`$d in `$sessionDirs) {
                 try { Remove-Item `$d.FullName -Recurse -Force -EA Stop; `$dataRemoved++ } catch { }
             }
             _Step (`$dataRemoved -eq `$sessionDirs.Count) "Discovery sessions + generated reports" "`$dataRemoved of `$(`$sessionDirs.Count) folder(s) deleted"
         } elseif (`$sessionDirs.Count -gt 0) {
-            _Step `$false "Discovery sessions + reports - KEPT at user request" "`$(`$sessionDirs.Count) folder(s) left in place"
+            # The whole SDT root gets deleted below. Any session folder living
+            # INSIDE it would be destroyed regardless of the user's choice, so
+            # move those out to the Desktop first and say where they went.
+            `$rootPrefix = `$root.TrimEnd('\') + '\'
+            `$inRoot = @(`$sessionDirs | Where-Object { `$_.FullName.StartsWith(`$rootPrefix, 'OrdinalIgnoreCase') })
+            if (`$inRoot.Count -gt 0) {
+                `$rescuedTo = Join-Path ([Environment]::GetFolderPath('Desktop')) 'SDT-Discovery-Sessions'
+                try {
+                    if (-not (Test-Path `$rescuedTo)) { New-Item -ItemType Directory -Path `$rescuedTo -Force | Out-Null }
+                    foreach (`$d in `$inRoot) {
+                        try { Move-Item `$d.FullName -Destination `$rescuedTo -Force -EA Stop } catch { }
+                    }
+                    _Step `$true "Kept session data MOVED out of the install folder" `$rescuedTo
+                } catch {
+                    _Step `$false "Could not move kept session data out of the install folder" "`$rescuedTo"
+                    `$rescuedTo = ''
+                }
+            }
+            _Step `$false "Discovery sessions + reports - KEPT at user request" "`$(`$sessionDirs.Count) folder(s) preserved"
         }
 
         # 2. Bundled Python + plink that SDT downloaded
@@ -667,12 +686,23 @@ switch -Regex (`$Mode) {
             _Step `$true "Cached session credentials - none present" ""
         }
 
-        # 4. The install tree itself (app + bin + shim)
+        # 4. The install tree itself - the entire SDT root, not just its contents
         try { Remove-Item `$root -Recurse -Force -EA Stop } catch { }
         `$rootGone = -not (Test-Path `$root)
-        _Step `$rootGone "Program files (app, bin, sdt command)" `$root
+        _Step `$rootGone "SDT root folder removed (app, bin, sdt command)" `$root
         if (-not `$rootGone) {
-            Write-Host "      NOTE: some files were locked. Close any running SDT window and re-run." -ForegroundColor Yellow
+            Write-Host "      NOTE: some files were locked. Close any running SDT window ('sdt stop') and re-run." -ForegroundColor Yellow
+        }
+        # Drop the Magna5 parent too when SDT was the only thing in it, so the
+        # uninstall leaves no empty folders behind.
+        `$parent = Split-Path `$root -Parent
+        if (`$rootGone -and (Test-Path `$parent)) {
+            try {
+                if (-not (Get-ChildItem `$parent -Force -EA SilentlyContinue)) {
+                    Remove-Item `$parent -Force -Recurse -EA Stop
+                    _Step (-not (Test-Path `$parent)) "Empty parent folder removed" `$parent
+                }
+            } catch { }
         }
 
         # 5. PATH entry
@@ -704,7 +734,12 @@ switch -Regex (`$Mode) {
         }
         if (-not `$killData -and `$sessionDirs.Count -gt 0) {
             Write-Host "  Client data was intentionally kept. Delete manually when done:" -ForegroundColor Yellow
-            foreach (`$d in (`$sessionDirs | Select-Object -First 5)) { Write-Host "    `$(`$d.FullName)" -ForegroundColor DarkYellow }
+            if (`$rescuedTo) {
+                Write-Host "    `$rescuedTo   (moved here out of the install folder)" -ForegroundColor DarkYellow
+            }
+            foreach (`$d in (`$sessionDirs | Select-Object -First 5)) {
+                if (-not `$d.FullName.StartsWith(`$root.TrimEnd('\') + '\', 'OrdinalIgnoreCase')) { Write-Host "    `$(`$d.FullName)" -ForegroundColor DarkYellow }
+            }
         }
         Write-Host "  Close and reopen your terminal for the PATH change to apply." -ForegroundColor DarkGray
         Write-Host ""
