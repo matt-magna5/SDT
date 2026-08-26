@@ -1244,7 +1244,7 @@ $CollectionBlock = {
 
         foreach ($instName in $instanceNames) {
             Write-Host ("    [SQL] Instance: $instName") -ForegroundColor DarkGray
-            $inst = @{ InstanceName=$instName; Version='Unknown'; Edition='Unknown'; ProductName='Unknown'; ProductLevel='Unknown'; ProductVersion='Unknown'; EngineEdition=$null; ServiceAccount='Unknown'; EOLStatus='Unknown'; EOLDate='Unknown'; Databases=@(); Partial=$false }
+            $inst = @{ InstanceName=$instName; Version='Unknown'; Edition='Unknown'; ProductName='Unknown'; ProductLevel='Unknown'; ProductVersion='Unknown'; EngineEdition=$null; ServiceAccount='Unknown'; EOLStatus='Unknown'; EOLDate='Unknown'; Databases=@(); Logins=@(); Partial=$false }
             try {
                 # Get version from registry
                 $vKey = if ($instName -eq 'MSSQLSERVER') { 'MSSQL' } else { "MSSQL.$instName" }
@@ -1389,6 +1389,98 @@ ORDER BY data_size_mb DESC
                         [void]$dbs.Add($db)
                     }
                     $reader.Close()
+
+                    # ---- WHO CAN GET IN: server logins + role membership ----
+                    # Migration and security both need this: service accounts to
+                    # recreate, sysadmins to justify, and any BUILTIN or broad
+                    # domain group that effectively opens the instance to
+                    # everyone. Read-only, one query, degrades quietly when the
+                    # discovery account cannot read server principals.
+                    $logins = [System.Collections.ArrayList]@()
+                    try {
+                        $lcmd = $conn.CreateCommand()
+                        $lcmd.CommandTimeout = 30
+                        $lcmd.CommandText = @"
+SELECT sp.name AS login_name,
+       sp.type_desc,
+       sp.is_disabled,
+       STUFF((SELECT ', ' + r.name
+              FROM sys.server_role_members rm
+              JOIN sys.server_principals r ON r.principal_id = rm.role_principal_id
+              WHERE rm.member_principal_id = sp.principal_id
+              FOR XML PATH('')), 1, 2, '') AS server_roles
+FROM sys.server_principals sp
+WHERE sp.type IN ('S','U','G')
+  AND sp.name NOT LIKE '##%'
+  AND sp.name NOT LIKE 'NT SERVICE\%'
+ORDER BY sp.name
+"@
+                        $lrdr = $lcmd.ExecuteReader()
+                        while ($lrdr.Read()) {
+                            $lname  = [string]$lrdr['login_name']
+                            $ltype  = [string]$lrdr['type_desc']
+                            $ldis   = [bool]$lrdr['is_disabled']
+                            $lroles = if ($lrdr['server_roles'] -is [DBNull]) { '' } else { [string]$lrdr['server_roles'] }
+                            $isSa   = ($lroles -match 'sysadmin')
+                            # A login that effectively grants everyone access.
+                            $broad  = ($lname -match '(?i)^BUILTIN\\(Administrators|Users)$' -or
+                                       $lname -match '(?i)\\(Domain Users|Authenticated Users|Everyone)$')
+                            [void]$logins.Add(@{
+                                Name       = $lname
+                                Type       = $ltype
+                                Disabled   = $ldis
+                                Roles      = $lroles
+                                IsSysadmin = $isSa
+                                IsBroad    = $broad
+                            })
+                            if ($isSa -and $broad -and -not $ldis) {
+                                cb-Flag 'critical' "SQL wide-open sysadmin: $lname ($instName)" "$lname holds sysadmin on $instName. Every member of that group is a full administrator of the SQL instance."
+                            }
+                        }
+                        $lrdr.Close()
+                    } catch { cb-Log "SQL-$instName" "Login enumeration failed (needs VIEW ANY DEFINITION): $($_.Exception.Message)" }
+                    $inst.Logins = @($logins)
+
+                    # ---- Per-database users. Bounded: a server with hundreds of
+                    # databases would otherwise turn this into a long serial walk.
+                    $MAX_DB_ACL = 40
+                    $dbIdx = 0
+                    foreach ($dbrec in $dbs) {
+                        if ($dbIdx -ge $MAX_DB_ACL) { $inst.Partial = $true; break }
+                        $dbIdx++
+                        $dbUsers = [System.Collections.ArrayList]@()
+                        try {
+                            $ucmd = $conn.CreateCommand()
+                            $ucmd.CommandTimeout = 20
+                            $safeDb = ($dbrec.Name -replace ']', ']]')
+                            $ucmd.CommandText = @"
+USE [$safeDb];
+SELECT dp.name AS user_name,
+       dp.type_desc,
+       STUFF((SELECT ', ' + r.name
+              FROM sys.database_role_members drm
+              JOIN sys.database_principals r ON r.principal_id = drm.role_principal_id
+              WHERE drm.member_principal_id = dp.principal_id
+              FOR XML PATH('')), 1, 2, '') AS db_roles
+FROM sys.database_principals dp
+WHERE dp.type IN ('S','U','G')
+  AND dp.name NOT IN ('dbo','guest','sys','INFORMATION_SCHEMA','public')
+ORDER BY dp.name
+"@
+                            $urdr = $ucmd.ExecuteReader()
+                            while ($urdr.Read()) {
+                                $uroles = if ($urdr['db_roles'] -is [DBNull]) { '' } else { [string]$urdr['db_roles'] }
+                                [void]$dbUsers.Add(@{
+                                    Name  = [string]$urdr['user_name']
+                                    Type  = [string]$urdr['type_desc']
+                                    Roles = $uroles
+                                })
+                            }
+                            $urdr.Close()
+                        } catch { cb-Log "SQL-$instName" "DB user enumeration failed for $($dbrec.Name): $($_.Exception.Message)" }
+                        $dbrec['Users'] = @($dbUsers)
+                    }
+
                     $conn.Close()
                     $inst.Databases = $dbs
                 } catch {

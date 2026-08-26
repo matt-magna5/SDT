@@ -1923,6 +1923,118 @@ def _db_vendor(name):
         if k in n: return v
     return ''
 
+def _db_access_cell(db):
+    """Per-database user count for the size table. The detail lives in the
+    instance access dropdown so the sizing table stays scannable."""
+    users = as_list(db.get('Users', []))
+    if not users:
+        return '<span style="color:#c4b5fd;">-</span>'
+    return f'<span class="pill pill-gray">{len(users)}</span>'
+
+
+def _sql_access_block(inst):
+    """Who can get into this SQL instance, and into each database.
+
+    Same rule the Printers and Group Policy tabs use: when access is
+    effectively open to everyone - a BUILTIN or broad domain group holding
+    sysadmin - say that plainly rather than listing accounts. Otherwise name
+    the principals, since those are the logins that have to be recreated (and
+    justified) after a migration.
+    """
+    logins = as_list(inst.get('Logins', []))
+    dbs    = as_list(inst.get('Databases', []))
+
+    if not logins:
+        return ('<details style="border:1px solid #e5e1ee;border-radius:6px;margin-top:12px;">'
+                '<summary style="cursor:pointer;padding:9px 12px;list-style:none;">'
+                '<span style="font-weight:600;color:#271e41;">Who can access this instance</span> '
+                '<span class="pill pill-gray">not collected</span>'
+                '<div style="font-size:8pt;color:#5b4a78;margin-top:3px;">'
+                'Login list unavailable - the discovery account needs VIEW ANY DEFINITION on this '
+                'instance.</div></summary></details>')
+
+    sysadmins = [l for l in logins if l.get('IsSysadmin')]
+    broad_sa  = [l for l in sysadmins if l.get('IsBroad') and not l.get('Disabled')]
+    enabled   = [l for l in logins if not l.get('Disabled')]
+
+    if broad_sa:
+        names = ', '.join(str(l.get('Name', '')) for l in broad_sa)
+        pill_html = '<span class="pill pill-red">Everyone</span>'
+        note = (f'Effectively open: {names} holds sysadmin, so every member of that group is a full '
+                f'administrator of this instance.')
+    else:
+        pill_html = f'<span class="pill pill-yellow">{len(enabled)} login(s)</span>'
+        sa_names = ', '.join(str(l.get('Name', '')) for l in sysadmins) or 'none found'
+        note = f'{len(enabled)} enabled login(s). sysadmin: {sa_names}'
+
+    rows = ''
+    order = sorted(logins, key=lambda l: (not l.get('IsSysadmin'),
+                                          bool(l.get('Disabled')),
+                                          str(l.get('Name', ''))))
+    for j, l in enumerate(order):
+        nm    = str(l.get('Name', ''))
+        roles = str(l.get('Roles', '') or '')
+        typ   = str(l.get('Type', '')).replace('_', ' ').title()
+        bg = ' style="background:#faf9fc"' if j % 2 else ''
+        if l.get('Disabled'):
+            nm_html = f'<span style="color:#6b6080;text-decoration:line-through;">{h(nm)}</span>'
+        elif l.get('IsBroad'):
+            nm_html = f'<strong>{h(nm)}</strong> <span class="pill pill-red">broad group</span>'
+        else:
+            nm_html = f'<strong>{h(nm)}</strong>'
+        if l.get('IsSysadmin'):
+            role_html = '<span class="pill pill-red">sysadmin</span>'
+            if roles and roles != 'sysadmin':
+                role_html += f' <span style="font-size:8pt;color:#6b6080;">{h(roles)}</span>'
+        elif roles:
+            role_html = f'<span class="pill pill-gray">{h(roles)}</span>'
+        else:
+            role_html = '<span style="font-size:8pt;color:#6b6080;">no server role</span>'
+        rows += (f'<tr{bg}><td style="font-size:8.5pt;">{nm_html}</td>'
+                 f'<td>{role_html}</td>'
+                 f'<td style="font-size:8pt;color:#6b6080;">{h(typ)}</td></tr>')
+
+    body = ('<div style="font-size:8.5pt;font-weight:600;color:#271e41;">Server Logins</div>'
+            '<table style="width:100%;margin-top:6px;">'
+            '<tr><th>Login</th><th style="width:230px">Server Role</th>'
+            '<th style="width:170px">Type</th></tr>' + rows + '</table>')
+
+    # Per-database users, only for databases that actually have any
+    db_bits = ''
+    for db in dbs:
+        users = as_list(db.get('Users', []))
+        if not users:
+            continue
+        urows = ''
+        for k, u in enumerate(users):
+            ur = str(u.get('Roles', '') or '')
+            bg2 = ' style="background:#faf9fc"' if k % 2 else ''
+            role_pill = (f'<span class="pill pill-gray">{h(ur)}</span>' if ur
+                         else '<span style="font-size:8pt;color:#6b6080;">no role</span>')
+            utyp = str(u.get('Type', '')).replace('_', ' ').title()
+            urows += (f'<tr{bg2}><td style="font-size:8.5pt;">'
+                      f'<strong>{h(str(u.get("Name", "")))}</strong></td>'
+                      f'<td>{role_pill}</td>'
+                      f'<td style="font-size:8pt;color:#6b6080;">{h(utyp)}</td></tr>')
+        db_bits += (f'<div style="font-size:8.5pt;font-weight:600;color:#271e41;margin-top:14px;">'
+                    f'{h(str(db.get("Name", "")))} &mdash; {len(users)} user(s)</div>'
+                    '<table style="width:100%;margin-top:6px;">'
+                    '<tr><th>Database User</th><th style="width:230px">Database Role</th>'
+                    '<th style="width:170px">Type</th></tr>' + urows + '</table>')
+    if db_bits:
+        body += ('<div style="font-size:8.5pt;font-weight:600;color:#271e41;margin-top:16px;">'
+                 'Database Access</div>' + db_bits)
+
+    return ('<details style="border:1px solid #e5e1ee;border-radius:6px;margin-top:12px;">'
+            '<summary style="cursor:pointer;padding:9px 12px;list-style:none;">'
+            '<span style="font-weight:600;color:#271e41;">Who can access this instance</span> '
+            f'{pill_html}'
+            f'<div style="font-size:8pt;color:#5b4a78;margin-top:3px;">{h(note)}</div>'
+            '</summary>'
+            f'<div style="padding:4px 12px 12px 12px;border-top:1px solid #efecf6;">{body}</div>'
+            '</details>')
+
+
 def build_sql_tab():
     # Collect SQL data from all servers
     sql_servers = []
@@ -2000,6 +2112,7 @@ def build_sql_tab():
                         f'<td style="padding:6px 10px;font-size:8.5pt">{h(recov)}</td>'
                         f'<td style="padding:6px 10px;text-align:center;font-size:8.5pt">{h(str(compat))}</td>'
                         f'<td style="padding:6px 10px;font-size:8.5pt;color:#6b6080">{h(backup)}</td>'
+                        f'<td style="padding:6px 10px;text-align:center;font-size:8.5pt">{_db_access_cell(db)}</td>'
                         f'</tr>\n')
 
         db_section = ''
@@ -2016,9 +2129,12 @@ def build_sql_tab():
                           f'<th style="padding:7px 10px;color:#fff">Recovery</th>'
                           f'<th style="padding:7px 10px;color:#fff;text-align:center">Compat</th>'
                           f'<th style="padding:7px 10px;color:#fff">Last Full Backup</th>'
+                          f'<th style="padding:7px 10px;color:#fff;text-align:center">Users</th>'
                           f'</tr>\n{db_rows}</table>\n')
         else:
             db_section = '<div style="color:#6b6080;font-style:italic;margin-top:10px;">No user databases found.</div>\n'
+
+        db_section += _sql_access_block(inst)
 
         top_lnk = '<div style="text-align:right;margin-top:10px;"><a href="#top-sql" style="color:#5b1fa4;font-size:8.5pt;text-decoration:none;font-weight:600;">&#8593; Top</a></div>\n'
 
