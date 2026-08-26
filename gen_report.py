@@ -2920,6 +2920,59 @@ def build_gpo_tab():
         if not link_pills:
             link_pills = '<span style="color:#6b6080;font-size:8.5pt;">linked (target detail unavailable)</span>'
 
+        # Who the GPO actually applies to (security filtering). Same question
+        # the Printers tab answers for queues: if it hits everyone, say that
+        # plainly rather than listing accounts; if it is filtered to specific
+        # groups, name them - those become the Intune assignment groups.
+        scope   = str(gp.get('AppliesToScope', 'unknown'))
+        applies = as_list(gp.get('AppliesTo', []))
+        wmif    = str(gp.get('WmiFilter', '') or '')
+        named_applies = [str(a.get('Trustee','')) for a in applies
+                         if str(a.get('Kind','')) != 'Everyone']
+
+        if scope == 'everyone':
+            scope_pill = '<span class="pill pill-green">Everyone</span>'
+            scope_note = 'Applies to every user and computer in the linked scope.'
+        elif scope == 'filtered':
+            scope_pill = (f'<span class="pill pill-yellow">{len(named_applies)} group/user</span>'
+                          if named_applies else '<span class="pill pill-yellow">Filtered</span>')
+            scope_note = ('Security-filtered - only applies to: '
+                          + (', '.join(named_applies) if named_applies else 'a named group'))
+        else:
+            scope_pill = '<span class="pill pill-gray">Scope unknown</span>'
+            scope_note = 'Security filtering could not be read with the discovery account.'
+
+        if applies:
+            arows = ''
+            for j, ap in enumerate(applies):
+                who  = str(ap.get('Trustee', ''))
+                kind = str(ap.get('Kind', ''))
+                if kind == 'Everyone':
+                    who_html = (f'<strong>{h(who)}</strong> '
+                                f'<span style="font-size:8pt;color:#2a7d2e;">(all users and computers)</span>')
+                else:
+                    who_html = f'<strong>{h(who)}</strong>'
+                bg3 = ' style="background:#faf9fc"' if j % 2 else ''
+                arows += (f'<tr{bg3}><td style="font-size:8.5pt;">{who_html}</td>'
+                          f'<td><span class="pill pill-green">Apply Group Policy</span></td>'
+                          f'<td style="font-size:8pt;color:#6b6080;">{h(kind)}</td></tr>')
+            applies_html = ('<div style="font-size:8.5pt;font-weight:600;color:#271e41;margin-top:4px;">Applies To</div>'
+                            '<table style="width:100%;margin-top:6px;">'
+                            '<tr><th>Account / Group</th><th style="width:190px">Permission</th>'
+                            '<th style="width:190px">Type</th></tr>' + arows + '</table>')
+            if scope == 'everyone':
+                applies_html += ('<div style="font-size:8pt;color:#6b6080;margin-top:6px;">'
+                                 'Default filtering - individual users are not listed because everyone in '
+                                 'the linked OU is covered.</div>')
+        else:
+            applies_html = ('<div style="font-size:8.5pt;color:#6b6080;margin-top:6px;">'
+                            'Security filtering was not captured for this GPO. Re-run discovery on a DC '
+                            'with an account that can read Group Policy permissions.</div>')
+        if wmif:
+            applies_html += (f'<div style="font-size:8.5pt;color:#bd8600;margin-top:6px;">'
+                             f'WMI filter applied: <strong>{h(wmif)}</strong> &mdash; narrows this further at '
+                             f'apply time and has no direct Intune equivalent.</div>')
+
         raw = as_list(gp.get('RawSettings', []))
         if raw:
             raw_rows = ''
@@ -2957,14 +3010,18 @@ def build_gpo_tab():
             '<details style="border:1px solid #e5e1ee;border-radius:6px;margin-bottom:8px;">'
             '<summary style="cursor:pointer;padding:10px 12px;list-style:none;">'
             f'<span class="pill pill-{c["color"]}" style="margin-right:8px;">{c["band"]}</span>'
-            f'<span style="font-weight:600;color:#271e41;">{h(name)}</span>{status_note}'
+            f'<span style="font-weight:600;color:#271e41;">{h(name)}</span>{status_note} {scope_pill}'
             f'<span style="font-size:8pt;color:#6b6080;margin-left:8px;">'
             f'{c["settings"]} setting(s) &bull; {c["areas"]} area(s) &bull; {c["links"]} link(s)</span>'
             f'<div style="font-size:8.5pt;color:#5b4a78;margin-top:3px;">{h(synopsis)}</div>'
+            f'<div style="font-size:8pt;color:#5b4a78;margin-top:2px;">{h(scope_note)}</div>'
             f'{hard_note}'
             f'<div style="margin-top:6px;">{link_pills}</div>'
             '</summary>'
-            f'<div style="padding:4px 12px 12px 12px;border-top:1px solid #efecf6;">{raw_html}</div>'
+            f'<div style="padding:4px 12px 12px 12px;border-top:1px solid #efecf6;">'
+            f'{applies_html}'
+            f'<div style="font-size:8.5pt;font-weight:600;color:#271e41;margin-top:14px;">Settings</div>'
+            f'{raw_html}</div>'
             '</details>'
         )
 

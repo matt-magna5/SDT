@@ -2311,6 +2311,132 @@ ORDER BY data_size_mb DESC
         return @{ Categories = @($cats); Raw = @($raw) }
     }
 
+    # Extended-right GUID for "Apply Group Policy". An ACE granting this is what
+    # actually decides whether a GPO takes effect for a principal - the OU link
+    # only decides where it is *considered*.
+    $script:APPLY_GP_RIGHT = 'edacfd8f-ffb3-11d1-b41d-00a0c968f939'
+
+    function Get-GPOSecurityFiltering {
+        <#
+            Answer "who does this GPO actually apply to?".
+
+            A GPO linked to an OU does NOT necessarily hit everything in that
+            OU - security filtering narrows it. By default Authenticated Users
+            holds Apply Group Policy, which means everyone; admins frequently
+            replace that with a specific group. That distinction is exactly what
+            has to be reproduced as an Intune assignment group, so it is worth
+            surfacing next to the links.
+
+            Returns:
+              Scope       'everyone' | 'filtered' | 'unknown'
+              Principals  [ @{ Trustee; Kind } ]  - who holds Apply Group Policy
+              WmiFilter   name/text of any WMI filter, or ''
+        #>
+        param([string]$Guid, [string]$DomainDN, [bool]$HaveModule)
+
+        $out = @{ Scope='unknown'; Principals=@(); WmiFilter='' }
+        $everyoneTrustees = @('authenticated users','domain computers','domain users','everyone')
+        $principals = [System.Collections.ArrayList]@()
+        $sawEveryone = $false
+
+        $addP = {
+            param([string]$account)
+            if (-not $account) { return }
+            $short = ($account -replace '^.*\\', '').Trim()
+            if (-not $short) { return }
+            if ($everyoneTrustees -contains $short.ToLower()) {
+                $script:_gpEveryone = $true
+                if (-not (@($principals | Where-Object { $_.Trustee -eq $short }).Count)) {
+                    [void]$principals.Add(@{ Trustee=$short; Kind='Everyone' })
+                }
+                return
+            }
+            $kind = if ($account -match '\\') { 'Domain group or user' } else { 'Group or user' }
+            if (-not (@($principals | Where-Object { $_.Trustee -eq $account }).Count)) {
+                [void]$principals.Add(@{ Trustee=$account; Kind=$kind })
+            }
+        }
+
+        try {
+            $script:_gpEveryone = $false
+
+            # ---- Method A: GroupPolicy module ----
+            $gotAny = $false
+            if ($HaveModule -and (Get-Command Get-GPPermission -ErrorAction SilentlyContinue)) {
+                try {
+                    $bare = $Guid.Trim('{','}')
+                    foreach ($perm in (Get-GPPermission -Guid $bare -All -ErrorAction Stop)) {
+                        if ([string]$perm.Permission -eq 'GpoApply') {
+                            $t = $perm.Trustee
+                            $acct = if ($t.Domain) { "$($t.Domain)\$($t.Name)" } else { [string]$t.Name }
+                            & $addP $acct
+                            $gotAny = $true
+                        }
+                    }
+                } catch { cb-Log "GPO" "Get-GPPermission failed for $Guid - falling back to LDAP ACL" }
+            }
+
+            # ---- Method B: LDAP ACL on the groupPolicyContainer object ----
+            # Works with no modules: look for ACEs granting the Apply Group
+            # Policy extended right.
+            if (-not $gotAny -and $DomainDN) {
+                try {
+                    $gpoDN = "CN=$Guid,CN=Policies,CN=System,$DomainDN"
+                    $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$gpoDN")
+                    $sec = $de.ObjectSecurity
+                    if ($sec) {
+                        foreach ($ace in $sec.GetAccessRules($true, $true, [System.Security.Principal.NTAccount])) {
+                            if ([string]$ace.AccessControlType -ne 'Allow') { continue }
+                            $rightOk = $false
+                            try {
+                                if ($ace.ObjectType -and ([string]$ace.ObjectType).ToLower() -eq $script:APPLY_GP_RIGHT) { $rightOk = $true }
+                            } catch { }
+                            if ($rightOk) {
+                                & $addP ([string]$ace.IdentityReference)
+                                $gotAny = $true
+                            }
+                        }
+                    }
+                    $de.Close()
+                } catch { cb-Log "GPO" "LDAP ACL read failed for $Guid : $($_.Exception.Message.Trim())" }
+            }
+
+            # ---- WMI filter (further narrows applicability) ----
+            if ($DomainDN) {
+                try {
+                    $gpoDN = "CN=$Guid,CN=Policies,CN=System,$DomainDN"
+                    $de2 = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$gpoDN")
+                    $wq = [string]$de2.Properties['gPCWQLFilter'].Value
+                    if ($wq) {
+                        # Format: [domain;{GUID};0] - resolve to the filter's name
+                        $mg = [regex]::Match($wq, '\{[0-9A-Fa-f-]+\}')
+                        if ($mg.Success) {
+                            $fDN = "CN=$($mg.Value),CN=SOM,CN=WMIPolicy,CN=System,$DomainDN"
+                            try {
+                                $fde = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$fDN")
+                                $fname = [string]$fde.Properties['msWMI-Name'].Value
+                                $out.WmiFilter = if ($fname) { $fname } else { $mg.Value }
+                                $fde.Close()
+                            } catch { $out.WmiFilter = $mg.Value }
+                        }
+                    }
+                    $de2.Close()
+                } catch { }
+            }
+
+            $sawEveryone = $script:_gpEveryone
+            if (-not $gotAny)      { $out.Scope = 'unknown' }
+            elseif ($sawEveryone -and @($principals | Where-Object { $_.Kind -ne 'Everyone' }).Count -eq 0) {
+                $out.Scope = 'everyone'
+            }
+            elseif ($sawEveryone)  { $out.Scope = 'everyone' }
+            else                   { $out.Scope = 'filtered' }
+        } catch { cb-Log "GPO" "Security filtering read failed for $Guid : $_" }
+
+        $out.Principals = @($principals)
+        return $out
+    }
+
     function Collect-GPODetails {
         <#
             Collect every LINKED GPO, with a self-healing method chain so this
@@ -2564,6 +2690,11 @@ ORDER BY data_size_mb DESC
                 } catch { }
             }
 
+            # Who the policy actually applies to (security filtering). A link
+            # only says where the GPO is considered; Apply Group Policy says who
+            # it hits. Both are needed to reproduce scope in Intune.
+            $secf = Get-GPOSecurityFiltering -Guid $guid -DomainDN $domainDN -HaveModule $haveGPModule
+
             $result.GPOs += @{
                 Name        = [string]$dispName
                 Id          = [string]$guid
@@ -2571,6 +2702,9 @@ ORDER BY data_size_mb DESC
                 Links       = $links
                 Categories  = @($cats)
                 RawSettings = @($raw)
+                AppliesToScope = [string]$secf.Scope
+                AppliesTo      = @($secf.Principals)
+                WmiFilter      = [string]$secf.WmiFilter
                 DetailLevel = $(if ($gotDetail -and $haveGPModule) { 'full' } elseif ($gotDetail) { 'sysvol-inferred' } else { 'links-only' })
             }
         }
