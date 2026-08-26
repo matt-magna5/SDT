@@ -2734,32 +2734,88 @@ def build_printers_tab():
                 f'{len(queues)} shared queue(s), {rest_n} restricted'
                 + (f' &nbsp;&bull;&nbsp; detected via {h(str(detected))}' if detected else '')
                 + '</div>\n')
-        out += ('<table style="width:100%;"><tr>'
-                '<th>Printer</th><th>Share</th><th>Driver</th><th>Port / Host</th>'
-                '<th>Who Can Print</th><th>Deployed By GPO</th></tr>')
-        for i, q in enumerate(queues):
+        for q in queues:
             access = str(q.get('Access', 'unknown'))
             g = q.get('AccessGroups')
             groups = [g] if isinstance(g, str) else (g if isinstance(g, list) else [])
+            perms  = as_list(q.get('Permissions', []))
+
+            pname  = str(q.get('Name', ''))
+            share  = str(q.get('ShareName', '') or '-')
+            driver = str(q.get('Driver', '') or '-')
+            port   = str(q.get('Port', '') or '-')
+            gpo    = q.get('DeployedByGPO', '') or ''
+
+            # Collapsed summary says WHO in one glance. When a printer is open to
+            # everyone we say exactly that instead of listing accounts - every
+            # authenticated user inherits access, so enumerating them is noise.
+            # Only when access is actually restricted do we name the principals.
             if access == 'open':
-                acc_html = '<span class="pill pill-green">Everyone / Authenticated Users</span>'
+                acc_pill = '<span class="pill pill-green">Everyone</span>'
+                acc_note = 'Any authenticated user can print to this queue.'
             elif access == 'restricted':
-                gl = ', '.join(h(str(x)) for x in groups) if groups else 'named group'
-                acc_html = (f'<span class="pill pill-yellow">Restricted</span> '
-                            f'<div style="font-size:8pt;color:#271e41;margin-top:3px;">{gl}</div>')
+                acc_pill = (f'<span class="pill pill-yellow">{len(groups)} group/user</span>'
+                            if groups else '<span class="pill pill-yellow">Restricted</span>')
+                acc_note = ('Only these can print: '
+                            + (', '.join(str(x) for x in groups) if groups else 'a named group'))
             else:
-                acc_html = '<span class="pill pill-gray">Unknown</span>'
-            gpo = q.get('DeployedByGPO', '') or ''
-            gpo_html = (f'<span class="pill pill-purple">{h(str(gpo))}</span>' if gpo
+                acc_pill = '<span class="pill pill-gray">Unknown</span>'
+                acc_note = 'Permissions could not be read with the discovery account.'
+
+            gpo_pill = (f'<span class="pill pill-purple">{h(str(gpo))}</span>' if gpo
                         else '<span style="color:#6b6080;font-size:8pt;">not GPO-deployed</span>')
-            bg = ' style="background:#f5f4f8"' if i % 2 else ''
-            out += (f'<tr{bg}><td><strong>{h(str(q.get("Name","")))}</strong></td>'
-                    f'<td style="font-family:monospace;font-size:8.5pt">{h(str(q.get("ShareName","") or "-"))}</td>'
-                    f'<td style="font-size:8.5pt;color:#6b6080;">{h(str(q.get("Driver","") or "-"))}</td>'
-                    f'<td style="font-family:monospace;font-size:8pt;color:#6b6080;">{h(str(q.get("Port","") or "-"))}</td>'
-                    f'<td>{acc_html}</td>'
-                    f'<td>{gpo_html}</td></tr>')
-        out += '</table>\n'
+
+            # Expanded detail: the full access list, Print rights first since
+            # that is the permission that decides who can actually use it.
+            if perms:
+                order = {'Print': 0, 'Manage documents': 1, 'Manage this printer': 2}
+                sperms = sorted(perms, key=lambda x: (order.get(str(x.get('Rights', '')), 3),
+                                                      str(x.get('Kind', '')) == 'Administrative',
+                                                      str(x.get('Trustee', ''))))
+                rows = ''
+                for j, pm in enumerate(sperms):
+                    kind = str(pm.get('Kind', ''))
+                    who  = str(pm.get('Trustee', ''))
+                    rts  = str(pm.get('Rights', 'Print'))
+                    if kind == 'Everyone':
+                        who_html = (f'<strong>{h(who)}</strong> '
+                                    f'<span style="font-size:8pt;color:#2a7d2e;">(all users)</span>')
+                    elif kind == 'Administrative':
+                        who_html = f'<span style="color:#6b6080;">{h(who)}</span>'
+                    else:
+                        who_html = f'<strong>{h(who)}</strong>'
+                    rt_pill = ('<span class="pill pill-green">Print</span>' if rts == 'Print'
+                               else f'<span class="pill pill-gray">{h(rts)}</span>')
+                    bg2 = ' style="background:#faf9fc"' if j % 2 else ''
+                    rows += (f'<tr{bg2}><td style="font-size:8.5pt;">{who_html}</td>'
+                             f'<td>{rt_pill}</td>'
+                             f'<td style="font-size:8pt;color:#6b6080;">{h(kind)}</td></tr>')
+                detail = ('<table style="width:100%;margin-top:6px;">'
+                          '<tr><th>Account / Group</th><th style="width:170px">Permission</th>'
+                          '<th style="width:190px">Type</th></tr>' + rows + '</table>')
+                if access == 'open':
+                    detail += ('<div style="font-size:8pt;color:#6b6080;margin-top:6px;">'
+                               'Open to Everyone, so individual users are not listed - they all inherit '
+                               'access. Greyed-out entries are administrative: they govern managing the '
+                               'queue, not printing to it.</div>')
+            else:
+                detail = ('<div style="font-size:8.5pt;color:#6b6080;margin-top:6px;">'
+                          'No permission detail was captured for this queue. Re-run discovery with an '
+                          'account holding Manage Printers rights on the print server.</div>')
+
+            out += (
+                '<details style="border:1px solid #e5e1ee;border-radius:6px;margin-bottom:6px;">'
+                '<summary style="cursor:pointer;padding:9px 12px;list-style:none;">'
+                f'<span style="font-weight:600;color:#271e41;">{h(pname)}</span> '
+                f'{acc_pill} {gpo_pill}'
+                f'<div style="font-size:8pt;color:#5b4a78;margin-top:3px;">{h(acc_note)}</div>'
+                f'<div style="font-size:8pt;color:#6b6080;margin-top:2px;">'
+                f'share <code>{h(share)}</code> &nbsp;&bull;&nbsp; {h(driver)} '
+                f'&nbsp;&bull;&nbsp; {h(port)}</div>'
+                '</summary>'
+                f'<div style="padding:4px 12px 12px 12px;border-top:1px solid #efecf6;">{detail}</div>'
+                '</details>'
+            )
 
     if unknown_q:
         out += ('<div class="flag-info" style="margin-top:16px;"><div class="flag-label">'

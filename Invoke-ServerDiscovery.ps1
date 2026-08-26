@@ -1920,15 +1920,81 @@ ORDER BY data_size_mb DESC
     # "open"  = Everyone / Authenticated Users can print.
     # "restricted" = only named security group(s) hold Print rights.
     function Get-PrinterAccessSummary {
+        <#
+            Work out WHO can print to a queue, and with what rights.
+
+            Returns:
+              Access      'open' | 'restricted' | 'unknown'
+              Groups      flat list of named (non-well-known) trustees
+              Permissions [ @{ Trustee; Rights; Kind; IsOpen } ] - the full ACL,
+                          used by the report to render a per-printer access list.
+
+            "Open" means a well-known everyone-style trustee (Everyone,
+            Authenticated Users, Domain Users) holds Print. In that case the
+            report says "Everyone" rather than enumerating individual accounts,
+            because every domain user inherits access and listing them is noise.
+            When only named groups/users hold Print, each one is listed - those
+            are what has to be recreated in Entra / Universal Print.
+        #>
         param($Printer, [bool]$UseGetPrinter)
-        $out = @{ Access='unknown'; Groups=@() }
+
+        $out = @{ Access='unknown'; Groups=@(); Permissions=@() }
         $openTrustees   = @('everyone','authenticated users','domain users','all application packages')
-        $ignoreTrustees = @('administrators','system','creator owner','print operators',
+        $adminTrustees  = @('administrators','system','creator owner','print operators',
                             'server operators','nt service\trustedinstaller','trustedinstaller',
-                            'nt authority\system','builtin\administrators')
+                            'nt authority\system','builtin\administrators','power users')
         $named = [System.Collections.ArrayList]@()
+        $perms = [System.Collections.ArrayList]@()
         $sawOpen = $false
+
+        # Translate a printer access mask / SDDL rights string into the three
+        # permissions the Windows printer security UI actually shows.
+        $rightsLabel = {
+            param([string]$r)
+            if (-not $r) { return 'Print' }
+            $t = $r.ToLower()
+            $isManage = ($t -match 'writedacl|writeowner|genericall|fullcontrol|changepermissions|takeownership|sd|wd|wo')
+            $isDocs   = ($t -match 'genericwrite|delete|createchild|deletechild|dc|cc')
+            if ($isManage) { return 'Manage this printer' }
+            if ($isDocs)   { return 'Manage documents' }
+            return 'Print'
+        }
+
+        # Record one ACE, bucketing the trustee so the report can decide what to
+        # show without re-deriving any of this.
+        $addPerm = {
+            param([string]$account, [string]$rights)
+            if (-not $account) { return }
+            $short = ($account -replace '^.*\\', '').Trim()
+            if (-not $short) { return }
+            $lc = $short.ToLower()
+            $lcFull = $account.ToLower()
+            $label = & $rightsLabel $rights
+
+            if ($openTrustees -contains $lc) {
+                $script:_pOpen = $true
+                if (-not (@($perms | Where-Object { $_.Trustee -eq $short }).Count)) {
+                    [void]$perms.Add(@{ Trustee=$short; Rights=$label; Kind='Everyone'; IsOpen=$true })
+                }
+                return
+            }
+            if (($adminTrustees -contains $lc) -or ($adminTrustees -contains $lcFull)) {
+                if (-not (@($perms | Where-Object { $_.Trustee -eq $short }).Count)) {
+                    [void]$perms.Add(@{ Trustee=$short; Rights=$label; Kind='Administrative'; IsOpen=$false })
+                }
+                return
+            }
+            # A real named principal. Only 'Print' rights gate who can actually
+            # print, but record management rights too - useful for scoping.
+            $kind = if ($account -match '\\') { 'Domain group or user' } else { 'Local group or user' }
+            if (-not (@($perms | Where-Object { $_.Trustee -eq $short }).Count)) {
+                [void]$perms.Add(@{ Trustee=$account; Rights=$label; Kind=$kind; IsOpen=$false })
+            }
+            if ($named -notcontains $short) { [void]$named.Add($short) }
+        }
+
         try {
+            $script:_pOpen = $false
             $sddl = ''
             if ($UseGetPrinter) {
                 try {
@@ -1936,61 +2002,56 @@ ORDER BY data_size_mb DESC
                     $sddl = [string]$full.PermissionSDDL
                 } catch { cb-Log "PrintServer" "Get-Printer -Full failed for $($Printer.Name): $_" }
             }
-            # Manual SDDL parse - ConvertFrom-SddlString is PS 5.1+ only, so on
-            # Server 2012/2012R2 (PS 3/4) it does not exist. Parse the DACL ACEs
-            # directly and translate SIDs, which works on every version.
-            if ($sddl -and -not (Get-Command ConvertFrom-SddlString -ErrorAction SilentlyContinue)) {
-                try {
-                    $dacl = ''
-                    $mD = [regex]::Match($sddl, 'D:(.*?)(?=S:|$)')
-                    if ($mD.Success) { $dacl = $mD.Groups[1].Value }
-                    foreach ($ace in [regex]::Matches($dacl, '\(([^)]*)\)')) {
-                        $parts = $ace.Groups[1].Value -split ';'
-                        if ($parts.Count -lt 6) { continue }
-                        $trustee = $parts[5]
-                        if (-not $trustee) { continue }
-                        $acct = $trustee
-                        # Well-known SDDL aliases first, then real SID translation
-                        switch ($trustee) {
-                            'WD' { $acct = 'Everyone' }
-                            'AU' { $acct = 'Authenticated Users' }
-                            'BA' { $acct = 'Administrators' }
-                            'SY' { $acct = 'SYSTEM' }
-                            'PU' { $acct = 'Power Users' }
-                            'CO' { $acct = 'CREATOR OWNER' }
-                            'DU' { $acct = 'Domain Users' }
-                            default {
-                                if ($trustee -match '^S-1-') {
-                                    try {
-                                        $sidObj = New-Object System.Security.Principal.SecurityIdentifier($trustee)
-                                        $acct = $sidObj.Translate([System.Security.Principal.NTAccount]).Value
-                                    } catch { $acct = $trustee }
-                                }
-                            }
-                        }
-                        $short = ($acct -replace '^.*\','').Trim()
-                        $lc = $short.ToLower()
-                        if ($openTrustees -contains $lc)   { $sawOpen = $true; continue }
-                        if ($ignoreTrustees -contains $lc) { continue }
-                        if ($short -and ($named -notcontains $short)) { [void]$named.Add($short) }
-                    }
-                } catch { cb-Log "PrintServer" "Manual SDDL parse failed for $($Printer.Name): $_" }
-            }
-            elseif ($sddl -and (Get-Command ConvertFrom-SddlString -ErrorAction SilentlyContinue)) {
-                # Namespace-agnostic parse: each DACL entry looks like
-                # "DOMAIN\Group: AccessAllowed (Print, ...)".
+
+            if ($sddl -and (Get-Command ConvertFrom-SddlString -ErrorAction SilentlyContinue)) {
+                # PS 5.1+ - friendly account names and right names for free.
                 $parsed = ConvertFrom-SddlString -Sddl $sddl -ErrorAction Stop
                 foreach ($ace in @($parsed.DiscretionaryAcl)) {
-                    $acct = ([string]$ace -split ':')[0].Trim()
-                    $short = ($acct -replace '^.*\\','').Trim()
-                    $lc = $short.ToLower()
-                    $lcFull = $acct.ToLower()
-                    if ($openTrustees -contains $lc)   { $sawOpen = $true; continue }
-                    if ($ignoreTrustees -contains $lc -or $ignoreTrustees -contains $lcFull) { continue }
-                    if ($short -and ($named -notcontains $short)) { [void]$named.Add($short) }
+                    $s = [string]$ace
+                    $acct = ($s -split ':')[0].Trim()
+                    $rights = ''
+                    $mr = [regex]::Match($s, '\(([^)]*)\)')
+                    if ($mr.Success) { $rights = $mr.Groups[1].Value }
+                    & $addPerm $acct $rights
                 }
-            } else {
-                # Legacy WMI path: GetSecurityDescriptor -> DACL trustees.
+            }
+            elseif ($sddl) {
+                # Server 2012/2012R2 (PS 3/4): ConvertFrom-SddlString does not
+                # exist, so parse the DACL and translate SIDs by hand.
+                $dacl = ''
+                $mD = [regex]::Match($sddl, 'D:(.*?)(?=S:|$)')
+                if ($mD.Success) { $dacl = $mD.Groups[1].Value }
+                foreach ($ace in [regex]::Matches($dacl, '\(([^)]*)\)')) {
+                    $parts = $ace.Groups[1].Value -split ';'
+                    if ($parts.Count -lt 6) { continue }
+                    $rightsRaw = $parts[2]
+                    $trustee   = $parts[5]
+                    if (-not $trustee) { continue }
+                    $acct = $trustee
+                    switch ($trustee) {
+                        'WD' { $acct = 'Everyone' }
+                        'AU' { $acct = 'Authenticated Users' }
+                        'BA' { $acct = 'Administrators' }
+                        'SY' { $acct = 'SYSTEM' }
+                        'PU' { $acct = 'Power Users' }
+                        'CO' { $acct = 'CREATOR OWNER' }
+                        'DU' { $acct = 'Domain Users' }
+                        'PO' { $acct = 'Print Operators' }
+                        default {
+                            if ($trustee -match '^S-1-') {
+                                try {
+                                    $sidObj = New-Object System.Security.Principal.SecurityIdentifier($trustee)
+                                    $acct = $sidObj.Translate([System.Security.Principal.NTAccount]).Value
+                                } catch { $acct = $trustee }
+                            }
+                        }
+                    }
+                    & $addPerm $acct $rightsRaw
+                }
+            }
+            else {
+                # No SDDL available (WMI-only path). Read the security descriptor
+                # straight off the WMI object - works on every Windows version.
                 try {
                     $sd = $null
                     if ($PSMaj -ge 3) {
@@ -2001,18 +2062,16 @@ ORDER BY data_size_mb DESC
                     foreach ($ace in @($sd.DACL)) {
                         $t = $ace.Trustee
                         if (-not $t) { continue }
-                        $short = [string]$t.Name
-                        if (-not $short) { continue }
-                        $lc = $short.ToLower()
-                        if ($openTrustees -contains $lc)   { $sawOpen = $true; continue }
-                        if ($ignoreTrustees -contains $lc) { continue }
-                        if ($named -notcontains $short) { [void]$named.Add($short) }
+                        $acct = if ($t.Domain) { "$($t.Domain)\$($t.Name)" } else { [string]$t.Name }
+                        & $addPerm $acct ([string]$ace.AccessMask)
                     }
                 } catch { cb-Log "PrintServer" "WMI SD read failed for $($Printer.Name): $_" }
             }
+            $sawOpen = $script:_pOpen
         } catch { cb-Log "PrintServer" "ACL parse error for $($Printer.Name): $_" }
 
-        $out.Groups = @($named)
+        $out.Groups      = @($named)
+        $out.Permissions = @($perms)
         if ($named.Count -gt 0) { $out.Access = 'restricted' }
         elseif ($sawOpen)       { $out.Access = 'open' }
         else                    { $out.Access = 'unknown' }
@@ -2141,6 +2200,7 @@ ORDER BY data_size_mb DESC
                     Port        = $port
                     Access      = $acc.Access
                     AccessGroups = @($acc.Groups)
+                    Permissions  = @($acc.Permissions)
                     DeployedByGPO = $deployGpo
                 }
             }
