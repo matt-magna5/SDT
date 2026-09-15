@@ -17,3 +17,7 @@ python/
 _archive/*.html
 _archive/*.json
 _archive/*.zip
+
+# Prepackaged dependencies ship inside every release so installs work on
+# networks that block python.org / the.earth.li / pypi.org.
+!deps/*.zip

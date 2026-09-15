@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     SDT installer + updater - sets up a permanent 'sdt' command that
     auto-updates itself on every launch.
@@ -30,12 +30,19 @@ param(
     [string] $Version = 'latest',
     [switch] $Quiet,
     [switch] $NoLaunch,
-    [switch] $Force
+    [switch] $Force,
+    # Prepackaged-deps folder (local path, USB, UNC share). Defaults to
+    # SDT_DEPS_PATH so it can be set before running the one-liner.
+    [string] $DepsPath = $env:SDT_DEPS_PATH,
+    # Never touch the network for dependencies.
+    [switch] $Offline
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+# The one-liner (iwr | iex) cannot pass switches, so honour an env var too.
+if (-not $Offline -and $env:SDT_OFFLINE -match '^(1|true|yes)$') { $Offline = $true }
 
 # -- PowerShell version check --------------------------------------------------
 $script:PSMaj = $PSVersionTable.PSVersion.Major
@@ -152,8 +159,8 @@ if ($existing -eq $Version -and -not $Force) {
     $url    = "https://github.com/matt-magna5/SDT/archive/refs/tags/$Version.zip"
     $zipTmp = Join-Path $env:TEMP "sdt-install-$Version.zip"
     $extTmp = Join-Path $env:TEMP ("sdt-install-" + [guid]::NewGuid().ToString('N').Substring(0,8))
-    Say "Downloading $Version ..." DarkCyan
-    Invoke-WebRequest -Uri $url -OutFile $zipTmp -UseBasicParsing -TimeoutSec 120
+    Say "Downloading $Version (includes prepackaged Python + plink, ~15 MB)..." DarkCyan
+    Invoke-WebRequest -Uri $url -OutFile $zipTmp -UseBasicParsing -TimeoutSec 900
     New-Item -ItemType Directory -Force -Path $extTmp | Out-Null
     Expand-ZipCompat $zipTmp $extTmp
     Remove-Item $zipTmp -Force -EA 0
@@ -179,10 +186,10 @@ if ($existing -eq $Version -and -not $Force) {
 # ----- Portable Python + pip deps -------------------------------------------
 $pyExe = Join-Path $PyDir 'python.exe'
 if (-not (Test-Path $pyExe)) {
-    Say "Fetching portable Python 3.12 + plink (~10 MB)..." DarkCyan
+    Say "Setting up portable Python 3.12 + plink (prepackaged first)..." DarkCyan
     $getPy = Join-Path $AppDir 'Get-PortablePython.ps1'
     if (Test-Path $getPy) {
-        try { Push-Location $AppDir; & $getPy | Out-Null } catch { Say "Portable Python fetch failed: $($_.Exception.Message)" Yellow } finally { Pop-Location }
+        try { Push-Location $AppDir; & $getPy -DepsPath $DepsPath -Offline:$Offline | Out-Null } catch { Say "Portable Python fetch failed: $($_.Exception.Message)" Yellow } finally { Pop-Location }
     }
 }
 if (-not (Test-Path $pyExe)) {
@@ -235,12 +242,85 @@ if (-not (Test-Path $pyExe)) {
         Say "No python*._pth found in $PyDir - skipping site-packages enable" DarkYellow
     }
 
+    # Step 1b: prepackaged wheels - no network.
+    # Every SDT release ships deps\wheels\*.whl with SHA256SUMS.txt. A wheel is a
+    # zip laid out for site-packages, so unpacking it IS the install: no pip, no
+    # get-pip.py, no pypi.org. This is what lets installs succeed on networks
+    # that block python.exe from reaching PyPI.
+    $depsReady = $false
+    $depsRoots = @()
+    if ($DepsPath) { $depsRoots += $DepsPath }
+    $depsRoots += (Join-Path $AppDir 'deps')
+    $depsRoot = $depsRoots | Where-Object { $_ -and (Test-Path (Join-Path $_ 'wheels')) } | Select-Object -First 1
+    if ($depsRoot) {
+        $sums = @{}
+        $sumsFile = Join-Path $depsRoot 'SHA256SUMS.txt'
+        if (Test-Path $sumsFile) {
+            foreach ($line in (Get-Content $sumsFile -EA 0)) {
+                if ($line -match '^\s*([0-9a-fA-F]{64})\s+\*?(.+?)\s*$') {
+                    $sums[($Matches[2] -replace '\\','/').ToLower()] = $Matches[1].ToLower()
+                }
+            }
+        }
+        $site = Join-Path $PyDir 'Lib\site-packages'
+        New-Item -ItemType Directory -Force -Path $site | Out-Null
+        $wheels = @(Get-ChildItem (Join-Path $depsRoot 'wheels') -Filter '*.whl' -EA 0)
+        $bad = 0
+        try { Add-Type -AssemblyName System.IO.Compression.FileSystem -EA Stop } catch { }
+        foreach ($w in $wheels) {
+            $want = $sums[('wheels/' + $w.Name).ToLower()]
+            $got  = ''
+            try {
+                if (Get-Command Get-FileHash -EA 0) {
+                    $got = (Get-FileHash -Path $w.FullName -Algorithm SHA256).Hash.ToLower()
+                } else {
+                    $sha = [System.Security.Cryptography.SHA256]::Create()
+                    $fs  = [System.IO.File]::OpenRead($w.FullName)
+                    try { $got = (($sha.ComputeHash($fs) | ForEach-Object { $_.ToString('x2') }) -join '') }
+                    finally { $fs.Close(); $sha.Dispose() }
+                }
+            } catch { }
+            if (-not $want -or $got -ne $want) {
+                Say "[X] $($w.Name) failed SHA256 verification - not installed" Yellow
+                $bad++
+                continue
+            }
+            try {
+                $za = [System.IO.Compression.ZipFile]::OpenRead($w.FullName)
+                try {
+                    foreach ($entry in $za.Entries) {
+                        if (-not $entry.Name) { continue }                              # directory entry
+                        if ($entry.FullName -match '(^|/)\.\.(/|$)') { continue }       # never escape site-packages
+                        $dest = Join-Path $site ($entry.FullName -replace '/','\')
+                        $destDir = Split-Path $dest -Parent
+                        if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
+                        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+                    }
+                } finally { $za.Dispose() }
+            } catch {
+                Say "[X] Could not unpack $($w.Name): $($_.Exception.Message)" Yellow
+                $bad++
+            }
+        }
+        if ($wheels.Count -gt 0 -and $bad -eq 0 -and (Test-PyImport $pyExe 'requests') -and (Test-PyImport $pyExe 'pyVmomi')) {
+            $depsReady = $true
+            Say "[OK] Python deps installed from $($wheels.Count) prepackaged wheels (no pypi.org)." DarkGreen
+        } elseif ($wheels.Count -gt 0) {
+            Say "Prepackaged wheels did not fully install - falling back to pip/pypi.org." DarkYellow
+        }
+    }
+    if ($Offline -and -not $depsReady) {
+        Say "[X] Offline mode: prepackaged wheels unavailable - vSphere perf collection will be skipped." Yellow
+    }
+
     # Step 2: bootstrap pip via get-pip.py. We SKIP ensurepip entirely -
     # embeddable Python never has it, and under $ErrorActionPreference='Stop'
     # its "No module named ensurepip" stderr becomes a NativeCommandError
     # that killed older installs.
-    if (Test-PyPipVersion $pyExe) {
-        Say "pip already present." DarkGreen
+    if ($depsReady -or $Offline -or (Test-PyPipVersion $pyExe)) {
+        if ($depsReady)   { Say "pip not needed - deps came from prepackaged wheels." DarkGreen }
+        elseif ($Offline) { Say "Offline mode - skipping pip bootstrap." DarkYellow }
+        else              { Say "pip already present." DarkGreen }
     } else {
         Say "Bootstrapping pip via get-pip.py..." DarkCyan
         $getPipPy = Join-Path $PyDir 'get-pip.py'
@@ -314,7 +394,11 @@ if (-not (Test-Path $pyExe)) {
     # Step 3: pip install the required packages.
     # Trust pip's own output over exit-code fiddling: "Successfully installed"
     # or "Requirement already satisfied" are the only signals that matter.
-    if (Test-PyPipVersion $pyExe) {
+    if ($depsReady) {
+        # Already satisfied from prepackaged wheels (Step 1b).
+    } elseif ($Offline) {
+        Say "Offline mode - skipping pypi.org package install." DarkYellow
+    } elseif (Test-PyPipVersion $pyExe) {
         Say "Installing Python deps (pyVmomi, requests, urllib3)..." DarkCyan
         $pipLog = Join-Path $env:TEMP "sdt-pipinst-$([guid]::NewGuid().ToString('N').Substring(0,6)).log"
         $proc = Start-Process -FilePath $pyExe -ArgumentList @('-m','pip','install','--disable-pip-version-check','pyVmomi','requests','urllib3') -NoNewWindow -PassThru -RedirectStandardOutput $pipLog -RedirectStandardError "$pipLog.err" -EA SilentlyContinue
@@ -343,7 +427,8 @@ if (-not (Test-Path $pyExe)) {
     Say "--- Python dep pre-flight ---" DarkCyan
     $checks = @{
         'python.exe'      = (Test-Path $pyExe)
-        'pip module'      = (Test-PyPipVersion $pyExe)
+        # pip is not needed when deps came from prepackaged wheels.
+        'pip module'      = ($depsReady -or (Test-PyPipVersion $pyExe))
         'import requests' = (Test-PyImport $pyExe 'requests')
         'import pyVmomi'  = (Test-PyImport $pyExe 'pyVmomi')
         'import urllib3'  = (Test-PyImport $pyExe 'urllib3')

@@ -219,6 +219,32 @@ parse_ntnx_collector.py       # Run manually after using the Nutanix Collector G
 
 ---
 
+### Locked-down networks (no downloads needed)
+
+Every release ships Python 3.12, `plink.exe` and the Python packages SDT needs in
+`deps/`, each pinned by SHA256 in `deps/SHA256SUMS.txt`. The installer uses these
+first and only falls back to python.org / pypi.org when they are missing, so a
+client network that blocks those sites does not stop the install.
+
+To use a copy from a USB stick or file share instead, set this before running the
+install one-liner:
+
+```powershell
+$env:SDT_DEPS_PATH = '\\server\share\sdt-deps'
+```
+
+To forbid any dependency download at all:
+
+```powershell
+$env:SDT_OFFLINE = '1'
+```
+
+Every file is checked against the manifest; a corrupt or tampered file is
+rejected and reported, never used. If a download is needed, each method shows a
+live countdown to the next fallback.
+
+---
+
 ## Requirements
 
 | Component | Requirement |
