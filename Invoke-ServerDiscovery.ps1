@@ -2809,7 +2809,273 @@ ORDER BY dp.name
     }
 
 
+    # -- SHAREPOINT MIGRATION READINESS ---------------------------------------
+
+    function Collect-SharePointReadiness {
+        <#
+            Walk each business file share and count what the SharePoint Migration
+            Tool (SPMT) will refuse to migrate, so the blockers are known during
+            discovery instead of during a failed cutover.
+
+            What SPMT rejects (see detection_rules.json -> sharepoint_migration):
+              - Destination URL over the character limit. SharePoint measures the
+                whole decoded URL, so the site + library prefix eats into the
+                budget before the file's own path starts. We record the
+                share-relative length AND the projected URL length using a
+                configurable assumed prefix, so the number can be re-based later
+                without re-scanning.
+              - Characters that are illegal in SharePoint names.
+              - Reserved names (CON, PRN, AUX, NUL, COM0-9, LPT0-9, .lock,
+                desktop.ini, anything containing _vti_, names starting with ~$).
+              - Leading/trailing spaces, or a name ending in a period.
+              - Files above the per-file size ceiling.
+
+            Bounded on purpose: a client file server can hold millions of items.
+            Each share gets its own time budget and item cap; whichever hits
+            first stops that share and the result is marked incomplete rather
+            than silently short. Counts always say how many items were actually
+            examined.
+        #>
+        param($Shares)
+
+        $result = @{
+            Scanned = $false; Shares = @(); Partial = $false
+            TotalItems = 0; TotalBlockers = 0; Diagnostics = @()
+        }
+        $diag = [System.Collections.ArrayList]@()
+        $note = { param($m) [void]$diag.Add([string]$m); cb-Log "SharePoint" $m }
+
+        if (-not $Shares -or @($Shares).Count -eq 0) {
+            & $note "No business shares to scan"
+            $result.Diagnostics = @($diag); return $result
+        }
+
+        # Defaults mirror detection_rules.json; the JSON is authoritative when
+        # present so the limits can be tuned without touching this script.
+        $cfg = @{
+            MaxUrlChars   = 400
+            PrefixSample  = 'https://contoso.sharepoint.com/sites/Migration/Shared Documents/'
+            MaxFileBytes  = 268435456000   # 250 GB
+            BudgetSec     = 120
+            MaxItems      = 250000
+            MaxExamples   = 25
+        }
+        # This script is shipped to targets as a scriptblock over WinRM, where
+        # $PSScriptRoot is empty and detection_rules.json is not present. The
+        # embedded defaults above are what run remotely; the JSON only applies
+        # when the script runs from its own folder. Same pattern as the other
+        # lookup tables in this file.
+        try {
+            $rulesPath = $null
+            if ($PSScriptRoot) { $rulesPath = Join-Path $PSScriptRoot 'detection_rules.json' }
+            if ($rulesPath -and (Test-Path $rulesPath)) {
+                $rules = Get-Content $rulesPath -Raw | ConvertFrom-Json
+                $sp = $rules.sharepoint_migration
+                if ($sp) {
+                    if ($sp.max_url_chars)         { $cfg.MaxUrlChars  = [int]$sp.max_url_chars }
+                    if ($sp.assumed_target_prefix) { $cfg.PrefixSample = [string]$sp.assumed_target_prefix }
+                    if ($sp.max_file_bytes)        { $cfg.MaxFileBytes = [long]$sp.max_file_bytes }
+                    if ($sp.scan_budget_seconds)   { $cfg.BudgetSec    = [int]$sp.scan_budget_seconds }
+                    if ($sp.scan_max_items)        { $cfg.MaxItems     = [int]$sp.scan_max_items }
+                    if ($sp.max_examples_per_share){ $cfg.MaxExamples  = [int]$sp.max_examples_per_share }
+                }
+            }
+        } catch { & $note "detection_rules.json unreadable - using built-in limits: $($_.Exception.Message)" }
+
+        $prefixLen = $cfg.PrefixSample.Length
+        & $note ("Limit {0} chars; assuming a {1}-char destination prefix" -f $cfg.MaxUrlChars, $prefixLen)
+
+        foreach ($sh in @($Shares)) {
+            $sharePath = [string]$sh.Path
+            $shareName = [string]$sh.Name
+            if (-not $sharePath) { continue }
+            if (-not (Test-Path $sharePath -ErrorAction SilentlyContinue)) {
+                & $note "$shareName : path not reachable - skipped"
+                continue
+            }
+            Write-Host ("  [SharePoint] Scanning {0} ({1})..." -f $shareName, $sharePath) -ForegroundColor DarkGray
+
+            $job = $null
+            try {
+                $job = Start-Job -ScriptBlock {
+                    param($root, $maxUrl, $prefixLen, $maxBytes, $budget, $maxItems, $maxEx)
+
+                    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                    $out = @{
+                        Items=0; Completed=$true; StopReason='complete'
+                        LongPath=0; InvalidChar=0; ReservedName=0; EdgeSpace=0; TooBig=0
+                        EncodedRisk=0
+                        MaxRelLen=0; MaxProjectedLen=0; MaxProjectedEncLen=0; Unreadable=0
+                        Examples=@()
+                    }
+                    $ex = New-Object System.Collections.ArrayList
+
+                    # Illegal in SharePoint names. / and \ cannot occur inside a
+                    # single Windows name, but are checked so the same rule set
+                    # stays correct if this is ever pointed at other sources.
+                    $badChars = @('"','*',':','<','>','?','/','\','|')
+                    $reserved = @('.lock','desktop.ini','CON','PRN','AUX','NUL')
+
+                    # Enumerate through the extended-length prefix when the path allows it.
+                    # Without it, anything longer than MAX_PATH is invisible on a host that
+                    # has not enabled long-path support - exactly the population this scan
+                    # exists to count, so a plain walk would confidently report 0 long paths.
+                    # Falls back to the normal path if the prefixed walk yields nothing.
+                    $errs = @()
+                    $extRoot = $null
+                    if ($root -match '^\\\\') { $extRoot = '\\?\UNC\' + $root.TrimStart('\') }
+                    elseif ($root -match '^[A-Za-z]:\\') { $extRoot = '\\?\' + $root }
+                    $rootTrim = $root.TrimEnd('\')
+                    $items = @()
+                    if ($extRoot) {
+                        $items = @(Get-ChildItem -LiteralPath $extRoot -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable +errs)
+                        if ($items.Count -gt 0) { $rootTrim = $extRoot.TrimEnd('\') }
+                    }
+                    if ($items.Count -eq 0) {
+                        $errs = @()
+                        $rootTrim = $root.TrimEnd('\')
+                        $items = @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable +errs)
+                    }
+                    $out.Unreadable = @($errs).Count
+                    # Nothing enumerated but errors raised = the walk failed, not
+                    # a clean empty share. Never let that pass as a completed scan.
+                    if ($items.Count -eq 0 -and $out.Unreadable -gt 0) {
+                        $out.Completed  = $false
+                        $out.StopReason = 'enumeration failed (paths unreadable on this host)'
+                    }
+
+                    foreach ($it in $items) {
+                        if ($out.Items -ge $maxItems) { $out.Completed=$false; $out.StopReason='item cap'; break }
+                        if (($out.Items % 500) -eq 0 -and $sw.Elapsed.TotalSeconds -gt $budget) {
+                            $out.Completed=$false; $out.StopReason='time budget'; break
+                        }
+                        $out.Items++
+
+                        $full = [string]$it.FullName
+                        $rel  = $full
+                        if ($full.Length -gt $rootTrim.Length) { $rel = $full.Substring($rootTrim.Length).TrimStart('\') }
+                        $relLen = $rel.Length
+                        if ($relLen -gt $out.MaxRelLen) { $out.MaxRelLen = $relLen }
+                        # SharePoint counts the decoded URL, so the site/library
+                        # prefix is spent before this path even begins.
+                        $projected = $prefixLen + $relLen
+                        if ($projected -gt $out.MaxProjectedLen) { $out.MaxProjectedLen = $projected }
+
+                        # Microsoft documents the limit against the DECODED path,
+                        # but special characters are percent-encoded in the real
+                        # URL (a space becomes %20). A path full of spaces can be
+                        # far longer encoded than it looks, so track that too and
+                        # report it as a separate risk rather than a hard blocker.
+                        $encRel = (($rel -split '\\') | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
+                        $projectedEnc = $prefixLen + $encRel.Length
+                        if ($projectedEnc -gt $out.MaxProjectedEncLen) { $out.MaxProjectedEncLen = $projectedEnc }
+
+                        $why = @()
+                        if ($projected -gt $maxUrl) { $out.LongPath++; $why += "url $projected chars" }
+                        elseif ($projectedEnc -gt $maxUrl) { $out.EncodedRisk++; $why += "url $projectedEnc chars once encoded" }
+
+                        $name = [string]$it.Name
+                        $hasBad = $false
+                        foreach ($c in $badChars) { if ($name.Contains($c)) { $hasBad = $true; break } }
+                        if ($hasBad) { $out.InvalidChar++; $why += 'illegal character' }
+
+                        $bare = $name
+                        $dot = $bare.LastIndexOf('.')
+                        if ($dot -gt 0) { $bare = $bare.Substring(0, $dot) }
+                        $isReserved = $false
+                        foreach ($r in $reserved) { if ($name -ieq $r -or $bare -ieq $r) { $isReserved = $true; break } }
+                        if (-not $isReserved -and ($bare -imatch '^(COM|LPT)[0-9]$')) { $isReserved = $true }
+                        if (-not $isReserved -and $name.StartsWith('~$'))             { $isReserved = $true }
+                        if (-not $isReserved -and ($full -imatch '_vti_'))            { $isReserved = $true }
+                        if ($isReserved) { $out.ReservedName++; $why += 'reserved name' }
+
+                        if ($name -ne $name.Trim() -or $name.EndsWith('.')) {
+                            $out.EdgeSpace++; $why += 'leading/trailing space or trailing period'
+                        }
+
+                        if (-not $it.PSIsContainer -and $it.Length -gt $maxBytes) {
+                            $out.TooBig++; $why += 'over max file size'
+                        }
+
+                        if ($why.Count -gt 0 -and $ex.Count -lt $maxEx) {
+                            [void]$ex.Add(@{
+                                Path      = $rel
+                                Projected = $projected
+                                Reasons   = ($why -join '; ')
+                                IsFolder  = [bool]$it.PSIsContainer
+                            })
+                        }
+                    }
+                    $out.Examples = @($ex)
+                    $out.Seconds  = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+                    $out
+                } -ArgumentList $sharePath, $cfg.MaxUrlChars, $prefixLen, $cfg.MaxFileBytes, $cfg.BudgetSec, $cfg.MaxItems, $cfg.MaxExamples
+
+                # Give the job a little slack over its own internal budget, then
+                # stop waiting - a hung enumeration must not stall discovery.
+                $done = Wait-Job $job -Timeout ($cfg.BudgetSec + 60)
+                if ($done) {
+                    $r = Receive-Job $job -ErrorAction SilentlyContinue
+                    if ($r) {
+                        $blockers = [int]$r.LongPath + [int]$r.InvalidChar + [int]$r.ReservedName + [int]$r.EdgeSpace + [int]$r.TooBig
+                        $result.TotalItems    += [int]$r.Items
+                        $result.TotalBlockers += $blockers
+                        if (-not $r.Completed) { $result.Partial = $true }
+                        $result.Shares += @{
+                            Name            = $shareName
+                            Path            = $sharePath
+                            ItemsScanned    = [int]$r.Items
+                            Completed       = [bool]$r.Completed
+                            StopReason      = [string]$r.StopReason
+                            Seconds         = [double]$r.Seconds
+                            Unreadable      = [int]$r.Unreadable
+                            LongPath        = [int]$r.LongPath
+                            InvalidChar     = [int]$r.InvalidChar
+                            ReservedName    = [int]$r.ReservedName
+                            EdgeSpace       = [int]$r.EdgeSpace
+                            TooBig          = [int]$r.TooBig
+                            Blockers        = $blockers
+                            EncodedRisk        = [int]$r.EncodedRisk
+                            MaxRelLen          = [int]$r.MaxRelLen
+                            MaxProjectedLen    = [int]$r.MaxProjectedLen
+                            MaxProjectedEncLen = [int]$r.MaxProjectedEncLen
+                            Examples           = @($r.Examples)
+                        }
+                        $result.Scanned = $true
+                        if ($blockers -gt 0) {
+                            cb-Flag 'warning' "SharePoint blockers on share $shareName" "$blockers item(s) would be rejected by the SharePoint Migration Tool (longest projected URL $($r.MaxProjectedLen) chars). Remediate or re-home before migrating."
+                        }
+                        if (-not $r.Completed) {
+                            & $note "$shareName : stopped early ($($r.StopReason)) after $($r.Items) items - counts are a floor, not a total"
+                        }
+                        if ([int]$r.Unreadable -gt 0) {
+                            & $note "$shareName : $($r.Unreadable) path(s) could not be read (often the very deep ones) - real blocker count may be higher"
+                        }
+                    }
+                } else {
+                    $result.Partial = $true
+                    & $note "$shareName : scan exceeded $($cfg.BudgetSec + 60)s and was abandoned"
+                }
+            } catch {
+                & $note "$shareName : scan failed - $($_.Exception.Message)"
+                $result.Partial = $true
+            } finally {
+                if ($job) {
+                    try { Stop-Job $job -ErrorAction SilentlyContinue } catch { }
+                    try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
+                }
+            }
+        }
+
+        $result.Diagnostics = @($diag)
+        return $result
+    }
+
     # -- ASSEMBLE & RETURN -----------------------------------------------------
+
+    # Collected once and reused by the SharePoint readiness scan below, so
+    # the share list is not enumerated twice.
+    $fileShareResult = Collect-FileShares
 
     $Discovery = [ordered]@{
         Meta = @{
@@ -2825,7 +3091,7 @@ ORDER BY dp.name
         AD         = Collect-ADDetails
         DNS        = Collect-DNSDetails
         DHCP       = Collect-DHCPDetails
-        FileShares = Collect-FileShares
+        FileShares = $fileShareResult
         NPS        = Collect-NPSDetails
         IIS        = Collect-IISDetails
         SQL        = Collect-SQLDetails
@@ -2838,6 +3104,7 @@ ORDER BY dp.name
         Printers   = Collect-Printers
         PrintServer = Collect-PrintServer
         GPO        = Collect-GPODetails
+        SharePoint = Collect-SharePointReadiness -Shares $fileShareResult.Shares
         Flags      = $cbFlags
         Errors     = $cbErrors
     }
@@ -2859,6 +3126,7 @@ ORDER BY dp.name
         'EventLog' = @('TopSources','RecentCritical')
         'PrintServer' = @('Queues')
         'GPO'      = @('GPOs')
+        'SharePoint' = @('Shares','Diagnostics')
     }
     foreach ($section in $arrayFields.Keys) {
         $sec = $Discovery[$section]

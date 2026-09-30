@@ -245,6 +245,47 @@ live countdown to the next fallback.
 
 ---
 
+### SharePoint migration readiness
+
+Every run walks the business file shares it finds and counts what the SharePoint
+Migration Tool will refuse to move, so the blockers are known before a cutover
+rather than discovered as missing files after one. Results land on the
+**SharePoint Readiness** tab.
+
+Counted per share:
+
+- **Long path** - SharePoint caps the entire decoded URL at 400 characters,
+  including the file name.
+- **Bad name** - characters SharePoint does not allow in a name (double quote,
+  asterisk, colon, angle brackets, question mark, slash, backslash, pipe).
+- **Reserved** - `.lock`, `desktop.ini`, `CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`,
+  `LPT0`-`LPT9`, anything containing `_vti_`, and names starting with a tilde-dollar.
+- **Spaces** - a leading or trailing space, or a name ending in a period.
+- **Too big** - files over the per-file ceiling (250 GB).
+
+The 400-character budget includes the destination site and library, which is
+spent before the file's own path even begins. The counts therefore assume the
+`assumed_target_prefix` in `detection_rules.json` - point it at the real target
+and re-run to re-base every number. Items that fit when decoded but exceed the
+limit once special characters are percent-encoded (a space becomes `%20`) are
+reported separately as "at risk" rather than as hard blockers.
+
+Two things worth knowing about the numbers:
+
+- Each share runs under a time budget and an item cap. Whichever is hit first
+  stops that share, and the result is marked partial so a count is never quietly
+  short.
+- Shares are enumerated through the extended-length path API, so paths beyond the
+  260-character Windows limit are still counted. Without that they are invisible
+  on a host that has not enabled long-path support - which would report a
+  reassuring and completely wrong zero.
+
+Tuning lives in `detection_rules.json` under `sharepoint_migration`:
+`max_url_chars`, `assumed_target_prefix`, `max_file_bytes`,
+`scan_budget_seconds`, `scan_max_items`, `max_examples_per_share`.
+
+---
+
 ## Requirements
 
 | Component | Requirement |

@@ -3146,6 +3146,157 @@ def build_gpo_tab():
     return out
 
 
+def _collect_sp_data():
+    """Gather the SharePoint migration readiness scan from every server."""
+    out = []   # [(server_name, [share dicts])]
+    meta = {'any': False, 'partial': False, 'diags': [], 'items': 0, 'blockers': 0,
+            'risks': 0, 'max_url': 0, 'incomplete': 0}
+    for srv in servers:
+        if srv.get('os_type') == 'linux':
+            continue
+        d = srv.get('data', {}) or {}
+        sp = d.get('SharePoint')
+        if not isinstance(sp, dict):
+            continue
+        for _d in (sp.get('Diagnostics') or []):
+            t = f"{srv.get('name', '')}: {_d}"
+            if t not in meta['diags']:
+                meta['diags'].append(t)
+        if sp.get('Partial'):
+            meta['partial'] = True
+        shares = as_list(sp.get('Shares', []))
+        if sp.get('Scanned') or shares:
+            meta['any'] = True
+        for sh in shares:
+            meta['items']    += int(sh.get('ItemsScanned', 0) or 0)
+            meta['blockers'] += int(sh.get('Blockers', 0) or 0)
+            meta['risks']    += int(sh.get('EncodedRisk', 0) or 0)
+            meta['max_url']   = max(meta['max_url'], int(sh.get('MaxProjectedLen', 0) or 0))
+            if not sh.get('Completed', True):
+                meta['incomplete'] += 1
+        if shares:
+            out.append((srv.get('name', ''), shares))
+    return out, meta
+
+
+def build_sharepoint_tab():
+    """What the SharePoint Migration Tool would refuse to move.
+
+    SPMT silently skips anything that breaks SharePoint's naming and path
+    rules, so these items surface as missing files after a cutover rather than
+    as errors during one. Counting them during discovery turns that into
+    scoped remediation work instead of a surprise.
+    """
+    sp_servers, meta = _collect_sp_data()
+    limit = 400
+    prefix = ''
+    try:
+        spcfg = RULES.get('sharepoint_migration', {}) or {}
+        limit = int(spcfg.get('max_url_chars', 400) or 400)
+        prefix = str(spcfg.get('assumed_target_prefix', '') or '')
+    except Exception:
+        pass
+
+    if not sp_servers:
+        body = ('<div class="flag-info"><div class="flag-label">No file shares scanned</div>'
+                '<div class="flag-detail">The SharePoint readiness scan runs against business file '
+                'shares found on in-scope Windows servers. No scannable share was reported - either no '
+                'file server was in scope, or its shares could not be reached with the discovery '
+                'account.</div></div>')
+        body += _diag_panel(meta['diags'], [], 'SharePoint readiness')
+        return f'<div style="padding:24px;">{body}</div>'
+
+    total_shares = sum(len(s) for _, s in sp_servers)
+    out = '<div style="padding:24px;">'
+
+    if meta['incomplete']:
+        out += ('<div class="flag-warning" style="margin-bottom:16px;">'
+                '<div class="flag-label">Counts are a floor, not a total</div>'
+                f'<div class="flag-detail">{meta["incomplete"]} share(s) hit the scan time budget or item '
+                'cap before finishing, so blockers past that point were never examined. Raise '
+                '<code>scan_budget_seconds</code> / <code>scan_max_items</code> in detection_rules.json '
+                'and re-run for a complete number.</div></div>')
+
+    out += (f'<div class="stat-grid">'
+            f'<div class="stat-box"><div class="stat-num">{total_shares}</div><div class="stat-lbl">Shares Scanned</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{meta["items"]:,}</div><div class="stat-lbl">Items Examined</div></div>'
+            f'<div class="stat-box"><div class="stat-num" style="color:#d63638;">{meta["blockers"]:,}</div><div class="stat-lbl">Will Not Migrate</div></div>'
+            f'<div class="stat-box"><div class="stat-num" style="color:#bd8600;">{meta["risks"]:,}</div><div class="stat-lbl">At Risk (Encoded)</div></div>'
+            f'<div class="stat-box"><div class="stat-num">{meta["max_url"]}</div><div class="stat-lbl">Longest URL</div></div>'
+            f'</div>\n')
+
+    out += ('<div style="font-size:8.5pt;color:#6b6080;margin-top:10px;">'
+            f'SharePoint rejects any item whose full decoded URL exceeds <strong>{limit} characters</strong>. '
+            'That budget includes the destination site and library, which is spent before the file\'s own '
+            'path begins - these numbers assume a '
+            f'<code>{h(prefix)}</code> prefix ({len(prefix)} chars). Change '
+            '<code>assumed_target_prefix</code> in detection_rules.json to match the real target and re-run '
+            'to re-base the counts. "At risk" items fit when decoded but exceed the limit once special '
+            'characters are percent-encoded (a space becomes %20).</div>\n')
+
+    for nm, shares in sp_servers:
+        out += f'<div class="sub-title" style="margin-top:24px;">{h(nm)}</div>\n'
+        out += ('<table style="width:100%;"><tr>'
+                '<th>Share</th><th style="text-align:right">Items</th>'
+                '<th style="text-align:right">Blockers</th><th style="text-align:right">Long Path</th>'
+                '<th style="text-align:right">Bad Name</th><th style="text-align:right">Reserved</th>'
+                '<th style="text-align:right">Spaces</th><th style="text-align:right">Too Big</th>'
+                '<th style="text-align:right">Longest URL</th></tr>')
+        for i, sh in enumerate(shares):
+            blockers = int(sh.get('Blockers', 0) or 0)
+            longest  = int(sh.get('MaxProjectedLen', 0) or 0)
+            bg = ' style="background:#f5f4f8"' if i % 2 else ''
+            name_html = f'<strong>{h(str(sh.get("Name", "")))}</strong>'
+            if not sh.get('Completed', True):
+                name_html += (' <span class="pill pill-yellow">partial</span>'
+                              f'<div style="font-size:8pt;color:#6b6080;">stopped: {h(str(sh.get("StopReason", "")))}</div>')
+            blk_html = (f'<span class="pill pill-red">{blockers:,}</span>' if blockers
+                        else '<span class="pill pill-green">0</span>')
+            url_html = (f'<span class="pill pill-red">{longest}</span>' if longest > limit
+                        else f'<span style="color:#6b6080;">{longest}</span>')
+            out += (f'<tr{bg}><td>{name_html}</td>'
+                    f'<td style="text-align:right">{int(sh.get("ItemsScanned", 0) or 0):,}</td>'
+                    f'<td style="text-align:right">{blk_html}</td>'
+                    f'<td style="text-align:right">{int(sh.get("LongPath", 0) or 0):,}</td>'
+                    f'<td style="text-align:right">{int(sh.get("InvalidChar", 0) or 0):,}</td>'
+                    f'<td style="text-align:right">{int(sh.get("ReservedName", 0) or 0):,}</td>'
+                    f'<td style="text-align:right">{int(sh.get("EdgeSpace", 0) or 0):,}</td>'
+                    f'<td style="text-align:right">{int(sh.get("TooBig", 0) or 0):,}</td>'
+                    f'<td style="text-align:right">{url_html}</td></tr>')
+        out += '</table>\n'
+
+        # Offending items, collapsed per share
+        for sh in shares:
+            examples = as_list(sh.get('Examples', []))
+            if not examples:
+                continue
+            rows = ''
+            for j, exm in enumerate(examples):
+                bg2 = ' style="background:#faf9fc"' if j % 2 else ''
+                kind = 'folder' if exm.get('IsFolder') else 'file'
+                rows += (f'<tr{bg2}><td style="font-size:8pt;color:#6b6080;">{kind}</td>'
+                         f'<td style="font-family:monospace;font-size:8pt;word-break:break-all;">{h(str(exm.get("Path", "")))}</td>'
+                         f'<td style="text-align:right;font-size:8pt;">{int(exm.get("Projected", 0) or 0)}</td>'
+                         f'<td style="font-size:8pt;color:#bd8600;">{h(str(exm.get("Reasons", "")))}</td></tr>')
+            out += (
+                '<details style="border:1px solid #e5e1ee;border-radius:6px;margin-bottom:6px;">'
+                '<summary style="cursor:pointer;padding:9px 12px;list-style:none;">'
+                f'<span style="font-weight:600;color:#271e41;">{h(str(sh.get("Name", "")))}</span> '
+                f'<span class="pill pill-yellow">{len(examples)} example(s)</span>'
+                '<div style="font-size:8pt;color:#5b4a78;margin-top:3px;">'
+                'Sample offending paths, relative to the share root.</div>'
+                '</summary>'
+                '<div style="padding:4px 12px 12px 12px;border-top:1px solid #efecf6;">'
+                '<table style="width:100%;"><tr><th style="width:60px">Type</th><th>Path</th>'
+                '<th style="width:80px;text-align:right">URL len</th><th style="width:230px">Why</th></tr>'
+                f'{rows}</table></div></details>'
+            )
+
+    out += _diag_panel(meta['diags'], [], 'SharePoint readiness')
+    out += '</div>'
+    return out
+
+
 # -- SUMMARY TAB ---------------------------------------------------------------
 def build_summary_tab():
     """Environment-wide summary: counts, OS mix, EOL exposure, security tools,
@@ -3299,6 +3450,7 @@ summary_tab_html = build_summary_tab()
 ad_tab_html    = build_ad_tab()
 gpo_tab_html   = build_gpo_tab()
 printers_tab_html = build_printers_tab()
+sharepoint_tab_html = build_sharepoint_tab()
 
 # -- LOGO ----------------------------------------------------------------------
 if LOGO_B64:
@@ -3371,10 +3523,12 @@ for bucket in BUCKET_ORDER:
 env_tab_buttons = ''  # goes into top tab-nav
 _gpo_all, _gpo_meta = _collect_gpo_data()
 _prn_all, _prn_meta = _collect_print_data()
+_sp_all,  _sp_meta  = _collect_sp_data()
 # Render the tab when there is data OR when the collector explained a failure,
 # so an empty section always says WHY instead of vanishing from the nav.
 _has_gpo_data     = bool(_gpo_all) or _gpo_meta['any_dc'] or bool(_gpo_meta['diags'])
 _has_printer_data = bool(_prn_all) or bool(_prn_meta['diags'])
+_has_sp_data      = bool(_sp_all) or bool(_sp_meta['diags'])
 _has_hyperv  = any(h.get('_type') == 'HyperVInventory'   for h in hv_inventories)
 _has_vsphere = any(h.get('_type') == 'vSphereInventory'  for h in hv_inventories)
 # Fall back to manifest hv_type hint when no inventory file was collected
@@ -3395,6 +3549,8 @@ if _has_gpo_data:
     env_tab_buttons += '<button class="tab-btn" data-tab="tab-gpo" onclick="showTab(\'gpo\')">Group Policy</button>\n'
 if _has_printer_data:
     env_tab_buttons += '<button class="tab-btn" data-tab="tab-printers" onclick="showTab(\'printers\')">Printers</button>\n'
+if _has_sp_data:
+    env_tab_buttons += '<button class="tab-btn" data-tab="tab-sharepoint" onclick="showTab(\'sharepoint\')">SharePoint Readiness</button>\n'
 env_tab_buttons += '<button class="tab-btn" data-tab="tab-eol" onclick="showTab(\'eol\')" style="border-top:3px solid #d63638;">EOL</button>\n'
 env_tab_buttons += '<button class="tab-btn" data-tab="tab-cloud" onclick="showTab(\'cloud\')" style="border-top:3px solid #5b1fa4;">Private Cloud + Commvault</button>\n'
 
@@ -3409,6 +3565,8 @@ if _has_gpo_data:
     tab_contents += f'<div id="tab-gpo" class="tab-content">\n{gpo_tab_html}\n</div>\n'
 if _has_printer_data:
     tab_contents += f'<div id="tab-printers" class="tab-content">\n{printers_tab_html}\n</div>\n'
+if _has_sp_data:
+    tab_contents += f'<div id="tab-sharepoint" class="tab-content">\n{sharepoint_tab_html}\n</div>\n'
 if sql_tab_html:
     tab_contents += f'<div id="tab-sql" class="tab-content">\n{sql_tab_html}\n</div>\n'
 tab_contents += f'<div id="tab-eol" class="tab-content"><div style="padding:24px;">{eol_tab_html}</div></div>\n'
