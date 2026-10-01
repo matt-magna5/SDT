@@ -3146,6 +3146,39 @@ def build_gpo_tab():
     return out
 
 
+def _fmt_bytes(n):
+    """Human-readable size. Files on a share run from bytes to hundreds of GB."""
+    try:
+        n = float(n or 0)
+    except Exception:
+        return '-'
+    for unit, div in (('TB', 1024 ** 4), ('GB', 1024 ** 3), ('MB', 1024 ** 2), ('KB', 1024)):
+        if n >= div:
+            return f'{n / div:,.1f} {unit}'
+    return f'{int(n)} B'
+
+
+# Extensions worth calling out when they show up among the biggest files: they
+# change the migration plan, not just its size.
+_BIG_FILE_NOTES = {
+    '.pst':  'Outlook data file - should not live in SharePoint',
+    '.ost':  'Outlook cache file - should not be migrated',
+    '.vhd':  'disk image - usually out of scope',
+    '.vhdx': 'disk image - usually out of scope',
+    '.iso':  'disk image - usually out of scope',
+    '.bak':  'backup file - usually out of scope',
+    '.bkf':  'backup file - usually out of scope',
+}
+
+
+def _big_file_note(path):
+    p = str(path or '').lower()
+    for ext, note in _BIG_FILE_NOTES.items():
+        if p.endswith(ext):
+            return note
+    return ''
+
+
 def _collect_sp_data():
     """Gather the SharePoint migration readiness scan from every server."""
     out = []   # [(server_name, [share dicts])]
@@ -3291,6 +3324,84 @@ def build_sharepoint_tab():
                 '<th style="width:80px;text-align:right">URL len</th><th style="width:230px">Why</th></tr>'
                 f'{rows}</table></div></details>'
             )
+
+    # ---- Largest files -----------------------------------------------------
+    # Captured during the same walk as the blocker counts, so this costs no
+    # extra I/O. Useful for migration time, for the per-file ceiling, and for
+    # spotting what should not be migrated at all (PSTs, disk images, backups).
+    everything = []
+    for nm, shares in sp_servers:
+        for sh in shares:
+            for tf in as_list(sh.get('TopFiles', [])):
+                try:
+                    b = int(tf.get('Bytes', 0) or 0)
+                except Exception:
+                    b = 0
+                everything.append((b, str(tf.get('Path', '')), str(sh.get('Name', '')), nm))
+    everything.sort(key=lambda x: x[0], reverse=True)
+
+    if everything:
+        top_n = 10
+        try:
+            top_n = int((RULES.get('sharepoint_migration', {}) or {}).get('top_files_per_share', 10) or 10)
+        except Exception:
+            pass
+        out += f'<div class="sub-title" style="margin-top:28px;">Largest Files (top {top_n})</div>\n'
+        out += ('<div style="font-size:8.5pt;color:#6b6080;margin-bottom:8px;">'
+                'Biggest files across every scanned share. Collected during the same walk, so these '
+                'reflect only what was examined - a share that stopped at its budget may hold something '
+                'larger.</div>\n')
+        out += ('<table style="width:100%;"><tr><th style="width:36px">#</th><th>File</th>'
+                '<th style="width:140px">Share</th><th style="width:150px">Server</th>'
+                '<th style="width:100px;text-align:right">Size</th><th style="width:260px">Note</th></tr>')
+        for i, (b, path, share, srv) in enumerate(everything[:top_n], 1):
+            note = _big_file_note(path)
+            note_html = f'<span class="pill pill-yellow">{h(note)}</span>' if note else ''
+            bg = ' style="background:#f5f4f8"' if i % 2 == 0 else ''
+            out += (f'<tr{bg}><td style="color:#6b6080;">{i}</td>'
+                    f'<td style="font-family:monospace;font-size:8pt;word-break:break-all;">{h(path)}</td>'
+                    f'<td style="font-size:8.5pt;">{h(share)}</td>'
+                    f'<td style="font-size:8.5pt;">{h(srv)}</td>'
+                    f'<td style="text-align:right;font-variant-numeric:tabular-nums;">'
+                    f'<strong>{_fmt_bytes(b)}</strong></td>'
+                    f'<td>{note_html}</td></tr>')
+        out += '</table>\n'
+
+        # Per-share lists, for when a single share is the one being moved
+        for nm, shares in sp_servers:
+            for sh in shares:
+                tops = as_list(sh.get('TopFiles', []))
+                if not tops:
+                    continue
+                rows = ''
+                for j, tf in enumerate(tops, 1):
+                    try:
+                        b = int(tf.get('Bytes', 0) or 0)
+                    except Exception:
+                        b = 0
+                    pth = str(tf.get('Path', ''))
+                    note = _big_file_note(pth)
+                    bg2 = ' style="background:#faf9fc"' if j % 2 == 0 else ''
+                    rows += (f'<tr{bg2}><td style="color:#6b6080;font-size:8pt;">{j}</td>'
+                             f'<td style="font-family:monospace;font-size:8pt;word-break:break-all;">{h(pth)}</td>'
+                             f'<td style="text-align:right;font-size:8pt;">{_fmt_bytes(b)}</td>'
+                             f'<td style="font-size:8pt;color:#bd8600;">{h(note)}</td></tr>')
+                biggest = _fmt_bytes(max((int(t.get('Bytes', 0) or 0) for t in tops), default=0))
+                out += (
+                    '<details style="border:1px solid #e5e1ee;border-radius:6px;margin-bottom:6px;">'
+                    '<summary style="cursor:pointer;padding:9px 12px;list-style:none;">'
+                    f'<span style="font-weight:600;color:#271e41;">{h(nm)} &rarr; '
+                    f'{h(str(sh.get("Name", "")))}</span> '
+                    f'<span class="pill pill-gray">largest {biggest}</span>'
+                    '<div style="font-size:8pt;color:#5b4a78;margin-top:3px;">'
+                    f'Top {len(tops)} file(s) by size on this share.</div>'
+                    '</summary>'
+                    '<div style="padding:4px 12px 12px 12px;border-top:1px solid #efecf6;">'
+                    '<table style="width:100%;"><tr><th style="width:36px">#</th><th>File</th>'
+                    '<th style="width:100px;text-align:right">Size</th>'
+                    '<th style="width:240px">Note</th></tr>'
+                    f'{rows}</table></div></details>'
+                )
 
     out += _diag_panel(meta['diags'], [], 'SharePoint readiness')
     out += '</div>'

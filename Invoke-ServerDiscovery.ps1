@@ -2859,6 +2859,7 @@ ORDER BY dp.name
             BudgetSec     = 120
             MaxItems      = 250000
             MaxExamples   = 25
+            TopFiles      = 10
         }
         # This script is shipped to targets as a scriptblock over WinRM, where
         # $PSScriptRoot is empty and detection_rules.json is not present. The
@@ -2878,6 +2879,7 @@ ORDER BY dp.name
                     if ($sp.scan_budget_seconds)   { $cfg.BudgetSec    = [int]$sp.scan_budget_seconds }
                     if ($sp.scan_max_items)        { $cfg.MaxItems     = [int]$sp.scan_max_items }
                     if ($sp.max_examples_per_share){ $cfg.MaxExamples  = [int]$sp.max_examples_per_share }
+                    if ($sp.top_files_per_share)   { $cfg.TopFiles     = [int]$sp.top_files_per_share }
                 }
             }
         } catch { & $note "detection_rules.json unreadable - using built-in limits: $($_.Exception.Message)" }
@@ -2898,7 +2900,7 @@ ORDER BY dp.name
             $job = $null
             try {
                 $job = Start-Job -ScriptBlock {
-                    param($root, $maxUrl, $prefixLen, $maxBytes, $budget, $maxItems, $maxEx)
+                    param($root, $maxUrl, $prefixLen, $maxBytes, $budget, $maxItems, $maxEx, $topN)
 
                     $sw = [System.Diagnostics.Stopwatch]::StartNew()
                     $out = @{
@@ -2906,9 +2908,13 @@ ORDER BY dp.name
                         LongPath=0; InvalidChar=0; ReservedName=0; EdgeSpace=0; TooBig=0
                         EncodedRisk=0
                         MaxRelLen=0; MaxProjectedLen=0; MaxProjectedEncLen=0; Unreadable=0
-                        Examples=@()
+                        Examples=@(); TopFiles=@()
                     }
                     $ex = New-Object System.Collections.ArrayList
+                    # Running top-N largest files. PSCustomObject so Sort-Object
+                    # and Measure-Object can work on the Bytes property.
+                    $top = New-Object System.Collections.ArrayList
+                    $topMin = [long]0
 
                     # Illegal in SharePoint names. / and \ cannot occur inside a
                     # single Windows name, but are checked so the same rule set
@@ -2997,6 +3003,25 @@ ORDER BY dp.name
                             $out.TooBig++; $why += 'over max file size'
                         }
 
+                        # Largest files, captured during the walk we are already
+                        # doing - no second pass over the share. Only the running
+                        # top N is held: compare against the smallest entry kept
+                        # and replace it when beaten.
+                        if (-not $it.PSIsContainer -and $topN -gt 0) {
+                            $len = [long]$it.Length
+                            if ($top.Count -lt $topN) {
+                                [void]$top.Add([PSCustomObject]@{ Path = $rel; Bytes = $len })
+                                if ($top.Count -eq $topN) { $topMin = ($top | Measure-Object -Property Bytes -Minimum).Minimum }
+                            } elseif ($len -gt $topMin) {
+                                $minIdx = 0; $minVal = [long]::MaxValue
+                                for ($k = 0; $k -lt $top.Count; $k++) {
+                                    if ($top[$k].Bytes -lt $minVal) { $minVal = $top[$k].Bytes; $minIdx = $k }
+                                }
+                                $top[$minIdx] = [PSCustomObject]@{ Path = $rel; Bytes = $len }
+                                $topMin = ($top | Measure-Object -Property Bytes -Minimum).Minimum
+                            }
+                        }
+
                         if ($why.Count -gt 0 -and $ex.Count -lt $maxEx) {
                             [void]$ex.Add(@{
                                 Path      = $rel
@@ -3007,9 +3032,10 @@ ORDER BY dp.name
                         }
                     }
                     $out.Examples = @($ex)
+                    $out.TopFiles = @($top | Sort-Object -Property Bytes -Descending)
                     $out.Seconds  = [math]::Round($sw.Elapsed.TotalSeconds, 1)
                     $out
-                } -ArgumentList $sharePath, $cfg.MaxUrlChars, $prefixLen, $cfg.MaxFileBytes, $cfg.BudgetSec, $cfg.MaxItems, $cfg.MaxExamples
+                } -ArgumentList $sharePath, $cfg.MaxUrlChars, $prefixLen, $cfg.MaxFileBytes, $cfg.BudgetSec, $cfg.MaxItems, $cfg.MaxExamples, $cfg.TopFiles
 
                 # Give the job a little slack over its own internal budget, then
                 # stop waiting - a hung enumeration must not stall discovery.
@@ -3040,6 +3066,7 @@ ORDER BY dp.name
                             MaxProjectedLen    = [int]$r.MaxProjectedLen
                             MaxProjectedEncLen = [int]$r.MaxProjectedEncLen
                             Examples           = @($r.Examples)
+                            TopFiles           = @($r.TopFiles)
                         }
                         $result.Scanned = $true
                         if ($blockers -gt 0) {

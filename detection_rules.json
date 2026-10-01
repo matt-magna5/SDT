@@ -86,7 +86,8 @@
     "max_file_bytes": 268435456000,
     "scan_budget_seconds": 120,
     "scan_max_items": 250000,
-    "max_examples_per_share": 25
+    "max_examples_per_share": 25,
+    "top_files_per_share": 10
   },
   "_notes": [
     "SDT Detection Rules — edit freely, no Python knowledge required.",

@@ -280,9 +280,17 @@ Two things worth knowing about the numbers:
   on a host that has not enabled long-path support - which would report a
   reassuring and completely wrong zero.
 
+The same walk also records the **largest files** on each share - the top 10 by
+size per share, rolled up into an environment-wide top 10 on the same tab. It
+costs no extra I/O, since the files are already being enumerated. Types that
+change the migration plan rather than just its size - Outlook data files, disk
+images, backups - are called out, because those usually should not be migrated
+at all.
+
 Tuning lives in `detection_rules.json` under `sharepoint_migration`:
 `max_url_chars`, `assumed_target_prefix`, `max_file_bytes`,
-`scan_budget_seconds`, `scan_max_items`, `max_examples_per_share`.
+`scan_budget_seconds`, `scan_max_items`, `max_examples_per_share`,
+`top_files_per_share`.
 
 ---
 
