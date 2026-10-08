@@ -35,7 +35,10 @@ param(
     # SDT_DEPS_PATH so it can be set before running the one-liner.
     [string] $DepsPath = $env:SDT_DEPS_PATH,
     # Never touch the network for dependencies.
-    [switch] $Offline
+    [switch] $Offline,
+    # Install from an already-extracted SDT folder instead of downloading a
+    # release zip. Auto-detected when install.ps1 is run from inside one.
+    [string] $LocalSource
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,6 +46,31 @@ $ProgressPreference    = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 # The one-liner (iwr | iex) cannot pass switches, so honour an env var too.
 if (-not $Offline -and $env:SDT_OFFLINE -match '^(1|true|yes)$') { $Offline = $true }
+
+# -- Local-source (offline bundle) detection ----------------------------------
+# When install.ps1 runs as a FILE that sits beside the rest of SDT, the whole
+# tree is already on disk and there is nothing to download. $PSCommandPath is
+# empty under the `iwr | iex` one-liner and under `sdt update` (which re-fetches
+# install.ps1 from raw.githubusercontent.com), so neither network path changes.
+$script:LocalInstall = $false
+if (-not $LocalSource -and $PSCommandPath) {
+    $selfDir = Split-Path -Parent $PSCommandPath
+    if ((Test-Path (Join-Path $selfDir 'Start-DiscoverySession.ps1')) -and
+        (Test-Path (Join-Path $selfDir 'Invoke-ServerDiscovery.ps1'))) {
+        $LocalSource = $selfDir
+    }
+}
+if ($LocalSource) {
+    if (-not (Test-Path $LocalSource)) { throw "LocalSource not found: $LocalSource" }
+    $LocalSource = (Resolve-Path -LiteralPath $LocalSource).Path
+    $script:LocalInstall = $true
+    # A local bundle is self-contained by definition - never reach for the network.
+    $Offline = $true
+    if (-not $DepsPath) {
+        $bundledDeps = Join-Path $LocalSource 'deps'
+        if (Test-Path $bundledDeps) { $DepsPath = $bundledDeps }
+    }
+}
 
 # -- PowerShell version check --------------------------------------------------
 $script:PSMaj = $PSVersionTable.PSVersion.Major
@@ -95,12 +123,39 @@ foreach ($d in @($Root, $BinDir, $AppDir)) {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
 }
 
+# Installing the live install folder over itself would wipe it: the copy step
+# clears $AppDir before copying, so source and destination must never match.
+if ($script:LocalInstall) {
+    $srcFull = $LocalSource.TrimEnd('\')
+    $appFull = $AppDir.TrimEnd('\')
+    if ($srcFull -eq $appFull) {
+        Say "[X] This IS the installed copy ($AppDir)." Red
+        Say "    Run 'sdt update' to refresh it, or re-extract the bundle elsewhere." DarkGray
+        exit 1
+    }
+}
+
 # ----- Resolve latest tag ----------------------------------------------------
 # Query /tags FIRST (returns ALL tags including those without formal Release
 # objects). Falls back to /releases if /tags fails. Previously we only
 # queried /releases which meant tag-only updates (no Release object) were
 # invisible to auto-discovery and the install would pin to the last formally
 # released version. /tags is the authoritative source.
+if ($Version -eq 'latest' -and $script:LocalInstall) {
+    # Read the version out of the bundle itself. VERSION is written by
+    # Make-OfflineBundle.ps1; fall back to parsing the session script.
+    $Version = $null
+    $vf = Join-Path $LocalSource 'VERSION'
+    if (Test-Path $vf) { $Version = (Get-Content $vf -Raw -EA 0).Trim() }
+    if (-not $Version) {
+        $sdsrc = Get-Content (Join-Path $LocalSource 'Start-DiscoverySession.ps1') -Raw -EA 0
+        $m = [regex]::Match([string]$sdsrc, "SessionVersion\s*=\s*'([^']+)'")
+        if ($m.Success) { $Version = 'v' + $m.Groups[1].Value }
+    }
+    if (-not $Version) { $Version = 'v0.0.0-local' }
+    if ($Version -notmatch '^v') { $Version = 'v' + $Version }
+    Say "Offline bundle: $Version (no network required)" DarkGreen
+}
 if ($Version -eq 'latest') {
     Say "Resolving latest tag..." DarkCyan
     $Version = $null
@@ -155,17 +210,23 @@ if ($existing -eq $Version -and -not $Force) {
     if ($Force -and $existing -eq $Version) {
         Say "Force re-download requested - downloading $Version fresh..." DarkYellow
     }
-    # ----- Download + extract ------------------------------------------------
-    $url    = "https://github.com/matt-magna5/SDT/archive/refs/tags/$Version.zip"
-    $zipTmp = Join-Path $env:TEMP "sdt-install-$Version.zip"
-    $extTmp = Join-Path $env:TEMP ("sdt-install-" + [guid]::NewGuid().ToString('N').Substring(0,8))
-    Say "Downloading $Version (includes prepackaged Python + plink, ~15 MB)..." DarkCyan
-    Invoke-WebRequest -Uri $url -OutFile $zipTmp -UseBasicParsing -TimeoutSec 900
-    New-Item -ItemType Directory -Force -Path $extTmp | Out-Null
-    Expand-ZipCompat $zipTmp $extTmp
-    Remove-Item $zipTmp -Force -EA 0
-    $src = Get-ChildItem $extTmp -Directory | Select-Object -First 1
-    if (-not $src) { throw "Extraction produced no folder" }
+    # ----- Obtain the release files ------------------------------------------
+    $extTmp = $null
+    if ($script:LocalInstall) {
+        Say "Installing $Version from $LocalSource (offline)..." DarkCyan
+        $src = Get-Item -LiteralPath $LocalSource
+    } else {
+        $url    = "https://github.com/matt-magna5/SDT/archive/refs/tags/$Version.zip"
+        $zipTmp = Join-Path $env:TEMP "sdt-install-$Version.zip"
+        $extTmp = Join-Path $env:TEMP ("sdt-install-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+        Say "Downloading $Version (includes prepackaged Python + plink, ~15 MB)..." DarkCyan
+        Invoke-WebRequest -Uri $url -OutFile $zipTmp -UseBasicParsing -TimeoutSec 900
+        New-Item -ItemType Directory -Force -Path $extTmp | Out-Null
+        Expand-ZipCompat $zipTmp $extTmp
+        Remove-Item $zipTmp -Force -EA 0
+        $src = Get-ChildItem $extTmp -Directory | Select-Object -First 1
+        if (-not $src) { throw "Extraction produced no folder" }
+    }
 
     # ----- Copy release files into AppDir (preserve python/ + _output/) -----
     Say "Installing to $AppDir ..." DarkCyan
@@ -176,7 +237,16 @@ if ($existing -eq $Version -and -not $Force) {
     }
     # Copy everything from the extracted release
     Copy-Item -Path (Join-Path $src.FullName '*') -Destination $AppDir -Recurse -Force
-    Remove-Item $extTmp -Recurse -Force -EA 0
+    if ($extTmp) { Remove-Item $extTmp -Recurse -Force -EA 0 }
+
+    # A zip downloaded through a browser carries Mark-of-the-Web on every file,
+    # which makes PowerShell refuse to dot-source or run them. Strip it.
+    if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
+        try {
+            Get-ChildItem $AppDir -Recurse -File -Include *.ps1,*.psm1,*.psd1,*.py,*.exe,*.zip,*.whl -EA 0 |
+                Unblock-File -EA 0
+        } catch {}
+    }
 
     # ----- Stamp version -----------------------------------------------------
     Set-Content -Path $VerFile -Value $Version -Encoding ASCII
@@ -929,6 +999,21 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ShimPS" %*
 "@ | Set-Content -Path $ShimCmd -Encoding ASCII
 
 Say "Shim scripts written." DarkGreen
+
+# ----- Offline boxes: stop every launch stalling on a GitHub check -----------
+# An air-gapped install can never succeed at the update lookup, so each `sdt`
+# would burn the HTTP timeout before doing any work. Persist the opt-out for
+# this user; README-OFFLINE.txt documents how to clear it.
+if ($script:LocalInstall) {
+    try {
+        [Environment]::SetEnvironmentVariable('SDT_NO_AUTOUPDATE', '1', 'User')
+        $env:SDT_NO_AUTOUPDATE = '1'
+        Say "Offline install - update checks disabled (SDT_NO_AUTOUPDATE=1)." DarkGray
+        Say '  Re-enable later with:  setx SDT_NO_AUTOUPDATE ""' DarkGray
+    } catch {
+        Say "Could not persist SDT_NO_AUTOUPDATE: $($_.Exception.Message)" DarkYellow
+    }
+}
 
 # ----- PATH (user scope) -----------------------------------------------------
 $userPath = [Environment]::GetEnvironmentVariable('Path','User')

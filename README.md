@@ -10,6 +10,15 @@ PowerShell-based server and VM discovery tool for presales cloud migration scopi
 
 Then run `.\Start-DiscoverySession.ps1` — everything else is automatic.
 
+**No internet on the target box? Download the offline bundle instead:**
+
+<https://github.com/matt-magna5/SDT/releases/latest>
+
+Grab `SDT-Offline-vX.Y.Z.zip` (~14 MB), copy it to the machine, right-click the zip
+-> Properties -> **Unblock**, extract, and double-click **`RUN-SDT.cmd`**. Nothing is
+downloaded: Python, `plink.exe` and the vSphere packages all ship inside it. See
+[Offline / air-gapped install](#offline--air-gapped-install).
+
 ---
 
 ## What It Does
@@ -245,6 +254,51 @@ live countdown to the next fallback.
 
 ---
 
+### Offline / air-gapped install
+
+The one-liner needs to reach `raw.githubusercontent.com`. When the target box has
+no egress at all — proxy, firewall, or simply no route — use the downloadable
+bundle, which carries the whole tool plus its dependencies.
+
+**On a machine that does have internet:** download
+`SDT-Offline-vX.Y.Z.zip` from <https://github.com/matt-magna5/SDT/releases/latest>.
+
+**On the target box:**
+
+1. Copy the zip over (USB, RDP drive redirection, file share).
+2. Right-click the zip -> Properties -> tick **Unblock** -> OK.
+3. Extract it.
+4. Double-click **`RUN-SDT.cmd`**.
+5. Open a **new** terminal and run `sdt`.
+
+`RUN-SDT.cmd` exists because a downloaded zip fights back twice: PowerShell's
+execution policy refuses the scripts, and Mark-of-the-Web taints every extracted
+file. The wrapper clears both for that one process and changes nothing on the
+machine. No admin rights are needed — SDT installs per-user under
+`%LOCALAPPDATA%\Magna5\SDT`.
+
+Because the bundle is self-contained, the installer skips the tag lookup, the
+release download and pip entirely, and persists `SDT_NO_AUTOUPDATE=1` for the user
+so later `sdt` launches do not stall on a GitHub check that cannot succeed. Full
+instructions ship in the zip as `README-OFFLINE.txt`.
+
+There is no in-place offline update: extract a newer bundle somewhere fresh and run
+`RUN-SDT.cmd` again. It installs over the previous copy and keeps collected session
+data.
+
+**Building the bundle** (from a clone of this repo):
+
+```powershell
+.\Make-OfflineBundle.ps1
+```
+
+It writes `_dist\SDT-Offline-vX.Y.Z.zip`, taking the version from
+`$script:SessionVersion`, shipping an explicit allow-list of files so no client data
+can ride along, and refusing to produce a zip that is missing Python, `plink.exe` or
+the wheels.
+
+---
+
 ### SharePoint migration readiness
 
 Every run walks the business file shares it finds and counts what the SharePoint
@@ -327,6 +381,7 @@ Discovery-Session-2026-04-13-1647/
 
 | Version | Notes |
 |---|---|
+| **v4.6.0** | **Downloadable offline bundle.** `Make-OfflineBundle.ps1` builds `SDT-Offline-vX.Y.Z.zip` — the full tool plus prepackaged Python, `plink.exe` and the vSphere wheels — for boxes with no internet egress. `install.ps1` gained `-LocalSource` (auto-detected when run as a file beside the rest of SDT) so it installs from disk with no tag lookup, no release download and no pip; it also strips Mark-of-the-Web from the installed copy, persists `SDT_NO_AUTOUPDATE=1` on an offline install, and refuses to install the live app folder over itself. `RUN-SDT.cmd` is the double-click entry point (clears execution policy + MOTW); `README-OFFLINE.txt` ships in the zip. |
 | v1.17 | Multi-hypervisor session launcher, vSphere REST API, WinRM safety, Nutanix Collector parser |
 | v1.18 | HV host auto-added as discovery targets; AD/DNS suggested servers scan; report fixes; async ping sweep; B-Err silent error swallow fix |
 | v1.19 | Initial report generator release |
